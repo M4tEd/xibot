@@ -90,7 +90,8 @@ songbot/
 ## Requirements
 
 - Python 3.12+ (managed via [uv](https://docs.astral.sh/uv/))
-- ffmpeg + ffprobe on `PATH` (snippet generation) — macOS: `brew install ffmpeg`
+- ffmpeg + ffprobe on `PATH` (snippet generation) — macOS: `brew install ffmpeg`;
+  Windows: `winget install ffmpeg`
 - Network access to YouTube only if you enable the YouTube playlist provider
 
 ## Setup
@@ -111,7 +112,12 @@ cp .env.example .env   # then edit .env (see below)
 ```
 
 All commands below use the venv binaries directly (`.venv/bin/...`); activating
-the venv (`source .venv/bin/activate`) works too.
+the venv (`source .venv/bin/activate`) works too. On Windows the venv layout
+differs: use `.venv\Scripts\python.exe` in place of `.venv/bin/python`
+(activation: `.venv\Scripts\Activate.ps1` in PowerShell,
+`.venv\Scripts\activate.bat` in cmd), and set environment variables with
+`$env:VAR = "value"` (PowerShell) or `set VAR=value` (cmd) instead of
+`export VAR=value`.
 
 ## Configuration (`.env`)
 
