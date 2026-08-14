@@ -332,9 +332,13 @@ class SongBotClient(discord.Client):
         Restart-safe: ``is_post_due`` gates on the most recent challenge date
         recorded in the db, so a restart never double-posts and a missed day
         posts as soon as the bot comes back after the configured time. The
-        reveal is sent BEFORE the new post (pinned #3 ordering). An empty
-        catalog is a persistent condition — logged once per check on the
-        normal cadence, not a crash and not a fast retry.
+        reveal is sent BEFORE the new post (pinned #3 ordering) and is
+        delivery-coupled (pinned #17): the previous challenge is marked
+        revealed ONLY after its reveal announcement send succeeds — a failed
+        send raises before any post is attempted, leaving the challenge
+        active so the next tick retries the reveal first. An empty catalog is
+        a persistent condition — logged once per check on the normal cadence,
+        not a crash and not a fast retry.
         """
         if not is_post_due(
             self._last_post_date(),
@@ -343,9 +347,11 @@ class SongBotClient(discord.Client):
             self._settings.daily_post_time,
         ):
             return
-        reveal = self._engine.get_reveal(self._settings.guild_id, now)
+        reveal = self._engine.peek_reveal(self._settings.guild_id, now)
         if reveal is not None:
             await self._reveal_sender(reveal)
+            # Pinned #17: mark revealed ONLY after the reveal send succeeded.
+            self._engine.mark_revealed(self._settings.guild_id, now)
         try:
             challenge = self._engine.ensure_today_challenge(
                 self._settings.guild_id, self._settings.channel_id, now

@@ -27,7 +27,9 @@ from songbot.engine import (
 from tests.unit.test_engine_daily import (
     NOW,
     TODAY,
+    _db_snapshot,
     _make_engine,
+    _reveal_previous,
 )
 
 TITLE = "Neon Skyline"
@@ -702,24 +704,6 @@ class TestUserStatsRowOnInteraction:
         assert stats["last_win_date"] == TODAY
 
 
-def _db_snapshot(db: Database) -> dict[str, list[dict[str, object]]]:
-    """Full-content dump of every mutable table, for zero-mutation proofs."""
-    return {
-        "challenges": [dict(r) for r in db.query("SELECT * FROM challenges ORDER BY id")],
-        "challenge_users": [
-            dict(r)
-            for r in db.query(
-                "SELECT * FROM challenge_users ORDER BY challenge_id, user_id"
-            )
-        ],
-        "guesses": [dict(r) for r in db.query("SELECT * FROM guesses ORDER BY id")],
-        "user_stats": [
-            dict(r)
-            for r in db.query("SELECT * FROM user_stats ORDER BY guild_id, user_id")
-        ],
-    }
-
-
 class TestRevealedChallengeLockout:
     """VAL-GUESS-019 (engine half): a revealed challenge refuses all gameplay.
 
@@ -739,7 +723,7 @@ class TestRevealedChallengeLockout:
         # Pre-reveal activity that must survive the refusal untouched.
         engine.unlock_snippet(challenge_id, "alice")
         engine.submit_guess(challenge_id, "alice", WRONG, NOW)
-        reveal = engine.get_reveal("g1", DAY2)  # the day-advance path
+        reveal = _reveal_previous(engine, "g1", DAY2)  # the delivered day-advance path
         assert reveal is not None
         assert reveal.challenge_id == challenge_id
 
@@ -763,7 +747,7 @@ class TestRevealedChallengeLockout:
         _add_song(db)
         challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
         engine.unlock_snippet(challenge_id, "alice")  # alice at level 1
-        assert engine.get_reveal("g1", DAY2) is not None
+        assert _reveal_previous(engine, "g1", DAY2) is not None
 
         before = _db_snapshot(db)
         ensure_calls_before = len(fake.ensure_calls)
@@ -784,7 +768,7 @@ class TestRevealedChallengeLockout:
         engine, _ = _make_engine(tmp_path, db)
         _add_song(db)
         challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
-        assert engine.get_reveal("g1", DAY2) is not None
+        assert _reveal_previous(engine, "g1", DAY2) is not None
 
         before = _db_snapshot(db)
         result = engine.submit_guess(challenge_id, "bob", TITLE, DAY2)
@@ -808,7 +792,7 @@ class TestRevealedChallengeLockout:
         _add_song(db)
         challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
         _solve(engine, challenge_id, "alice", NOW)
-        assert engine.get_reveal("g1", DAY2) is not None
+        assert _reveal_previous(engine, "g1", DAY2) is not None
 
         before = _db_snapshot(db)
         result = engine.submit_guess(challenge_id, "alice", ARTIST, DAY2)
@@ -831,7 +815,7 @@ class TestRevealedChallengeLockout:
         engine, _ = _make_engine(tmp_path, db)
         _add_song(db)
         challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
-        assert engine.get_reveal("g1", DAY2) is not None
+        assert _reveal_previous(engine, "g1", DAY2) is not None
 
         result = engine.submit_guess(challenge_id, "alice", "   ", DAY2)
         assert result.outcome == "challenge_closed"

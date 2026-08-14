@@ -23,7 +23,7 @@ from songbot.bot.modals import GuessModal
 from songbot.db import Database
 from songbot.engine import Challenge, GameEngine
 from tests.unit.interaction_fakes import FakeInteraction
-from tests.unit.test_engine_daily import NOW, _make_engine
+from tests.unit.test_engine_daily import NOW, _make_engine, _reveal_previous
 from tests.unit.test_engine_gameplay import _add_song
 
 NEXT_DAY = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
@@ -190,7 +190,7 @@ class TestSubmitGuess:
         self, engine: GameEngine, challenge: Challenge, db: Database
     ) -> None:
         # VAL-GUESS-019 adapter half: one ephemeral closed notice, nothing else.
-        engine.get_reveal("g1", NEXT_DAY)
+        _reveal_previous(engine, "g1", NEXT_DAY)
         interaction = await _submit(_modal(engine, challenge), TITLE)
 
         assert len(interaction.payloads) == 1

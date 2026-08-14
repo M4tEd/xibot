@@ -24,7 +24,7 @@ from songbot.bot.views import DailyChallengeView
 from songbot.db import Database
 from songbot.engine import Challenge, GameEngine
 from tests.unit.interaction_fakes import FakeInteraction, press
-from tests.unit.test_engine_daily import NOW, _make_engine, _settings
+from tests.unit.test_engine_daily import NOW, _make_engine, _reveal_previous, _settings
 from tests.unit.test_engine_gameplay import _add_song
 
 NEXT_DAY = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
@@ -171,7 +171,7 @@ class TestHearMore:
         self, view: DailyChallengeView, challenge: Challenge, engine: GameEngine
     ) -> None:
         # VAL-GUESS-019 adapter half: one ephemeral closed notice, nothing else.
-        engine.get_reveal("g1", NEXT_DAY)
+        _reveal_previous(engine, "g1", NEXT_DAY)
         interaction = _interaction()
         await press(view, "songbot:hear_more", interaction)
 

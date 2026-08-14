@@ -32,9 +32,13 @@ a revealed challenge therefore yields the real closed-challenge notice
 
 ``advance-day`` is state-anchored: it posts the day AFTER the guild's latest
 challenge (at the configured post time), revealing stale challenges first
-(reveal announcement recorded BEFORE the new daily post, pinned #3). From an
-empty state it posts the local date of ``--now`` (or the real clock) with no
-reveal (VAL-CROSS-018).
+(reveal announcement recorded BEFORE the new daily post, pinned #3). The
+reveal is delivery-coupled (pinned #17): the previous challenge is marked
+revealed ONLY after the reveal send succeeds — a failed reveal send mutates
+nothing and prints ``{"error": "reveal_failed", "message": ...}`` (exit 1),
+and the retry delivers the reveal before posting. From an empty state it
+posts the local date of ``--now`` (or the real clock) with no reveal
+(VAL-CROSS-018).
 
 Admin scenarios — ``admin-post`` / ``admin-skip`` / ``admin-reload`` — drive
 the REAL ``AdminCommands`` bodies (songbot/bot/admin.py) with the invoking
@@ -73,9 +77,14 @@ from songbot.bot.modals import GuessModal
 from songbot.bot.views import DailyChallengeView
 from songbot.config import ConfigError, Settings, load_settings
 from songbot.db import ChallengeRow, Database
-from songbot.engine import CatalogEmptyError, Challenge, EngineError, GameEngine
+from songbot.engine import (
+    CatalogEmptyError,
+    Challenge,
+    EngineError,
+    GameEngine,
+    Reveal,
+)
 from songbot.harness.fakes import (
-    FakeChannel,
     FakeInteraction,
     FakePermissions,
     FakeUser,
@@ -89,6 +98,7 @@ __all__ = [
     "NO_ACTIVE_CHALLENGE_MESSAGE",
     "HarnessContext",
     "RecordPost",
+    "RecordReveal",
     "UsageError",
     "build_parser",
     "main",
@@ -143,6 +153,14 @@ RecordPost = Callable[[Recorder, HarnessContext, Challenge, datetime], None]
 Default ``_record_daily_post`` (the real builders, recorded transport). Tests
 inject a failing seam to exercise the pinned-#16 delivery-failure rollback;
 the CLI itself always uses the default.
+"""
+
+RecordReveal = Callable[[Recorder, HarnessContext, Reveal], None]
+"""The harness's reveal "send": record the announcement payload.
+
+Default ``_record_reveal`` (the real embed builder, recorded transport).
+Tests inject a failing seam to exercise the pinned-#17 delivery-coupled
+reveal retry; the CLI itself always uses the default.
 """
 
 
@@ -398,6 +416,17 @@ def _record_daily_post(
     )
 
 
+def _record_reveal(recorder: Recorder, ctx: HarnessContext, reveal: Reveal) -> None:
+    """Record the reveal announcement exactly as the live client would send it.
+
+    Built with the REAL ``reveal_embed`` builder (the same embed the live
+    ``_send_reveal`` posts); only the transport is recorded — an
+    ``announcement``-kind payload (pinned #3). ``ctx`` is unused but kept for
+    symmetry with `RecordPost`.
+    """
+    recorder.record_message(kind="announcement", embed=reveal_embed(reveal))
+
+
 # -- scenarios ---------------------------------------------------------------------
 
 
@@ -501,26 +530,42 @@ async def scenario_leaderboard(
 
 
 async def scenario_advance_day(
-    ctx: HarnessContext, now: datetime, *, record_post: RecordPost | None = None
+    ctx: HarnessContext,
+    now: datetime,
+    *,
+    record_post: RecordPost | None = None,
+    record_reveal: RecordReveal | None = None,
 ) -> dict[str, Any]:
     """Reveal the previous challenge, then post the next day's challenge.
 
     State-anchored (pinned #1 sugar): the target is the day AFTER the guild's
     latest challenge at the configured post time; from an empty state it is
-    the local date of ``now``. The reveal announcement is recorded BEFORE the
-    new daily post payload (pinned #3). A failed daily-post send rolls back
-    the just-created challenge (pinned #16) and prints
+    the local date of ``now``. The reveal is delivery-coupled (pinned #17):
+    peek (read-only) -> send the reveal announcement -> mark revealed -> then
+    post, with the reveal payload recorded BEFORE the new daily post payload
+    (pinned #3). A failed reveal send mutates NOTHING (the previous challenge
+    stays active, no new post is delivered) and prints
+    ``{"error": "reveal_failed", ...}`` (exit 1); the retry re-attempts the
+    reveal before posting. A failed daily-post send rolls back the
+    just-created challenge (pinned #16) and prints
     ``{"error": "post_failed", ...}`` (exit 1); the already-sent reveal is
     idempotent, so the retry records exactly one new daily post.
     """
     record = record_post if record_post is not None else _record_daily_post
+    send_reveal = record_reveal if record_reveal is not None else _record_reveal
     recorder = Recorder()
     target = _advance_target(ctx.settings, ctx.db, now)
-    reveal = ctx.engine.get_reveal(ctx.settings.guild_id, target)
+    reveal = ctx.engine.peek_reveal(ctx.settings.guild_id, target)
     reveal_state: dict[str, Any] | None = None
     if reveal is not None:
-        channel = FakeChannel(recorder)
-        await channel.send(embed=reveal_embed(reveal))
+        try:
+            send_reveal(recorder, ctx, reveal)
+        except Exception as exc:
+            # Pinned #17: zero mutation — the challenge stays active and the
+            # next advance-day retries the reveal BEFORE posting.
+            return {"error": "reveal_failed", "message": str(exc)}
+        # Mark revealed ONLY after the reveal send succeeded (pinned #17).
+        ctx.engine.mark_revealed(ctx.settings.guild_id, target)
         reveal_state = {
             "challenge_id": reveal.challenge_id,
             "date": reveal.date,

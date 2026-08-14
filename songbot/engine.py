@@ -4,9 +4,11 @@ Pure Python — never imports discord, performs I/O only via db/snippets/catalog
 
 Daily lifecycle: ``ensure_today_challenge`` (idempotent per (guild, local
 date), no-repeat song selection with history reset, deterministic seeded
-song+offset picks, catalog auto-bootstrap, snippet cache re-heal),
-``get_reveal`` (mark the previous challenge revealed, return song + winners
-in solve order), ``skip_today_song`` (pinned decision #5), and
+song+offset picks, catalog auto-bootstrap, snippet cache re-heal), the
+pinned-#17 delivery-coupled reveal split — ``peek_reveal`` (read-only:
+compute the stale challenge's song + winners in solve order, zero mutation)
+and ``mark_revealed`` (the mutation the caller applies ONLY after the reveal
+announcement send succeeds) — ``skip_today_song`` (pinned decision #5), and
 ``delete_challenge`` (the pinned-#16 delivery-failure rollback).
 
 Gameplay: ``unlock_snippet`` (per-user snippet ladder 0..4 with descending
@@ -483,17 +485,9 @@ class GameEngine:
             self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
             raise
 
-    def get_reveal(self, guild_id: str, now: datetime) -> Reveal | None:
-        """Reveal the previous active challenge for a guild, if any.
-
-        Marks every stale active challenge (local date before today)
-        ``revealed`` exactly once and returns a `Reveal` for the most recent
-        one: its song plus winners in solve order. Returns None when there is
-        nothing to reveal (never reveals today's own challenge, so it is safe
-        to call before OR after today's post).
-        """
-        today = self._local_date(now).isoformat()
-        stale = [
+    def _stale_active_rows(self, guild_id: str, today: str) -> list[ChallengeRow]:
+        """Active challenges dated before ``today`` (ISO), most recent first."""
+        return [
             ChallengeRow.from_row(row)
             for row in self._db.query(
                 "SELECT * FROM challenges"
@@ -502,17 +496,25 @@ class GameEngine:
                 (guild_id, today),
             )
         ]
+
+    def peek_reveal(self, guild_id: str, now: datetime) -> Reveal | None:
+        """Compute the previous challenge's reveal WITHOUT marking it (pinned #17).
+
+        The read-only half of the delivery-coupled reveal: returns a `Reveal`
+        for the most recent stale active challenge (local date before today)
+        — its song plus winners in solve order — and mutates NOTHING, so a
+        failed reveal send leaves the challenge active and the next
+        tick/advance-day re-peeks the identical reveal. ``revealed_at`` is the
+        timestamp `mark_revealed` will persist for the same ``now``. Returns
+        None when there is nothing to reveal: already-revealed rows are
+        invisible (a delivered reveal is never computed again) and today's own
+        challenge is never revealed, so it is safe to call before OR after
+        today's post.
+        """
+        today = self._local_date(now).isoformat()
+        stale = self._stale_active_rows(guild_id, today)
         if not stale:
             return None
-
-        revealed_at = self._utc_iso(now)
-        with self._db.transaction():
-            for row in stale:
-                self._db.execute(
-                    "UPDATE challenges SET status = 'revealed', revealed_at = ?"
-                    " WHERE id = ? AND status = 'active'",
-                    (revealed_at, row.id),
-                )
 
         target = stale[0]
         winners = tuple(
@@ -534,8 +536,28 @@ class GameEngine:
             date=target.date,
             song=self._song_row(target.song_id),
             winners=winners,
-            revealed_at=revealed_at,
+            revealed_at=self._utc_iso(now),
         )
+
+    def mark_revealed(self, guild_id: str, now: datetime) -> None:
+        """Mark every stale active challenge revealed (pinned #17 commit half).
+
+        Applied by the reveal flows (scheduler tick, harness advance-day)
+        ONLY after the reveal announcement send succeeds. Marks ALL stale
+        active rows (local date before today) — including un-announced older
+        rows from missed cycles, exactly as the pre-split reveal did — in one
+        transaction, with ``revealed_at`` matching the peeked `Reveal` for the
+        same ``now``. A no-op when nothing is stale.
+        """
+        today = self._local_date(now).isoformat()
+        revealed_at = self._utc_iso(now)
+        with self._db.transaction():
+            for row in self._stale_active_rows(guild_id, today):
+                self._db.execute(
+                    "UPDATE challenges SET status = 'revealed', revealed_at = ?"
+                    " WHERE id = ? AND status = 'active'",
+                    (revealed_at, row.id),
+                )
 
     def skip_today_song(self, guild_id: str, now: datetime) -> Challenge:
         """Replace today's song with a new one (pinned decision #5).

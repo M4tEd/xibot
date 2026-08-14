@@ -1,5 +1,6 @@
 """Unit tests for the GameEngine daily lifecycle: ensure_today_challenge,
-get_reveal, skip_today_song.
+peek_reveal / mark_revealed (the pinned-#17 delivery-coupled reveal split),
+skip_today_song.
 
 Deterministic and fast: tmp SQLite DBs, injected `now`, and a fake
 SnippetService that creates empty cache files without ffmpeg. Contract
@@ -28,6 +29,7 @@ from songbot.db import Database
 from songbot.engine import (
     CatalogEmptyError,
     GameEngine,
+    Reveal,
     SkipRefusedError,
 )
 
@@ -123,6 +125,37 @@ def _challenge_count(db: Database) -> int:
     row = db.query_one("SELECT COUNT(*) AS c FROM challenges")
     assert row is not None
     return int(row["c"])
+
+
+def _db_snapshot(db: Database) -> dict[str, list[dict[str, object]]]:
+    """Full-content dump of every mutable table, for zero-mutation proofs."""
+    return {
+        "challenges": [dict(r) for r in db.query("SELECT * FROM challenges ORDER BY id")],
+        "challenge_users": [
+            dict(r)
+            for r in db.query(
+                "SELECT * FROM challenge_users ORDER BY challenge_id, user_id"
+            )
+        ],
+        "guesses": [dict(r) for r in db.query("SELECT * FROM guesses ORDER BY id")],
+        "user_stats": [
+            dict(r)
+            for r in db.query("SELECT * FROM user_stats ORDER BY guild_id, user_id")
+        ],
+    }
+
+
+def _reveal_previous(engine: GameEngine, guild_id: str, now: datetime) -> Reveal | None:
+    """Test-setup helper: the DELIVERED reveal flow (pinned #17 peek + mark).
+
+    The production reveal flows (scheduler tick, harness advance-day) call
+    ``peek_reveal``, send the announcement, then ``mark_revealed``. Tests that
+    need a revealed challenge as their starting state use this composed form.
+    """
+    reveal = engine.peek_reveal(guild_id, now)
+    if reveal is not None:
+        engine.mark_revealed(guild_id, now)
+    return reveal
 
 
 def _make_engine(
@@ -378,7 +411,7 @@ class TestPerGuildIsolation:
         g2 = engine.ensure_today_challenge("G2", "c1", NOW)
 
         next_day = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
-        reveal = engine.get_reveal("G1", next_day)
+        reveal = _reveal_previous(engine, "G1", next_day)
         assert reveal is not None
 
         g2_row = db.query_one(
@@ -420,7 +453,14 @@ class TestPerGuildIsolation:
         ) is None
 
 
-class TestGetReveal:
+class TestPeekReveal:
+    """The read-only half of the delivery-coupled reveal (pinned #17).
+
+    ``peek_reveal`` computes the stale challenge's `Reveal` (song + winners)
+    with ZERO mutation, so a failed reveal send leaves the challenge active
+    and the retry re-peeks the identical reveal (VAL-DAILY-014).
+    """
+
     def _insert_solver(
         self,
         db: Database,
@@ -438,7 +478,7 @@ class TestGetReveal:
             (challenge_id, user_id, guesses_used, points, solved_at),
         )
 
-    def test_reveal_marks_previous_and_returns_winners_in_solve_order(
+    def test_peek_returns_winners_in_solve_order_with_zero_mutation(
         self, db: Database, tmp_path: Path
     ) -> None:
         _add_songs(db, 3)
@@ -452,9 +492,10 @@ class TestGetReveal:
             db, day1.id, "bob", guesses_used=3, points=75,
             solved_at="2026-08-13T16:02:00+00:00",
         )
+        before = _db_snapshot(db)
 
         next_day = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
-        reveal = engine.get_reveal("g1", next_day)
+        reveal = engine.peek_reveal("g1", next_day)
 
         assert reveal is not None
         assert reveal.challenge_id == day1.id
@@ -466,39 +507,52 @@ class TestGetReveal:
         assert reveal.winners[0].points_awarded == 75
         assert reveal.winners[1].guesses_used == 1
 
-        row = db.query_one("SELECT status, revealed_at FROM challenges WHERE id = ?", (day1.id,))
+        # ZERO mutation: the challenge is still active and nothing else moved.
+        assert _db_snapshot(db) == before
+        row = db.query_one(
+            "SELECT status, revealed_at FROM challenges WHERE id = ?", (day1.id,)
+        )
         assert row is not None
-        assert row["status"] == "revealed"
-        assert row["revealed_at"] is not None
+        assert row["status"] == "active"
+        assert row["revealed_at"] is None
 
-    def test_reveal_marks_exactly_once(self, db: Database, tmp_path: Path) -> None:
-        """A second get_reveal the same day finds no active challenge -> None."""
+    def test_peek_is_idempotent_and_never_marks(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """A failed send followed by a retry peeks the IDENTICAL reveal."""
         _add_songs(db, 3)
         engine, _ = _make_engine(tmp_path, db)
-        engine.ensure_today_challenge("g1", "c1", NOW)
+        day1 = engine.ensure_today_challenge("g1", "c1", NOW)
+        self._insert_solver(
+            db, day1.id, "alice", guesses_used=1, points=100,
+            solved_at="2026-08-13T16:05:00+00:00",
+        )
         next_day = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
 
-        assert engine.get_reveal("g1", next_day) is not None
-        assert engine.get_reveal("g1", next_day) is None
-        row = db.query_one("SELECT COUNT(*) AS c FROM challenges WHERE status = 'revealed'")
+        first = engine.peek_reveal("g1", next_day)
+        second = engine.peek_reveal("g1", next_day)
+
+        assert first is not None
+        assert first == second  # same challenge, song, winners, revealed_at
+        row = db.query_one("SELECT status FROM challenges WHERE id = ?", (day1.id,))
         assert row is not None
-        assert row["c"] == 1
+        assert row["status"] == "active"
 
-    def test_reveal_none_when_no_challenge(self, db: Database, tmp_path: Path) -> None:
+    def test_peek_none_when_no_challenge(self, db: Database, tmp_path: Path) -> None:
         engine, _ = _make_engine(tmp_path, db)
-        assert engine.get_reveal("g1", NOW) is None
+        assert engine.peek_reveal("g1", NOW) is None
 
-    def test_reveal_ignores_todays_challenge(self, db: Database, tmp_path: Path) -> None:
-        """get_reveal never reveals the challenge of the current local day."""
+    def test_peek_ignores_todays_challenge(self, db: Database, tmp_path: Path) -> None:
+        """peek_reveal never reveals the challenge of the current local day."""
         _add_songs(db, 3)
         engine, _ = _make_engine(tmp_path, db)
         engine.ensure_today_challenge("g1", "c1", NOW)
-        assert engine.get_reveal("g1", NOW) is None
+        assert engine.peek_reveal("g1", NOW) is None
         row = db.query_one("SELECT status FROM challenges")
         assert row is not None
         assert row["status"] == "active"
 
-    def test_reveal_with_no_winners(self, db: Database, tmp_path: Path) -> None:
+    def test_peek_with_no_winners(self, db: Database, tmp_path: Path) -> None:
         _add_songs(db, 3)
         engine, _ = _make_engine(tmp_path, db)
         day1 = engine.ensure_today_challenge("g1", "c1", NOW)
@@ -510,11 +564,39 @@ class TestGetReveal:
         )
         next_day = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
 
-        reveal = engine.get_reveal("g1", next_day)
+        reveal = engine.peek_reveal("g1", next_day)
         assert reveal is not None
         assert reveal.winners == ()
 
-    def test_reveal_clears_all_stale_actives_returns_most_recent(
+    def test_peek_returns_most_recent_stale_without_marking(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """Two unrevealed past challenges (missed cycles): peek returns the
+        most recent one's reveal and marks NOTHING."""
+        _add_songs(db, 3)
+        engine, _ = _make_engine(tmp_path, db)
+        engine.ensure_today_challenge("g1", "c1", datetime(2026, 8, 11, 16, 0, tzinfo=UTC))
+        day2 = engine.ensure_today_challenge(
+            "g1", "c1", datetime(2026, 8, 12, 16, 0, tzinfo=UTC)
+        )
+
+        reveal = engine.peek_reveal("g1", datetime(2026, 8, 13, 16, 0, tzinfo=UTC))
+
+        assert reveal is not None
+        assert reveal.challenge_id == day2.id  # most recent stale active
+        statuses = db.query("SELECT status FROM challenges ORDER BY date")
+        assert [r["status"] for r in statuses] == ["active", "active"]
+
+
+class TestMarkRevealed:
+    """The mutation half of the delivery-coupled reveal (pinned #17).
+
+    ``mark_revealed`` is applied by the caller ONLY after the reveal send
+    succeeds; it marks every stale active row revealed (one transaction), so
+    a delivered reveal is never computed or sent again.
+    """
+
+    def test_mark_after_peek_reveals_all_stale_rows(
         self, db: Database, tmp_path: Path
     ) -> None:
         """Two unrevealed past challenges (missed cycles) both get revealed."""
@@ -524,13 +606,64 @@ class TestGetReveal:
         day2 = engine.ensure_today_challenge(
             "g1", "c1", datetime(2026, 8, 12, 16, 0, tzinfo=UTC)
         )
+        now = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
 
-        reveal = engine.get_reveal("g1", datetime(2026, 8, 13, 16, 0, tzinfo=UTC))
-
+        reveal = engine.peek_reveal("g1", now)
         assert reveal is not None
         assert reveal.challenge_id == day2.id  # most recent stale active
-        statuses = db.query("SELECT status FROM challenges ORDER BY date")
+        engine.mark_revealed("g1", now)
+
+        statuses = db.query("SELECT status, revealed_at FROM challenges ORDER BY date")
         assert [r["status"] for r in statuses] == ["revealed", "revealed"]
+        assert all(r["revealed_at"] is not None for r in statuses)
+
+    def test_mark_persists_the_peeked_revealed_at(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """The Reveal's ``revealed_at`` is exactly what mark_revealed writes."""
+        _add_songs(db, 3)
+        engine, _ = _make_engine(tmp_path, db)
+        day1 = engine.ensure_today_challenge("g1", "c1", NOW)
+        next_day = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
+
+        reveal = engine.peek_reveal("g1", next_day)
+        assert reveal is not None
+        engine.mark_revealed("g1", next_day)
+
+        row = db.query_one(
+            "SELECT status, revealed_at FROM challenges WHERE id = ?", (day1.id,)
+        )
+        assert row is not None
+        assert row["status"] == "revealed"
+        assert row["revealed_at"] == reveal.revealed_at
+
+    def test_peek_after_mark_returns_none(self, db: Database, tmp_path: Path) -> None:
+        """Exactly-once: a delivered reveal is never computed (or sent) again."""
+        _add_songs(db, 3)
+        engine, _ = _make_engine(tmp_path, db)
+        engine.ensure_today_challenge("g1", "c1", NOW)
+        next_day = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
+
+        assert _reveal_previous(engine, "g1", next_day) is not None
+        assert engine.peek_reveal("g1", next_day) is None
+        row = db.query_one("SELECT COUNT(*) AS c FROM challenges WHERE status = 'revealed'")
+        assert row is not None
+        assert row["c"] == 1
+
+    def test_mark_with_nothing_stale_is_a_noop(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        _add_songs(db, 3)
+        engine, _ = _make_engine(tmp_path, db)
+        engine.ensure_today_challenge("g1", "c1", NOW)
+        before = _db_snapshot(db)
+
+        engine.mark_revealed("g1", NOW)  # only today's challenge exists
+
+        assert _db_snapshot(db) == before
+        row = db.query_one("SELECT status FROM challenges")
+        assert row is not None
+        assert row["status"] == "active"
 
 
 class TestSkipTodaySong:
