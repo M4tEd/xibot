@@ -63,6 +63,7 @@ EXPECTED_COLUMNS: dict[str, list[tuple[str, str, int, str | None, int]]] = {
         ("status", "TEXT", 1, None, 0),
         ("created_at", "TEXT", 1, None, 0),
         ("revealed_at", "TEXT", 0, None, 0),
+        ("skip_count", "INTEGER", 1, "0", 0),  # migration 2: skip-song seed (pinned #5)
     ],
     "challenge_users": [
         ("challenge_id", "INTEGER", 1, None, 1),
@@ -187,7 +188,7 @@ class TestMigration:
     def test_migrate_returns_applied_versions_then_nothing(self, tmp_path: Path) -> None:
         database = Database(tmp_path / "songbot.db")
         try:
-            assert database.migrate() == [1]
+            assert database.migrate() == [1, 2]
             assert database.migrate() == []
         finally:
             database.close()
@@ -200,17 +201,47 @@ class TestMigration:
         try:
             assert second.migrate() == []
             assert second.schema_version() == SCHEMA_VERSION
-            assert count(second, "schema_migrations") == 1
+            assert count(second, "schema_migrations") == 2
         finally:
             second.close()
 
     def test_schema_migrations_records_version_and_timestamp(self, db: Database) -> None:
-        row = db.query_one("SELECT version, applied_at FROM schema_migrations")
-        assert row is not None
-        assert row["version"] == 1
-        # applied_at must be a parseable ISO-8601 timestamp
-        parsed = datetime.fromisoformat(str(row["applied_at"]))
-        assert parsed.tzinfo is not None
+        rows = db.query("SELECT version, applied_at FROM schema_migrations ORDER BY version")
+        assert [int(row["version"]) for row in rows] == [1, 2]
+        for row in rows:
+            # applied_at must be a parseable ISO-8601 timestamp
+            parsed = datetime.fromisoformat(str(row["applied_at"]))
+            assert parsed.tzinfo is not None
+
+    def test_migration_2_adds_skip_count_to_existing_challenges(self, tmp_path: Path) -> None:
+        """Upgrading a v1 database: pre-existing challenge rows get skip_count=0."""
+        path = tmp_path / "songbot.db"
+        database = Database(path)
+        try:
+            # Simulate a v1-only database: bookkeeping table + migration 1 by hand.
+            from songbot.db import MIGRATIONS
+
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            for statement in MIGRATIONS[0][1]:
+                database.execute(statement)
+            database.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)", (NOW,)
+            )
+            song_id = insert_song(database)
+            challenge_id = insert_challenge(database, song_id)
+
+            assert database.migrate() == [2]
+            assert database.schema_version() == 2
+            row = database.query_one(
+                "SELECT skip_count FROM challenges WHERE id = ?", (challenge_id,)
+            )
+            assert row is not None
+            assert row["skip_count"] == 0
+        finally:
+            database.close()
 
     def test_schema_version_zero_before_migrate(self, tmp_path: Path) -> None:
         database = Database(tmp_path / "songbot.db")

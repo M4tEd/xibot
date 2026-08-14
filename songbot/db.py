@@ -36,7 +36,7 @@ __all__ = [
 ChallengeStatus = Literal["active", "revealed"]
 """Valid values for `challenges.status`."""
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """Latest schema version; bump when appending to `MIGRATIONS`."""
 
 _BUSY_TIMEOUT_MS = 5000
@@ -108,9 +108,23 @@ _MIGRATION_001_INITIAL: tuple[str, ...] = (
     """,
 )
 
+_MIGRATION_002_CHALLENGE_SKIP_COUNT: tuple[str, ...] = (
+    # skip_count feeds the deterministic skip-song RNG seed
+    # hash(date, guild_id, skip_count) (pinned design decision #5). It lives on
+    # the challenge row itself: skip_today_song deletes the row and recreates
+    # it for the same date with skip_count + 1, so the count survives the
+    # delete+recreate cycle without extra tables.
+    """
+    ALTER TABLE challenges ADD COLUMN skip_count INTEGER NOT NULL DEFAULT 0
+    """,
+)
+
 # Versioned migrations, applied in ascending order. Never edit an applied
 # migration; append a new (version, statements) entry instead.
-MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ((1, _MIGRATION_001_INITIAL),)
+MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (1, _MIGRATION_001_INITIAL),
+    (2, _MIGRATION_002_CHALLENGE_SKIP_COUNT),
+)
 
 
 @dataclass(frozen=True)
@@ -154,6 +168,8 @@ class ChallengeRow:
 
     `date` is the ISO calendar date in the configured timezone; `status` is
     "active" until the next day's post reveals it (`revealed_at` set).
+    `skip_count` (migration 2) counts how many times this date's song has
+    been admin-skipped; it seeds the deterministic re-pick (pinned #5).
     """
 
     id: int
@@ -165,6 +181,7 @@ class ChallengeRow:
     status: ChallengeStatus
     created_at: str
     revealed_at: str | None
+    skip_count: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ChallengeRow:
@@ -179,6 +196,7 @@ class ChallengeRow:
             status=row["status"],
             created_at=row["created_at"],
             revealed_at=row["revealed_at"],
+            skip_count=row["skip_count"],
         )
 
 
