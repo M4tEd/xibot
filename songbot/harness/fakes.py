@@ -33,6 +33,7 @@ __all__ = [
     "FakeChannel",
     "FakeFollowup",
     "FakeInteraction",
+    "FakePermissions",
     "FakeResponse",
     "FakeUser",
     "RecordedAttachment",
@@ -138,8 +139,21 @@ class Recorder:
 
 
 @dataclass(frozen=True)
+class FakePermissions:
+    """Stand-in for ``discord.Permissions`` (only ``manage_guild`` is used).
+
+    The admin command bodies read ``interaction.user.guild_permissions
+    .manage_guild`` — the same attribute a guild ``Member`` exposes — so the
+    ``--as-admin``/``--as-non-admin`` flag flows through the identical check
+    the live commands run (VAL-ADMIN-009).
+    """
+
+    manage_guild: bool = False
+
+
+@dataclass(frozen=True)
 class FakeUser:
-    """Stand-in for ``discord.User``/``Member`` (only ``id``/``name`` used).
+    """Stand-in for ``discord.User``/``Member`` (``id``/``name``/permissions).
 
     The harness keeps ids as strings: a bare ``--user alice`` IS the stable
     deterministic id ``"alice"`` (pinned #2), so recorded recipients and
@@ -149,6 +163,7 @@ class FakeUser:
 
     id: str
     name: str
+    guild_permissions: FakePermissions = field(default_factory=FakePermissions)
 
 
 class FakeResponse:

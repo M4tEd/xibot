@@ -17,22 +17,29 @@ from pathlib import Path
 
 import discord
 
+from songbot.catalog.refresh import RefreshResult
 from songbot.config import Settings
 from songbot.engine import (
     Challenge,
     GuessResult,
     LeaderboardEntry,
     Reveal,
+    SkipRefusedReason,
     UnlockRefusedReason,
     UnlockResult,
 )
 
 __all__ = [
+    "ADMIN_CATALOG_EMPTY_MESSAGE",
+    "ADMIN_POST_ALREADY_MESSAGE",
+    "ADMIN_POST_SUCCESS_MESSAGE",
+    "ADMIN_SKIP_SUCCESS_MESSAGE",
     "ATTACHMENT_FILENAME",
     "CHALLENGE_CLOSED_MESSAGE",
     "EMPTY_GUESS_MESSAGE",
     "EMPTY_LEADERBOARD_MESSAGE",
     "HEAR_MORE_SOLVED_MESSAGE",
+    "PERMISSION_DENIED_MESSAGE",
     "announcement_content",
     "daily_challenge_embed",
     "format_seconds",
@@ -40,7 +47,9 @@ __all__ = [
     "hear_more_content",
     "hear_more_refusal_content",
     "leaderboard_embed",
+    "reload_ack_content",
     "reveal_embed",
+    "skip_refusal_content",
     "snippet_attachment",
 ]
 
@@ -58,6 +67,27 @@ EMPTY_LEADERBOARD_MESSAGE = "No scores yet — be the first to solve a daily son
 
 HEAR_MORE_SOLVED_MESSAGE = "You've already solved this one — no more snippets needed. ✅"
 """Hear-more rejection for a user who already solved the challenge."""
+
+PERMISSION_DENIED_MESSAGE = (
+    "🚫 You need the **Manage Server** permission to use SongBot admin commands."
+)
+"""VAL-ADMIN-009: the generic ephemeral denial — no leaked error detail."""
+
+ADMIN_POST_SUCCESS_MESSAGE = "✅ Posted today's challenge."
+"""Ephemeral ack for a successful /songbot-post."""
+
+ADMIN_POST_ALREADY_MESSAGE = (
+    "📋 Today's challenge is already posted — use /songbot-skip to replace the song."
+)
+"""Ephemeral ack for an idempotent /songbot-post repeat (pinned #4)."""
+
+ADMIN_CATALOG_EMPTY_MESSAGE = (
+    "📭 The catalog is empty — add songs to a catalog source, then /songbot-reload."
+)
+"""Ephemeral ack when /songbot-post finds no songs at all (pinned #11)."""
+
+ADMIN_SKIP_SUCCESS_MESSAGE = "⏭️ Skipped — today's song has been replaced with a new one."
+"""Ephemeral ack for a successful /songbot-skip (never names either song)."""
 
 
 def format_seconds(seconds: float) -> str:
@@ -219,3 +249,33 @@ def hear_more_refusal_content(reason: UnlockRefusedReason, settings: Settings) -
 def snippet_attachment(path: Path) -> discord.File:
     """Attach a snippet file under the pinned-#9 filename (never the song's)."""
     return discord.File(path, filename=ATTACHMENT_FILENAME)
+
+
+def skip_refusal_content(reason: SkipRefusedReason) -> str:
+    """The ephemeral refusal for /songbot-skip (pinned #5: zero mutation)."""
+    if reason == "no_challenge":
+        return "There's no challenge to skip today — post one first."
+    if reason == "revealed":
+        return "Today's challenge has already been revealed — it can't be skipped."
+    return "Today's challenge already has a solver — it can't be skipped."
+
+
+def reload_ack_content(result: RefreshResult) -> str:
+    """The ephemeral ack for /songbot-reload: the per-source summary.
+
+    One line per enabled source with its added/updated/removed/retained
+    counts, or its error when the source failed (per-source failure isolation,
+    pinned #12). Never contains song identity (counts only).
+    """
+    if not result.sources:
+        return "🔄 Catalog reload: no catalog sources are configured."
+    lines = ["🔄 Catalog reload complete."]
+    for source in result.sources:
+        if source.error is not None:
+            lines.append(f"**{source.source}**: ⚠️ failed — {source.error}")
+        else:
+            lines.append(
+                f"**{source.source}**: {source.added} added • {source.updated} updated "
+                f"• {source.removed} removed • {source.retained} retained"
+            )
+    return "\n".join(lines)

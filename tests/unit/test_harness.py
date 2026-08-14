@@ -22,12 +22,16 @@ from typing import Any
 
 import pytest
 
+from songbot.catalog.refresh import RefreshResult, SourceRefresh
 from songbot.db import Database
 from songbot.engine import GameEngine
 from songbot.harness.cli import (
     HarnessContext,
     parse_now,
     parse_user,
+    scenario_admin_post,
+    scenario_admin_reload,
+    scenario_admin_skip,
     scenario_advance_day,
     scenario_guess,
     scenario_hear_more,
@@ -36,7 +40,7 @@ from songbot.harness.cli import (
     scenario_reset,
     scenario_status,
 )
-from songbot.harness.fakes import FakeUser
+from songbot.harness.fakes import FakePermissions, FakeUser
 from tests.unit.test_engine_daily import _make_engine, _settings
 from tests.unit.test_engine_gameplay import _add_song
 
@@ -50,6 +54,8 @@ HALIFAX = timezone(timedelta(hours=-3))  # ADT (August)
 
 ALICE = FakeUser(id="alice", name="alice")
 BOB = FakeUser(id="bob", name="bob")
+ADMIN = FakeUser(id="admin", name="admin", guild_permissions=FakePermissions(manage_guild=True))
+NON_ADMIN = FakeUser(id="admin", name="admin")
 
 
 @pytest.fixture
@@ -510,6 +516,265 @@ class TestStatus:
         out = json_roundtrip(scenario_status(ctx, DAY2))
         assert out["state"]["date"] == "2026-08-14"
         assert out["state"]["challenge"] is None
+
+
+class TestAdminPost:
+    """The admin-post scenario drives the REAL /songbot-post body."""
+
+    async def test_admin_post_records_channel_post_and_ephemeral_ack(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        out = json_roundtrip(await scenario_admin_post(ctx, ADMIN, DAY1))
+
+        assert kinds(out) == ["channel", "ephemeral"]
+        post = out["payloads"][0]
+        assert post["recipient"] is None
+        assert post["embed"]["title"].startswith("🎵 Daily Song — 2026-08-13")
+        custom_ids = {c["custom_id"] for c in post["components"]}
+        assert custom_ids == {"songbot:hear_more", "songbot:guess", "songbot:leaderboard"}
+        assert len(post["attachments"]) == 1
+        assert post["attachments"][0]["filename"] == "songbot-snippet.mp3"
+        ack = out["payloads"][1]
+        assert ack["recipient"] == "admin"
+        assert out["state"]["outcome"] == "posted"
+        assert out["state"]["challenge"]["date"] == "2026-08-13"
+        assert out["state"]["challenge"]["status"] == "active"
+        row = db.query_one("SELECT COUNT(*) AS c FROM challenges")
+        assert row is not None
+        assert row["c"] == 1
+
+    async def test_admin_post_repeat_prints_compact_already_posted(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_admin_post(ctx, ADMIN, DAY1)
+
+        out = await scenario_admin_post(ctx, ADMIN, DAY1)
+
+        # Pinned #4 / VAL-CROSS-015: the exact compact shape, no second post.
+        assert out == {"already_posted": True, "messages": []}
+        row = db.query_one("SELECT COUNT(*) AS c FROM challenges")
+        assert row is not None
+        assert row["c"] == 1
+
+    async def test_admin_post_non_admin_denied_with_zero_mutation(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        out = json_roundtrip(await scenario_admin_post(ctx, NON_ADMIN, DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        denial = out["payloads"][0]
+        assert denial["recipient"] == "admin"
+        assert "manage server" in denial["content"].lower()
+        assert out["state"]["outcome"] == "denied"
+        for table in ("songs", "challenges"):
+            row = db.query_one(f"SELECT COUNT(*) AS c FROM {table}")
+            assert row is not None
+            assert row["c"] == 0
+
+    async def test_admin_post_with_empty_catalog_returns_clean_error(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        out = await scenario_admin_post(ctx, ADMIN, DAY1)
+        assert out == {"error": "catalog_empty"}
+        row = db.query_one("SELECT COUNT(*) AS c FROM challenges")
+        assert row is not None
+        assert row["c"] == 0
+
+
+class TestAdminSkip:
+    """The admin-skip scenario drives the REAL /songbot-skip body (pinned #5)."""
+
+    async def test_admin_skip_replaces_song_and_resets_users(
+        self, ctx: HarnessContext, db: Database, tmp_path: Path
+    ) -> None:
+        _add_song(db)
+        _add_song(db, "song-2", title="Digital Horizon", artist="Quantum Drift")
+        await scenario_post(ctx, DAY1)
+        before = db.query_one(
+            "SELECT id, song_id, snippet_offset_sec FROM challenges"
+        )
+        assert before is not None
+        # todd builds in-progress state against the pre-skip song.
+        await scenario_hear_more(ctx, FakeUser(id="todd", name="todd"), 2, DAY1, now_pinned=True)
+        await scenario_guess(ctx, FakeUser(id="todd", name="todd"), WRONG, DAY1, now_pinned=True)
+
+        out = json_roundtrip(await scenario_admin_skip(ctx, ADMIN, DAY1))
+
+        assert kinds(out) == ["ephemeral"], "skip emits no channel/announcement payload"
+        assert out["payloads"][0]["recipient"] == "admin"
+        assert out["state"]["outcome"] == "skipped"
+        assert out["state"]["reason"] is None
+        after = db.query_one("SELECT * FROM challenges WHERE date = '2026-08-13'")
+        assert after is not None
+        assert after["song_id"] != before["song_id"]
+        assert after["snippet_offset_sec"] != before["snippet_offset_sec"]
+        assert after["status"] == "active"
+        assert after["skip_count"] == 1
+        assert out["state"]["challenge"]["song_id"] == after["song_id"]
+        # Per-user state fully reset (cascade delete + recreate).
+        for table in ("challenge_users", "guesses"):
+            row = db.query_one(f"SELECT COUNT(*) AS c FROM {table}")
+            assert row is not None
+            assert row["c"] == 0
+        # The snippet cache was purged and regenerated for the replacement.
+        cache_dir = tmp_path / "snippets" / str(after["id"])
+        assert sorted(p.name for p in cache_dir.glob("*.mp3")) == [
+            "0.mp3", "1.mp3", "2.mp3", "3.mp3", "4.mp3",
+        ]
+        # Secrecy: the ack names neither song.
+        ack = out["payloads"][0]["content"].lower()
+        for secret in (TITLE, ARTIST, "digital horizon", "quantum drift"):
+            assert secret not in ack
+
+    async def test_admin_skip_refused_after_solve_with_zero_mutation(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        _add_song(db, "song-2", title="Digital Horizon", artist="Quantum Drift")
+        await scenario_post(ctx, DAY1)
+        song = db.query_one(
+            "SELECT s.title AS title FROM challenges c JOIN songs s ON s.id = c.song_id"
+        )
+        assert song is not None
+        await scenario_guess(ctx, ALICE, song["title"], DAY1, now_pinned=True)
+
+        out = json_roundtrip(await scenario_admin_skip(ctx, ADMIN, DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        assert out["state"]["outcome"] == "refused"
+        assert out["state"]["reason"] == "solved"
+        challenge = db.query_one("SELECT song_id, status, skip_count FROM challenges")
+        assert challenge is not None
+        assert challenge["status"] == "active"
+        assert challenge["skip_count"] == 0
+        user = db.query_one(
+            "SELECT solved, points_awarded FROM challenge_users WHERE user_id = 'alice'"
+        )
+        assert user is not None
+        assert (user["solved"], user["points_awarded"]) == (1, 100)
+        stats = db.query_one("SELECT total_points, wins FROM user_stats WHERE user_id = 'alice'")
+        assert stats is not None
+        assert (stats["total_points"], stats["wins"]) == (100, 1)
+
+    async def test_admin_skip_refused_when_revealed(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_post(ctx, DAY1)
+        db.execute(
+            "UPDATE challenges SET status = 'revealed',"
+            " revealed_at = '2026-08-13T16:30:00+00:00'"
+        )
+
+        out = json_roundtrip(await scenario_admin_skip(ctx, ADMIN, DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        assert out["state"]["outcome"] == "refused"
+        assert out["state"]["reason"] == "revealed"
+        row = db.query_one("SELECT status, skip_count FROM challenges")
+        assert row is not None
+        assert row["status"] == "revealed"
+        assert row["skip_count"] == 0
+
+    async def test_admin_skip_non_admin_denied_with_zero_mutation(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        _add_song(db, "song-2", title="Digital Horizon", artist="Quantum Drift")
+        await scenario_post(ctx, DAY1)
+        before = db.query_one("SELECT song_id, snippet_offset_sec FROM challenges")
+        assert before is not None
+
+        out = json_roundtrip(await scenario_admin_skip(ctx, NON_ADMIN, DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        assert "manage server" in out["payloads"][0]["content"].lower()
+        assert out["state"]["outcome"] == "denied"
+        after = db.query_one("SELECT song_id, snippet_offset_sec, skip_count FROM challenges")
+        assert after is not None
+        assert after["song_id"] == before["song_id"]
+        assert after["snippet_offset_sec"] == before["snippet_offset_sec"]
+        assert after["skip_count"] == 0
+
+
+class TestAdminReload:
+    """The admin-reload scenario drives the REAL /songbot-reload body."""
+
+    async def test_admin_reload_reports_per_source_summary(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        refresh = RefreshResult(
+            sources=(
+                SourceRefresh(source="local", added=8),
+                SourceRefresh(source="youtube", error="YouTubeCatalogError: boom"),
+            )
+        )
+        engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda: refresh)
+        ctx = HarnessContext(settings=_settings(tmp_path), db=db, engine=engine)
+
+        out = json_roundtrip(await scenario_admin_reload(ctx, ADMIN, DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        ack = out["payloads"][0]
+        assert ack["recipient"] == "admin"
+        content = ack["content"]
+        assert "local" in content
+        assert "8 added" in content
+        assert "youtube" in content
+        assert "YouTubeCatalogError" in content
+        assert out["state"]["outcome"] == "reloaded"
+        assert out["state"]["sources"] == [
+            {
+                "source": "local",
+                "added": 8,
+                "updated": 0,
+                "removed": 0,
+                "retained": 0,
+                "error": None,
+            },
+            {
+                "source": "youtube",
+                "added": 0,
+                "updated": 0,
+                "removed": 0,
+                "retained": 0,
+                "error": "YouTubeCatalogError: boom",
+            },
+        ]
+
+    async def test_admin_reload_with_no_providers_says_so(
+        self, ctx: HarnessContext
+    ) -> None:
+        # _settings disables both providers -> an empty RefreshResult.
+        out = json_roundtrip(await scenario_admin_reload(ctx, ADMIN, DAY1))
+        assert kinds(out) == ["ephemeral"]
+        assert "no catalog sources" in out["payloads"][0]["content"].lower()
+        assert out["state"]["sources"] == []
+
+    async def test_admin_reload_non_admin_denied_without_refreshing(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        calls = 0
+
+        def _spy() -> RefreshResult:
+            nonlocal calls
+            calls += 1
+            return RefreshResult(sources=())
+
+        engine, _ = _make_engine(tmp_path, db, catalog_refresher=_spy)
+        ctx = HarnessContext(settings=_settings(tmp_path), db=db, engine=engine)
+
+        out = json_roundtrip(await scenario_admin_reload(ctx, NON_ADMIN, DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        assert "manage server" in out["payloads"][0]["content"].lower()
+        assert out["state"]["outcome"] == "denied"
+        assert calls == 0, "a denied reload must not touch the catalog"
+        row = db.query_one("SELECT COUNT(*) AS c FROM songs")
+        assert row is not None
+        assert row["c"] == 0
 
 
 class TestSecrecy:

@@ -47,11 +47,24 @@ class RecordedPayload:
 
 
 @dataclass
+class FakePermissions:
+    """Stand-in for ``discord.Permissions`` (only ``manage_guild`` is used).
+
+    The admin command bodies read ``interaction.user.guild_permissions
+    .manage_guild`` — the same attribute a guild ``Member`` exposes — so the
+    same check serves discord.py and the fakes (VAL-ADMIN-009).
+    """
+
+    manage_guild: bool = False
+
+
+@dataclass
 class FakeUser:
-    """Stand-in for ``discord.User``/``Member`` (only ``id``/``name`` used)."""
+    """Stand-in for ``discord.User``/``Member`` (``id``/``name``/permissions)."""
 
     id: int
     name: str
+    guild_permissions: FakePermissions = field(default_factory=FakePermissions)
 
 
 @dataclass
@@ -118,9 +131,13 @@ class FakeInteraction:
     payloads: list[RecordedPayload] = field(default_factory=list)
 
     @classmethod
-    def for_user(cls, user_id: int, name: str) -> FakeInteraction:
+    def for_user(
+        cls, user_id: int, name: str, *, manage_guild: bool = False
+    ) -> FakeInteraction:
         interaction = cls.__new__(cls)
-        interaction.user = FakeUser(user_id, name)
+        interaction.user = FakeUser(
+            user_id, name, FakePermissions(manage_guild=manage_guild)
+        )
         interaction.payloads = []
         interaction.channel = FakeChannel(interaction)
         interaction.response = FakeResponse(interaction)

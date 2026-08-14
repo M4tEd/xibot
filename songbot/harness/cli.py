@@ -33,6 +33,16 @@ challenge (at the configured post time), revealing stale challenges first
 empty state it posts the local date of ``--now`` (or the real clock) with no
 reveal (VAL-CROSS-018).
 
+Admin scenarios — ``admin-post`` / ``admin-skip`` / ``admin-reload`` — drive
+the REAL ``AdminCommands`` bodies (songbot/bot/admin.py) with the invoking
+user's Manage-Guild permission simulated by ``--as-admin``/``--as-non-admin``
+(exactly one required). A denied invocation records exactly one ephemeral
+permission-denied payload and mutates nothing (VAL-ADMIN-009). A same-day
+repeat ``admin-post`` prints the pinned-#4 compact form
+``{"already_posted": true, "messages": []}`` just like ``post``
+(VAL-CROSS-015); an empty catalog prints ``{"error": "catalog_empty"}``
+(pinned #11).
+
 ``serve`` runs ONLY the health endpoint (mode="harness", HEALTH_PORT) and
 makes no Discord requests. The harness never constructs a Discord client, so
 ``DISCORD_BOT_TOKEN`` is never used; a placeholder is substituted when the
@@ -49,8 +59,11 @@ import shutil
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any
+from typing import Any, cast
 
+import discord
+
+from songbot.bot.admin import AdminCommands
 from songbot.bot.embeds import daily_challenge_embed, reveal_embed, snippet_attachment
 from songbot.bot.health import serve_health
 from songbot.bot.modals import GuessModal
@@ -61,6 +74,7 @@ from songbot.engine import CatalogEmptyError, Challenge, EngineError, GameEngine
 from songbot.harness.fakes import (
     FakeChannel,
     FakeInteraction,
+    FakePermissions,
     FakeUser,
     Recorder,
     press_button,
@@ -76,6 +90,9 @@ __all__ = [
     "main",
     "parse_now",
     "parse_user",
+    "scenario_admin_post",
+    "scenario_admin_reload",
+    "scenario_admin_skip",
     "scenario_advance_day",
     "scenario_guess",
     "scenario_hear_more",
@@ -197,6 +214,41 @@ def build_parser() -> argparse.ArgumentParser:
         "advance-day", help="Reveal the previous challenge and post the next day."
     )
     add_now(advance)
+
+    def add_admin_flags(subparser: argparse.ArgumentParser) -> None:
+        """--as-admin/--as-non-admin (exactly one) + the optional invoker."""
+        group = subparser.add_mutually_exclusive_group(required=True)
+        group.add_argument(
+            "--as-admin",
+            action="store_true",
+            help="Simulate an invoker WITH the Manage-Guild permission.",
+        )
+        group.add_argument(
+            "--as-non-admin",
+            action="store_true",
+            help="Simulate an invoker WITHOUT the Manage-Guild permission.",
+        )
+        subparser.add_argument(
+            "--user",
+            default="admin",
+            help="The invoking user, <name> or <id>:<name> (default: 'admin').",
+        )
+        add_now(subparser)
+
+    admin_post = sub.add_parser(
+        "admin-post", help="Run /songbot-post (ensure + post today's challenge)."
+    )
+    add_admin_flags(admin_post)
+
+    admin_skip = sub.add_parser(
+        "admin-skip", help="Run /songbot-skip (replace today's song, pinned #5)."
+    )
+    add_admin_flags(admin_skip)
+
+    admin_reload = sub.add_parser(
+        "admin-reload", help="Run /songbot-reload (refresh the catalog)."
+    )
+    add_admin_flags(admin_reload)
 
     reset = sub.add_parser("reset", help="Wipe all DB tables and the snippet cache.")
     add_now(reset)
@@ -472,6 +524,150 @@ def _advance_target(settings: Settings, db: Database, now: datetime) -> datetime
     return datetime.combine(target_date, time(int(hour), int(minute)), tzinfo=settings.tz)
 
 
+# -- admin scenarios ---------------------------------------------------------------
+#
+# Each drives the REAL AdminCommands body (songbot/bot/admin.py) with a
+# FakeInteraction whose user carries the simulated Manage-Guild permission —
+# the bodies run the identical `has_manage_guild` check the live discord.py
+# commands use (VAL-ADMIN-009).
+
+
+def _admin_user(spec: str, *, as_admin: bool) -> FakeUser:
+    """The invoking admin user with the simulated Manage-Guild permission."""
+    base = parse_user(spec)
+    return FakeUser(
+        id=base.id,
+        name=base.name,
+        guild_permissions=FakePermissions(manage_guild=as_admin),
+    )
+
+
+def _admin_commands(ctx: HarnessContext, recorder: Recorder, now: datetime) -> AdminCommands:
+    """The REAL admin command bodies with the harness post sender injected.
+
+    The sender records the daily post exactly like ``post`` does — built with
+    the REAL embed/view/attachment builders, only the transport is recorded.
+    """
+
+    async def send_daily_post(challenge: Challenge) -> None:
+        _record_daily_post(recorder, ctx, challenge, now)
+
+    return AdminCommands(
+        ctx.engine,
+        ctx.settings,
+        post_sender=send_daily_post,
+        clock=lambda: now,
+    )
+
+
+def _today_challenge_state(ctx: HarnessContext, now: datetime) -> dict[str, Any] | None:
+    """The challenge row for the local date of ``now`` as JSON (or None).
+
+    NEVER includes song title/artist (secrecy, pinned #9) — ``status`` is the
+    only harness surface that exposes song identity (pinned #2).
+    """
+    row = ctx.db.query_one(
+        "SELECT * FROM challenges WHERE guild_id = ? AND date = ?",
+        (ctx.settings.guild_id, _local_date(ctx.settings, now).isoformat()),
+    )
+    if row is None:
+        return None
+    challenge = ChallengeRow.from_row(row)
+    return {
+        "id": challenge.id,
+        "date": challenge.date,
+        "status": challenge.status,
+        "song_id": challenge.song_id,
+        "snippet_offset_sec": challenge.snippet_offset_sec,
+        "skip_count": challenge.skip_count,
+    }
+
+
+async def scenario_admin_post(
+    ctx: HarnessContext, user: FakeUser, now: datetime
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-post body (VAL-ADMIN-001/002/009).
+
+    Success: one ``channel`` payload (the daily post, same shape as the
+    scheduled post) plus one ephemeral ack to the invoker. A same-day repeat
+    prints the pinned-#4 compact form — the body still sends its ephemeral
+    already-posted ack (the live client needs it), but the CLI output mirrors
+    ``post``: ``{"already_posted": true, "messages": []}`` (VAL-CROSS-015).
+    An empty catalog prints the pinned-#11 error. A non-admin invocation
+    records exactly one ephemeral denial and mutates nothing.
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    # The fake is duck-typed, not an Interaction subclass — same cast the
+    # button/modal drivers use (see fakes.press_button).
+    interaction = cast("discord.Interaction[Any]", FakeInteraction(recorder, user))
+    result = await commands.post_now(interaction)
+    if result.outcome == "already_posted":
+        return {"already_posted": True, "messages": []}
+    if result.outcome == "catalog_empty":
+        return {"error": "catalog_empty"}
+    return _transcript(
+        "admin-post",
+        recorder,
+        {"outcome": result.outcome, "challenge": _today_challenge_state(ctx, now)},
+    )
+
+
+async def scenario_admin_skip(
+    ctx: HarnessContext, user: FakeUser, now: datetime
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-skip body (pinned #5, VAL-ADMIN-003..006/009).
+
+    Success: exactly one ephemeral ack (never a channel/announcement payload)
+    after the engine deleted + recreated today's challenge. Refusals
+    (``no_challenge``/``revealed``/``solved``) record one ephemeral refusal
+    with zero mutation; ``state.reason`` carries the machine-readable cause.
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    interaction = cast("discord.Interaction[Any]", FakeInteraction(recorder, user))
+    result = await commands.skip_song(interaction)
+    return _transcript(
+        "admin-skip",
+        recorder,
+        {
+            "outcome": result.outcome,
+            "reason": result.reason,
+            "challenge": _today_challenge_state(ctx, now),
+        },
+    )
+
+
+async def scenario_admin_reload(
+    ctx: HarnessContext, user: FakeUser, now: datetime
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-reload body (VAL-ADMIN-007/008/009).
+
+    The ephemeral ack and ``state.sources`` both report the per-source
+    summary (added/updated/removed/retained, or the source's error).
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    interaction = cast("discord.Interaction[Any]", FakeInteraction(recorder, user))
+    result = await commands.reload_catalog(interaction)
+    sources = [
+        {
+            "source": source.source,
+            "added": source.added,
+            "updated": source.updated,
+            "removed": source.removed,
+            "retained": source.retained,
+            "error": source.error,
+        }
+        for source in (result.refresh.sources if result.refresh is not None else ())
+    ]
+    return _transcript(
+        "admin-reload",
+        recorder,
+        {"outcome": result.outcome, "sources": sources, "counts": _counts(ctx)},
+    )
+
+
 def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
     """Wipe every data table and the snippet cache (schema/migrations survive)."""
     with ctx.db.transaction():
@@ -566,6 +762,18 @@ async def _dispatch(
         return await scenario_leaderboard(ctx, parse_user(args.user), now, now_pinned=now_pinned)
     if args.scenario == "advance-day":
         return await scenario_advance_day(ctx, now)
+    if args.scenario == "admin-post":
+        return await scenario_admin_post(
+            ctx, _admin_user(args.user, as_admin=args.as_admin), now
+        )
+    if args.scenario == "admin-skip":
+        return await scenario_admin_skip(
+            ctx, _admin_user(args.user, as_admin=args.as_admin), now
+        )
+    if args.scenario == "admin-reload":
+        return await scenario_admin_reload(
+            ctx, _admin_user(args.user, as_admin=args.as_admin), now
+        )
     if args.scenario == "reset":
         return scenario_reset(ctx)
     if args.scenario == "status":
