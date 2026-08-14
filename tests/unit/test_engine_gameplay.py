@@ -4,9 +4,10 @@ submit_guess, leaderboard, and streak accounting.
 Deterministic and fast: tmp SQLite DBs, injected `now`, and the fake
 SnippetService shared with the daily-lifecycle tests. Contract coverage
 (engine level): VAL-GUESS-002..011, VAL-GUESS-014, VAL-GUESS-018,
-VAL-SCORE-001..010, and pinned decisions #6 (round-half-up bonus), #7
-(effective streak on read), #13 (rejected submissions not logged), #15
-(empty guesses rejected as validation).
+VAL-GUESS-019 (revealed-challenge lockout), VAL-SCORE-001..010, and pinned
+decisions #6 (round-half-up bonus), #7 (effective streak on read), #13
+(rejected submissions not logged), #15 (empty guesses rejected as
+validation).
 """
 
 from __future__ import annotations
@@ -577,3 +578,140 @@ class TestLeaderboard:
         engine.unlock_snippet(challenge_id, "frank")
         engine.submit_guess(challenge_id, "grace", WRONG, NOW)
         assert engine.leaderboard("g1", NOW) == []
+
+
+def _db_snapshot(db: Database) -> dict[str, list[dict[str, object]]]:
+    """Full-content dump of every mutable table, for zero-mutation proofs."""
+    return {
+        "challenges": [dict(r) for r in db.query("SELECT * FROM challenges ORDER BY id")],
+        "challenge_users": [
+            dict(r)
+            for r in db.query(
+                "SELECT * FROM challenge_users ORDER BY challenge_id, user_id"
+            )
+        ],
+        "guesses": [dict(r) for r in db.query("SELECT * FROM guesses ORDER BY id")],
+        "user_stats": [
+            dict(r)
+            for r in db.query("SELECT * FROM user_stats ORDER BY guild_id, user_id")
+        ],
+    }
+
+
+class TestRevealedChallengeLockout:
+    """VAL-GUESS-019 (engine half): a revealed challenge refuses all gameplay.
+
+    After the daily reveal the answer is public, so the persistent view on
+    yesterday's message must not farm points: ``submit_guess`` returns
+    ``challenge_closed`` and ``unlock_snippet`` raises ``UnlockRefusedError``
+    with reason ``"closed"`` — both with ZERO mutation (no guesses rows, no
+    points, no challenge_users/user_stats changes, no snippet-level change).
+    """
+
+    def test_correct_guess_on_revealed_challenge_refused_with_zero_mutation(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        # Pre-reveal activity that must survive the refusal untouched.
+        engine.unlock_snippet(challenge_id, "alice")
+        engine.submit_guess(challenge_id, "alice", WRONG, NOW)
+        reveal = engine.get_reveal("g1", DAY2)  # the day-advance path
+        assert reveal is not None
+        assert reveal.challenge_id == challenge_id
+
+        before = _db_snapshot(db)
+        result = engine.submit_guess(challenge_id, "alice", TITLE, DAY2)  # correct answer
+
+        assert result.outcome == "challenge_closed"
+        assert result.matched_title is False
+        assert result.matched_artist is False
+        assert result.is_both is False
+        assert result.points_awarded == 0
+        assert result.announce is False
+        assert result.guesses_used == 1  # the unchanged pre-reveal count
+        assert result.guesses_left == 5
+        assert _db_snapshot(db) == before
+
+    def test_unlock_on_revealed_challenge_refused_with_zero_mutation(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, fake = _make_engine(tmp_path, db)
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        engine.unlock_snippet(challenge_id, "alice")  # alice at level 1
+        assert engine.get_reveal("g1", DAY2) is not None
+
+        before = _db_snapshot(db)
+        ensure_calls_before = len(fake.ensure_calls)
+        with pytest.raises(UnlockRefusedError) as excinfo:
+            engine.unlock_snippet(challenge_id, "alice")
+
+        assert excinfo.value.reason == "closed"
+        assert _db_snapshot(db) == before
+        assert _challenge_user(db, challenge_id, "alice")["snippet_level"] == 1
+        # The refusal precedes the snippet re-heal: no ensure_snippets call.
+        assert len(fake.ensure_calls) == ensure_calls_before
+
+    def test_fresh_user_refused_without_creating_any_rows(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """A first-time interactor is refused AND no challenge_users row is
+        upserted — a lockout refusal is not an interaction (contrast #13)."""
+        engine, _ = _make_engine(tmp_path, db)
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        assert engine.get_reveal("g1", DAY2) is not None
+
+        before = _db_snapshot(db)
+        result = engine.submit_guess(challenge_id, "bob", TITLE, DAY2)
+        assert result.outcome == "challenge_closed"
+        assert result.guesses_used == 0
+        assert result.guesses_left == 6
+        with pytest.raises(UnlockRefusedError) as excinfo:
+            engine.unlock_snippet(challenge_id, "bob")
+        assert excinfo.value.reason == "closed"
+
+        assert _db_snapshot(db) == before
+        assert db.query("SELECT * FROM challenge_users") == []
+        assert db.query("SELECT * FROM user_stats") == []
+
+    def test_lockout_dominates_the_already_solved_refusal(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """Check order: closed beats already_solved, and the solver's banked
+        state (100 points, streak) stays exactly as earned."""
+        engine, _ = _make_engine(tmp_path, db)
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        _solve(engine, challenge_id, "alice", NOW)
+        assert engine.get_reveal("g1", DAY2) is not None
+
+        before = _db_snapshot(db)
+        result = engine.submit_guess(challenge_id, "alice", ARTIST, DAY2)
+        assert result.outcome == "challenge_closed"
+        assert result.guesses_used == 1
+        with pytest.raises(UnlockRefusedError) as excinfo:
+            engine.unlock_snippet(challenge_id, "alice")
+        assert excinfo.value.reason == "closed"
+
+        assert _db_snapshot(db) == before
+        stats = _user_stats(db, "alice")
+        assert stats is not None
+        assert stats["total_points"] == 100
+
+    def test_empty_guess_on_revealed_challenge_reports_closed(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """Check order: the closed lockout is evaluated before the pinned-#15
+        empty-guess validation — the adapter only needs the closed message."""
+        engine, _ = _make_engine(tmp_path, db)
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        assert engine.get_reveal("g1", DAY2) is not None
+
+        result = engine.submit_guess(challenge_id, "alice", "   ", DAY2)
+        assert result.outcome == "challenge_closed"
+        assert db.query("SELECT * FROM guesses") == []
+        assert db.query("SELECT * FROM challenge_users") == []

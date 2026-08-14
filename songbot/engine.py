@@ -12,7 +12,9 @@ Gameplay: ``unlock_snippet`` (per-user snippet ladder 0..4 with descending
 point potential), ``submit_guess`` (fuzzy matching, scoring with the pinned
 round-half-up both-bonus, guess log, wins/streaks — all atomic), and
 ``leaderboard`` (total_points DESC, wins DESC, user_id ASC; effective streak
-computed on read, pinned #7).
+computed on read, pinned #7). Both gameplay entry points refuse revealed
+challenges with zero mutation (the VAL-GUESS-019 lockout: ``challenge_closed``
+/ ``UnlockRefusedError(reason="closed")``).
 
 Determinism: song and offset are drawn from ``random.Random`` seeded by
 ``sha256(date | guild_id | skip_count)`` — stable across processes (never
@@ -69,15 +71,20 @@ logger = logging.getLogger(__name__)
 SkipRefusedReason = Literal["no_challenge", "revealed", "solved"]
 """Why `skip_today_song` refused (pinned decision #5)."""
 
-UnlockRefusedReason = Literal["solved", "max_level"]
-"""Why `unlock_snippet` refused: the user already solved, or is at max level."""
+UnlockRefusedReason = Literal["solved", "max_level", "closed"]
+"""Why `unlock_snippet` refused: the challenge is closed (no longer active),
+the user already solved, or the user is at max level."""
 
-GuessOutcome = Literal["correct", "wrong", "already_solved", "limit_reached", "empty"]
+GuessOutcome = Literal[
+    "correct", "wrong", "already_solved", "limit_reached", "empty", "challenge_closed"
+]
 """The result of a `submit_guess` submission.
 
-``empty`` is the pinned-#15 validation rejection (empty after stripping):
-never counted, never logged. ``already_solved``/``limit_reached`` rejections
-are likewise not logged and do not consume a guess (pinned #13).
+``challenge_closed`` is the revealed-challenge lockout (VAL-GUESS-019): the
+challenge is no longer ``active``, so the submission is refused with zero
+mutation. ``empty`` is the pinned-#15 validation rejection (empty after
+stripping): never counted, never logged. ``already_solved``/``limit_reached``
+rejections are likewise not logged and do not consume a guess (pinned #13).
 """
 
 
@@ -109,7 +116,8 @@ class SkipRefusedError(EngineError):
 class UnlockRefusedError(EngineError):
     """unlock_snippet refused with zero state mutation.
 
-    ``reason`` is ``"solved"`` (the user already solved this challenge) or
+    ``reason`` is ``"closed"`` (the challenge is no longer active — revealed;
+    VAL-GUESS-019), ``"solved"`` (the user already solved this challenge) or
     ``"max_level"`` (the user already unlocked the longest snippet).
     """
 
@@ -590,14 +598,24 @@ class GameEngine:
 
         Increments the user's ``snippet_level`` (0 -> 4) and returns the new
         level's snippet path and remaining point potential. Refused with zero
-        mutation (``UnlockRefusedError``) when the user already solved this
-        challenge or is already at the maximum level. The per-user row is
-        upserted on this first interaction (pinned #13). The snippet cache is
-        re-healed on every unlock (idempotent ``ensure_snippets``, pinned #14).
+        mutation (``UnlockRefusedError``) when the challenge is no longer
+        active (``"closed"`` — the revealed-challenge lockout, VAL-GUESS-019),
+        when the user already solved this challenge, or is already at the
+        maximum level. The per-user row is upserted on this first interaction
+        (pinned #13). The snippet cache is re-healed on every unlock
+        (idempotent ``ensure_snippets``, pinned #14).
 
         Writes no timestamps, so it needs no injected ``now``.
         """
         challenge = self._challenge_row_by_id(challenge_id)
+        if challenge.status != "active":
+            # Revealed-challenge lockout (VAL-GUESS-019): the answer is public,
+            # so the persistent view on the old message must not unlock audio.
+            # Refuse before any upsert or snippet re-heal — zero mutation.
+            raise UnlockRefusedError(
+                "closed",
+                f"challenge {challenge_id} is {challenge.status}; gameplay is closed",
+            )
         max_level = len(self._settings.snippet_lengths) - 1
         with self._db.transaction():
             state = self._challenge_user_row(challenge_id, user_id)
@@ -640,18 +658,38 @@ class GameEngine:
     ) -> GuessResult:
         """Process one guess; update per-user state, the guess log, and stats.
 
-        Outcomes (see `GuessOutcome`): an empty-after-strip guess is a
-        validation rejection — not counted, not logged, never matching
-        (pinned #15). Post-solve and post-limit submissions are rejected
-        without state change or log rows (pinned #13). Any other submission
-        consumes one of the day's guesses (the winning guess included) and is
-        logged verbatim. A correct guess banks ``SNIPPET_POINTS[level]`` —
-        round-half-up x1.5 when one guess matches BOTH title and artist
-        (pinned #6) — and updates ``user_stats`` (points, wins, streaks).
-        All writes happen in one transaction.
+        Outcomes (see `GuessOutcome`): a submission against a challenge that
+        is no longer ``active`` (revealed) is refused as ``challenge_closed``
+        with zero mutation (VAL-GUESS-019) — this lockout dominates every
+        other refusal, including ``empty`` and ``already_solved``. An
+        empty-after-strip guess is a validation rejection — not counted, not
+        logged, never matching (pinned #15). Post-solve and post-limit
+        submissions are rejected without state change or log rows
+        (pinned #13). Any other submission consumes one of the day's guesses
+        (the winning guess included) and is logged verbatim. A correct guess
+        banks ``SNIPPET_POINTS[level]`` — round-half-up x1.5 when one guess
+        matches BOTH title and artist (pinned #6) — and updates
+        ``user_stats`` (points, wins, streaks). All writes happen in one
+        transaction.
         """
         challenge = self._challenge_row_by_id(challenge_id)
         max_guesses = self._settings.max_guesses_per_day
+
+        if challenge.status != "active":
+            # Revealed-challenge lockout (VAL-GUESS-019): the answer is public,
+            # so the persistent view on the old message must not farm points.
+            state = self._challenge_user_row(challenge_id, user_id)
+            used = state.guesses_used if state is not None else 0
+            return GuessResult(
+                outcome="challenge_closed",
+                matched_title=False,
+                matched_artist=False,
+                is_both=False,
+                guesses_used=used,
+                guesses_left=max_guesses - used,
+                points_awarded=0,
+                announce=False,
+            )
 
         stripped = text.strip()
         if not stripped:
