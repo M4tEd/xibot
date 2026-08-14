@@ -6,14 +6,15 @@ offset fidelity (reference-cut comparison), cross-level prefix consistency,
 idempotent caching, m4a -> mp3 re-encode, the YouTube section-download flow,
 and clean failure semantics (named errors, no partial cache artifacts).
 
-Network: only ``test_real_youtube_section_download`` touches the network
-(YouTube is allowed by mission boundaries); everything else is fully local.
+Network: only the ``TestRealYouTube`` class touches the network (YouTube is
+allowed by mission boundaries); everything else is fully local.
 """
 
 from __future__ import annotations
 
 import hashlib
 import subprocess
+import time
 from array import array
 from pathlib import Path
 
@@ -528,8 +529,40 @@ def real_youtube_song() -> Song:
     return song
 
 
+_FULL_AUDIO_ATTEMPTS = 3
+"""Full-audio download attempts before giving up (fresh extraction per attempt)."""
+
+
 def _download_full_audio(url: str, dest_base: Path) -> Path:
-    """Fetch the complete bestaudio file via yt-dlp's native downloader."""
+    """Fetch the complete bestaudio file via yt-dlp's native downloader.
+
+    Mirrors the retry pattern of ``snippets.download_section_with_timeout``:
+    up to ``_FULL_AUDIO_ATTEMPTS`` attempts with a FRESH extraction (hence a
+    fresh googlevideo URL) per attempt, because googlevideo intermittently
+    answers a transient 403 that only a fresh URL clears. Partial output of
+    failed attempts is removed so no stray artifacts survive.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, _FULL_AUDIO_ATTEMPTS + 1):
+        try:
+            return _download_full_audio_once(url, dest_base)
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"full-audio download attempt {attempt}/{_FULL_AUDIO_ATTEMPTS} "
+                f"for {url!r} failed: {exc}"
+            )
+            for leftover in dest_base.parent.glob(f"{dest_base.name}.*"):
+                leftover.unlink(missing_ok=True)
+            if attempt < _FULL_AUDIO_ATTEMPTS:
+                time.sleep(min(2.0 ** (attempt - 1), 4.0))
+    raise AssertionError(
+        f"full-audio download failed after {_FULL_AUDIO_ATTEMPTS} attempts: {last_error}"
+    )
+
+
+def _download_full_audio_once(url: str, dest_base: Path) -> Path:
+    """Single full-audio download attempt (one fresh yt-dlp extraction)."""
     options: dict[str, object] = {
         "format": "bestaudio/best",
         "outtmpl": f"{dest_base}.%(ext)s",
@@ -545,7 +578,8 @@ def _download_full_audio(url: str, dest_base: Path) -> Path:
         for p in dest_base.parent.glob(f"{dest_base.name}.*")
         if p.suffix != ".part" and p.is_file() and p.stat().st_size > 0
     ]
-    assert matches, f"full-audio download produced no file at {dest_base}.*"
+    if not matches:
+        raise RuntimeError(f"full-audio download produced no file at {dest_base}.*")
     return sorted(matches)[0]
 
 
@@ -566,8 +600,88 @@ def _best_alignment_shift(
     return best
 
 
+class TestFullAudioDownloadRetry:
+    """The full-audio helper mirrors the section downloader's retry pattern.
+
+    Transient googlevideo 403s must be absorbed by retrying with a fresh
+    extraction (fresh URL) per attempt — never by skipping the assertion.
+    Fully local: yt-dlp is stubbed out.
+    """
+
+    def test_retries_with_fresh_extraction_until_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        downloads: list[list[str]] = []
+
+        class FakeYoutubeDL:
+            def __init__(self, options: dict[str, object]) -> None:
+                self.options = options
+
+            def __enter__(self) -> FakeYoutubeDL:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def download(self, urls: list[str]) -> None:
+                downloads.append(list(urls))
+                if len(downloads) < 3:
+                    # A failed attempt leaves a .part file the retry must clean up
+                    # (a real successful yt-dlp run renames it to the final name).
+                    (tmp_path / "full.webm.part").write_bytes(b"partial")
+                    raise RuntimeError("HTTP Error 403: Forbidden")
+                (tmp_path / "full.webm").write_bytes(b"full audio")
+
+        monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYoutubeDL)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        result = _download_full_audio("https://www.youtube.com/watch?v=x", tmp_path / "full")
+
+        assert result == tmp_path / "full.webm"
+        assert downloads == [["https://www.youtube.com/watch?v=x"]] * 3
+        assert list(tmp_path.glob("*.part")) == [], "stale .part file survived the retries"
+
+    def test_gives_up_after_three_attempts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = 0
+
+        class AlwaysForbidden:
+            def __init__(self, options: dict[str, object]) -> None:
+                self.options = options
+
+            def __enter__(self) -> AlwaysForbidden:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def download(self, urls: list[str]) -> None:
+                nonlocal calls
+                calls += 1
+                raise RuntimeError("HTTP Error 403: Forbidden")
+
+        monkeypatch.setattr(yt_dlp, "YoutubeDL", AlwaysForbidden)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        with pytest.raises(AssertionError, match="after 3 attempts"):
+            _download_full_audio("https://www.youtube.com/watch?v=x", tmp_path / "full")
+        assert calls == 3
+
+
+@pytest.mark.flaky(reruns=3, reruns_delay=30, reruns_delay_backoff_factor=2.0)
 class TestRealYouTube:
-    """VAL-SNIP-010 generator-level shape against the real YouTube video."""
+    """VAL-SNIP-010 generator-level shape against the real YouTube video.
+
+    Bounded auto-rerun (pytest-rerunfailures): googlevideo throttling comes in
+    windows lasting minutes (observed 2026-08-13: a window outlasted 3 test
+    executions with 30s gaps — every in-helper retry attempt 403ed), so the
+    rerun delays back off exponentially (30s/60s/120s) to span such a window.
+    One transient 403 — or one multi-minute throttle window — must not fail
+    the full-suite gate. Reruns re-execute the REAL network assertions:
+    nothing is ever skipped, and a genuine regression fails consistently
+    across all 4 executions and still fails the suite.
+    """
 
     def test_real_youtube_section_download(self, tmp_path: Path, real_youtube_song: Song) -> None:
         offset = 30.0  # safe: every playlist entry is >= 105s
