@@ -6,7 +6,8 @@ Daily lifecycle: ``ensure_today_challenge`` (idempotent per (guild, local
 date), no-repeat song selection with history reset, deterministic seeded
 song+offset picks, catalog auto-bootstrap, snippet cache re-heal),
 ``get_reveal`` (mark the previous challenge revealed, return song + winners
-in solve order), and ``skip_today_song`` (pinned decision #5).
+in solve order), ``skip_today_song`` (pinned decision #5), and
+``delete_challenge`` (the pinned-#16 delivery-failure rollback).
 
 Gameplay: ``unlock_snippet`` (per-user snippet ladder 0..4 with descending
 point potential), ``submit_guess`` (fuzzy matching, scoring with the pinned
@@ -586,6 +587,22 @@ class GameEngine:
             # The old row is already gone; do not leave a snippet-less row.
             self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
             raise
+
+    def delete_challenge(self, challenge_id: int) -> None:
+        """Roll back a just-created challenge whose channel post failed (pinned #16).
+
+        Mirrors skip_today_song's delete path WITHOUT the recreate: the row is
+        DELETEd (challenge_users and guesses cascade-delete — none can exist
+        for a just-created challenge) and its snippet cache is purged. The
+        daily-post paths (scheduler tick, admin post, harness post) call this
+        ONLY for a challenge they created in the same call
+        (``Challenge.created``) when sending the channel message fails; a
+        pre-existing challenge row is never rolled back. After the rollback a
+        retry recreates the identical challenge (deterministic
+        date+guild+skip_count seed) and delivers it.
+        """
+        self._db.execute("DELETE FROM challenges WHERE id = ?", (challenge_id,))
+        self._snippets.purge_challenge(challenge_id)
 
     def refresh_catalog(self) -> RefreshResult:
         """Passthrough for the admin reload-catalog command."""

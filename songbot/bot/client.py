@@ -356,7 +356,15 @@ class SongBotClient(discord.Client):
             )
             return
         if challenge.created:
-            await self._post_sender(challenge)
+            try:
+                await self._post_sender(challenge)
+            except Exception:
+                # Pinned #16: roll back the just-created challenge (never a
+                # pre-existing row) so the day is not suppressed — the next
+                # tick (60s backoff via `_scheduler_tick`) recreates the
+                # identical challenge and retries the send.
+                self._engine.delete_challenge(challenge.id)
+                raise
             # Keep the persistent fallback binding pointed at the latest
             # challenge within this session too (same custom_ids overwrite the
             # restart-registration entry).

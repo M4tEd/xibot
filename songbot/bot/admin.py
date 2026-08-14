@@ -19,7 +19,9 @@ payload; both build the message with the shared real builders
 Pinned decisions honored here: #4 (a same-day repeat post is idempotent and
 never double-posts), #5 (skip is refused after a solve/reveal with zero
 mutation; otherwise delete+recreate with no channel payload), #9 (no ack
-ever names the song), #11 (empty catalog -> a clear ack, no challenge row).
+ever names the song), #11 (empty catalog -> a clear ack, no challenge row),
+#16 (a failed post send rolls back the just-created challenge so a retry
+reposts it; a pre-existing row is never rolled back).
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from discord import app_commands
 from songbot.bot.embeds import (
     ADMIN_CATALOG_EMPTY_MESSAGE,
     ADMIN_POST_ALREADY_MESSAGE,
+    ADMIN_POST_FAILED_MESSAGE,
     ADMIN_POST_SUCCESS_MESSAGE,
     ADMIN_SKIP_SUCCESS_MESSAGE,
     PERMISSION_DENIED_MESSAGE,
@@ -60,9 +63,21 @@ __all__ = [
 ]
 
 AdminOutcome = Literal[
-    "posted", "already_posted", "catalog_empty", "denied", "skipped", "refused", "reloaded"
+    "posted",
+    "already_posted",
+    "catalog_empty",
+    "denied",
+    "skipped",
+    "refused",
+    "reloaded",
+    "error",
 ]
-"""The machine-readable outcome of an admin command body."""
+"""The machine-readable outcome of an admin command body.
+
+``error`` is the pinned-#16 delivery failure: the daily-post send raised for
+a challenge the call just created, which was rolled back (row deleted,
+snippet cache purged) so a retry reposts the identical challenge.
+"""
 
 DailyPostSender = Callable[[Challenge], Awaitable[None]]
 """Sends (or records) the daily challenge post for a freshly created challenge.
@@ -80,12 +95,14 @@ class AdminResult:
     discord.py ignores callback return values; the harness uses the outcome
     to shape its JSON output (e.g. the pinned-#4 ``already_posted`` compact
     form). ``reason`` is set for ``refused`` skips; ``refresh`` carries the
-    per-source catalog summary for ``reloaded``.
+    per-source catalog summary for ``reloaded``; ``error`` carries the send
+    failure's message for ``error`` (pinned #16).
     """
 
     outcome: AdminOutcome
     reason: SkipRefusedReason | None = None
     refresh: RefreshResult | None = None
+    error: str | None = None
 
 
 def has_manage_guild(interaction: discord.Interaction[Any]) -> bool:
@@ -134,7 +151,11 @@ class AdminCommands:
 
         Idempotent (pinned #4): an existing challenge yields the
         already-posted ack and no second post. An empty catalog (pinned #11)
-        yields the empty-catalog ack and no challenge row.
+        yields the empty-catalog ack and no challenge row. If the channel
+        send fails for the challenge THIS call created (pinned #16), the
+        challenge is rolled back (row deleted, snippet cache purged) so a
+        retry reposts the identical challenge — a transient send failure can
+        never suppress the day — and the admin gets an ephemeral error ack.
         """
         if not has_manage_guild(interaction):
             return await self._deny(interaction)
@@ -152,7 +173,16 @@ class AdminCommands:
                 ADMIN_POST_ALREADY_MESSAGE, ephemeral=True
             )
             return AdminResult("already_posted")
-        await self._post_sender(challenge)
+        try:
+            await self._post_sender(challenge)
+        except Exception as exc:
+            # Pinned #16: roll back the just-created challenge (never a
+            # pre-existing row) so the retry recreates it identically.
+            self._engine.delete_challenge(challenge.id)
+            await interaction.response.send_message(
+                ADMIN_POST_FAILED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("error", error=str(exc))
         await interaction.response.send_message(ADMIN_POST_SUCCESS_MESSAGE, ephemeral=True)
         return AdminResult("posted")
 

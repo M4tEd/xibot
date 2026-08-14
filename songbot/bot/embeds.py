@@ -32,6 +32,7 @@ from songbot.engine import (
 __all__ = [
     "ADMIN_CATALOG_EMPTY_MESSAGE",
     "ADMIN_POST_ALREADY_MESSAGE",
+    "ADMIN_POST_FAILED_MESSAGE",
     "ADMIN_POST_SUCCESS_MESSAGE",
     "ADMIN_SKIP_SUCCESS_MESSAGE",
     "ATTACHMENT_FILENAME",
@@ -85,6 +86,17 @@ ADMIN_CATALOG_EMPTY_MESSAGE = (
     "📭 The catalog is empty — add songs to a catalog source, then /songbot-reload."
 )
 """Ephemeral ack when /songbot-post finds no songs at all (pinned #11)."""
+
+ADMIN_POST_FAILED_MESSAGE = (
+    "⚠️ Couldn't deliver today's challenge post — the channel send failed. "
+    "Nothing was saved; please try again."
+)
+"""Ephemeral ack when the /songbot-post channel send fails (pinned #16).
+
+Generic on purpose: no transport internals and never the song identity. The
+just-created challenge was rolled back, so a retry reposts the identical
+challenge.
+"""
 
 ADMIN_SKIP_SUCCESS_MESSAGE = "⏭️ Skipped — today's song has been replaced with a new one."
 """Ephemeral ack for a successful /songbot-skip (never names either song)."""

@@ -12,7 +12,10 @@ recipient}`` (pinned #3 taxonomy: channel / announcement / ephemeral, plus
 ``modal`` for the guess-modal handover). Two pinned exact-shape outputs:
 a same-day repeat ``post`` prints ``{"already_posted": true, "messages": []}``
 (pinned #4) and an empty catalog at post time prints
-``{"error": "catalog_empty"}`` (pinned #11); domain errors exit 1.
+``{"error": "catalog_empty"}`` (pinned #11); domain errors exit 1. A failed
+daily-post send rolls the just-created challenge back and prints
+``{"error": "post_failed", "message": ...}`` (pinned #16, exit 1) — the retry
+reposts the identical challenge.
 
 Clock (pinned #1): every scenario accepts ``--now "ISO-8601"``; the engine
 only ever sees the injected time. Users (pinned #2): ``--user alice`` uses
@@ -56,7 +59,7 @@ import asyncio
 import json
 import os
 import shutil
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, cast
@@ -85,6 +88,7 @@ from songbot.snippets import SnippetError, SnippetGenerator
 __all__ = [
     "NO_ACTIVE_CHALLENGE_MESSAGE",
     "HarnessContext",
+    "RecordPost",
     "UsageError",
     "build_parser",
     "main",
@@ -131,6 +135,15 @@ class HarnessContext:
     def close(self) -> None:
         """Close the database connection (one-shot process hygiene)."""
         self.db.close()
+
+
+RecordPost = Callable[[Recorder, HarnessContext, Challenge, datetime], None]
+"""The harness's daily-post "send": record the channel payload.
+
+Default ``_record_daily_post`` (the real builders, recorded transport). Tests
+inject a failing seam to exercise the pinned-#16 delivery-failure rollback;
+the CLI itself always uses the default.
+"""
 
 
 # -- argument parsing helpers ---------------------------------------------------
@@ -388,15 +401,22 @@ def _record_daily_post(
 # -- scenarios ---------------------------------------------------------------------
 
 
-async def scenario_post(ctx: HarnessContext, now: datetime) -> dict[str, Any]:
+async def scenario_post(
+    ctx: HarnessContext, now: datetime, *, record_post: RecordPost | None = None
+) -> dict[str, Any]:
     """Ensure today's challenge via the engine and record the daily post.
 
     Idempotent (pinned #4): a same-day repeat prints exactly
     ``{"already_posted": true, "messages": []}`` — no second channel payload,
     no state change (the engine still re-heals the snippet cache, pinned #14).
     An empty catalog even after the auto-bootstrap yields the pinned-#11
-    ``{"error": "catalog_empty"}`` with no challenge row and no payload.
+    ``{"error": "catalog_empty"}`` with no challenge row and no payload. If
+    recording the channel payload fails for the challenge THIS call created
+    (pinned #16), the challenge is rolled back (row deleted, snippet cache
+    purged) and the scenario prints ``{"error": "post_failed", ...}`` (exit 1)
+    — a retry recreates the identical challenge and delivers it.
     """
+    record = record_post if record_post is not None else _record_daily_post
     try:
         challenge = ctx.engine.ensure_today_challenge(
             ctx.settings.guild_id, ctx.settings.channel_id, now
@@ -406,7 +426,13 @@ async def scenario_post(ctx: HarnessContext, now: datetime) -> dict[str, Any]:
     if not challenge.created:
         return {"already_posted": True, "messages": []}
     recorder = Recorder()
-    _record_daily_post(recorder, ctx, challenge, now)
+    try:
+        record(recorder, ctx, challenge, now)
+    except Exception as exc:
+        # Pinned #16: roll back the just-created challenge (never a
+        # pre-existing row) so a transient send failure never suppresses the day.
+        ctx.engine.delete_challenge(challenge.id)
+        return {"error": "post_failed", "message": str(exc)}
     return _transcript("post", recorder, {"challenge": _challenge_state(challenge)})
 
 
@@ -474,14 +500,20 @@ async def scenario_leaderboard(
     )
 
 
-async def scenario_advance_day(ctx: HarnessContext, now: datetime) -> dict[str, Any]:
+async def scenario_advance_day(
+    ctx: HarnessContext, now: datetime, *, record_post: RecordPost | None = None
+) -> dict[str, Any]:
     """Reveal the previous challenge, then post the next day's challenge.
 
     State-anchored (pinned #1 sugar): the target is the day AFTER the guild's
     latest challenge at the configured post time; from an empty state it is
     the local date of ``now``. The reveal announcement is recorded BEFORE the
-    new daily post payload (pinned #3).
+    new daily post payload (pinned #3). A failed daily-post send rolls back
+    the just-created challenge (pinned #16) and prints
+    ``{"error": "post_failed", ...}`` (exit 1); the already-sent reveal is
+    idempotent, so the retry records exactly one new daily post.
     """
+    record = record_post if record_post is not None else _record_daily_post
     recorder = Recorder()
     target = _advance_target(ctx.settings, ctx.db, now)
     reveal = ctx.engine.get_reveal(ctx.settings.guild_id, target)
@@ -501,7 +533,13 @@ async def scenario_advance_day(ctx: HarnessContext, now: datetime) -> dict[str, 
     except CatalogEmptyError:
         return {"error": "catalog_empty"}
     if challenge.created:
-        _record_daily_post(recorder, ctx, challenge, target)
+        try:
+            record(recorder, ctx, challenge, target)
+        except Exception as exc:
+            # Pinned #16: roll back the just-created challenge (never a
+            # pre-existing row) so the retry reposts the identical challenge.
+            ctx.engine.delete_challenge(challenge.id)
+            return {"error": "post_failed", "message": str(exc)}
     return _transcript(
         "advance-day",
         recorder,
@@ -542,15 +580,23 @@ def _admin_user(spec: str, *, as_admin: bool) -> FakeUser:
     )
 
 
-def _admin_commands(ctx: HarnessContext, recorder: Recorder, now: datetime) -> AdminCommands:
+def _admin_commands(
+    ctx: HarnessContext,
+    recorder: Recorder,
+    now: datetime,
+    *,
+    record_post: RecordPost | None = None,
+) -> AdminCommands:
     """The REAL admin command bodies with the harness post sender injected.
 
     The sender records the daily post exactly like ``post`` does — built with
     the REAL embed/view/attachment builders, only the transport is recorded.
+    ``record_post`` is the pinned-#16 failure-injection seam for tests.
     """
+    record = record_post if record_post is not None else _record_daily_post
 
     async def send_daily_post(challenge: Challenge) -> None:
-        _record_daily_post(recorder, ctx, challenge, now)
+        record(recorder, ctx, challenge, now)
 
     return AdminCommands(
         ctx.engine,
@@ -584,7 +630,11 @@ def _today_challenge_state(ctx: HarnessContext, now: datetime) -> dict[str, Any]
 
 
 async def scenario_admin_post(
-    ctx: HarnessContext, user: FakeUser, now: datetime
+    ctx: HarnessContext,
+    user: FakeUser,
+    now: datetime,
+    *,
+    record_post: RecordPost | None = None,
 ) -> dict[str, Any]:
     """Drive the REAL /songbot-post body (VAL-ADMIN-001/002/009).
 
@@ -593,11 +643,13 @@ async def scenario_admin_post(
     prints the pinned-#4 compact form — the body still sends its ephemeral
     already-posted ack (the live client needs it), but the CLI output mirrors
     ``post``: ``{"already_posted": true, "messages": []}`` (VAL-CROSS-015).
-    An empty catalog prints the pinned-#11 error. A non-admin invocation
+    An empty catalog prints the pinned-#11 error. A failed send of the
+    just-created challenge (pinned #16) rolls it back and prints
+    ``{"error": "post_failed", ...}`` (exit 1). A non-admin invocation
     records exactly one ephemeral denial and mutates nothing.
     """
     recorder = Recorder()
-    commands = _admin_commands(ctx, recorder, now)
+    commands = _admin_commands(ctx, recorder, now, record_post=record_post)
     # The fake is duck-typed, not an Interaction subclass — same cast the
     # button/modal drivers use (see fakes.press_button).
     interaction = cast("discord.Interaction[Any]", FakeInteraction(recorder, user))
@@ -606,6 +658,8 @@ async def scenario_admin_post(
         return {"already_posted": True, "messages": []}
     if result.outcome == "catalog_empty":
         return {"error": "catalog_empty"}
+    if result.outcome == "error":
+        return {"error": "post_failed", "message": result.error}
     return _transcript(
         "admin-post",
         recorder,
