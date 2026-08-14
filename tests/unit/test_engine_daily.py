@@ -8,9 +8,9 @@ no-repeat/reset selection (VAL-DAILY-006/007 engine level), pinned decisions
 #5 (skip-song), #11 (catalog bootstrap / catalog_empty), #14 (snippet cache
 re-heal), and the per-guild isolation of VAL-SCORE-013.
 
-The full VAL-SCORE-013 assertion (submit_guess + leaderboard) depends on the
-engine-gameplay-matching feature; a ready-made test is included here, skipped
-until that feature lands.
+The full VAL-SCORE-013 assertion (submit_guess + leaderboard) lives in
+`TestPerGuildIsolation::test_stats_isolated_per_guild` (unskipped by the
+engine-gameplay-matching feature).
 """
 
 from __future__ import annotations
@@ -395,15 +395,8 @@ class TestPerGuildIsolation:
         assert g1_row is not None
         assert g1_row["status"] == "revealed"
 
-    @pytest.mark.skip(
-        reason="needs GameEngine.submit_guess/leaderboard from engine-gameplay-matching"
-    )
     def test_stats_isolated_per_guild(self, db: Database, tmp_path: Path) -> None:
-        """VAL-SCORE-013 (full): a solve in G1 must not appear in G2.
-
-        Ready-made acceptance test for the gameplay feature: unskip once
-        submit_guess/leaderboard exist.
-        """
+        """VAL-SCORE-013 (full): a solve in G1 must not appear in G2."""
         _add_songs(db, 4)
         engine, _ = _make_engine(tmp_path, db)
         engine.ensure_today_challenge("G1", "c1", NOW)
@@ -413,10 +406,10 @@ class TestPerGuildIsolation:
         assert g1 is not None
         song = db.query_one("SELECT * FROM songs WHERE id = ?", (g1["song_id"],))
         assert song is not None
-        engine.submit_guess(g1["id"], "user-U", str(song["title"]))  # type: ignore[attr-defined]
+        engine.submit_guess(g1["id"], "user-U", str(song["title"]), NOW)
 
-        leaderboard_g1 = engine.leaderboard("G1")  # type: ignore[attr-defined]
-        leaderboard_g2 = engine.leaderboard("G2")  # type: ignore[attr-defined]
+        leaderboard_g1 = engine.leaderboard("G1", NOW)
+        leaderboard_g2 = engine.leaderboard("G2", NOW)
         assert [entry.user_id for entry in leaderboard_g1] == ["user-U"]
         assert leaderboard_g2 == []
         assert db.query_one(

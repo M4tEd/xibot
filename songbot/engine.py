@@ -2,14 +2,17 @@
 
 Pure Python — never imports discord, performs I/O only via db/snippets/catalog.
 
-This module currently implements the DAILY LIFECYCLE (this feature):
-``ensure_today_challenge`` (idempotent per (guild, local date), no-repeat
-song selection with history reset, deterministic seeded song+offset picks,
-catalog auto-bootstrap, snippet cache re-heal), ``get_reveal`` (mark the
-previous challenge revealed, return song + winners in solve order), and
-``skip_today_song`` (pinned decision #5). The gameplay methods
-(``unlock_snippet``, ``submit_guess``, ``leaderboard``) are added by the
-engine-gameplay-matching feature on top of this class.
+Daily lifecycle: ``ensure_today_challenge`` (idempotent per (guild, local
+date), no-repeat song selection with history reset, deterministic seeded
+song+offset picks, catalog auto-bootstrap, snippet cache re-heal),
+``get_reveal`` (mark the previous challenge revealed, return song + winners
+in solve order), and ``skip_today_song`` (pinned decision #5).
+
+Gameplay: ``unlock_snippet`` (per-user snippet ladder 0..4 with descending
+point potential), ``submit_guess`` (fuzzy matching, scoring with the pinned
+round-half-up both-bonus, guess log, wins/streaks — all atomic), and
+``leaderboard`` (total_points DESC, wins DESC, user_id ASC; effective streak
+computed on read, pinned #7).
 
 Determinism: song and offset are drawn from ``random.Random`` seeded by
 ``sha256(date | guild_id | skip_count)`` — stable across processes (never
@@ -33,17 +36,31 @@ from zoneinfo import ZoneInfo
 from songbot.catalog import CatalogSource, Song, refresh_catalog
 from songbot.catalog.refresh import RefreshResult
 from songbot.config import Settings
-from songbot.db import ChallengeRow, ChallengeStatus, Database, SongRow
+from songbot.db import (
+    ChallengeRow,
+    ChallengeStatus,
+    ChallengeUserRow,
+    Database,
+    SongRow,
+    UserStatsRow,
+)
+from songbot.matching import match_guess
 
 __all__ = [
     "CatalogEmptyError",
     "Challenge",
     "EngineError",
     "GameEngine",
+    "GuessOutcome",
+    "GuessResult",
+    "LeaderboardEntry",
     "Reveal",
     "SkipRefusedError",
     "SkipRefusedReason",
     "SnippetService",
+    "UnlockRefusedError",
+    "UnlockRefusedReason",
+    "UnlockResult",
     "Winner",
 ]
 
@@ -51,6 +68,17 @@ logger = logging.getLogger(__name__)
 
 SkipRefusedReason = Literal["no_challenge", "revealed", "solved"]
 """Why `skip_today_song` refused (pinned decision #5)."""
+
+UnlockRefusedReason = Literal["solved", "max_level"]
+"""Why `unlock_snippet` refused: the user already solved, or is at max level."""
+
+GuessOutcome = Literal["correct", "wrong", "already_solved", "limit_reached", "empty"]
+"""The result of a `submit_guess` submission.
+
+``empty`` is the pinned-#15 validation rejection (empty after stripping):
+never counted, never logged. ``already_solved``/``limit_reached`` rejections
+are likewise not logged and do not consume a guess (pinned #13).
+"""
 
 
 class EngineError(Exception):
@@ -76,6 +104,18 @@ class SkipRefusedError(EngineError):
     def __init__(self, reason: SkipRefusedReason, message: str) -> None:
         super().__init__(message)
         self.reason: SkipRefusedReason = reason
+
+
+class UnlockRefusedError(EngineError):
+    """unlock_snippet refused with zero state mutation.
+
+    ``reason`` is ``"solved"`` (the user already solved this challenge) or
+    ``"max_level"`` (the user already unlocked the longest snippet).
+    """
+
+    def __init__(self, reason: UnlockRefusedReason, message: str) -> None:
+        super().__init__(message)
+        self.reason: UnlockRefusedReason = reason
 
 
 class SnippetService(Protocol):
@@ -145,6 +185,55 @@ class Reveal:
     song: SongRow
     winners: tuple[Winner, ...]
     revealed_at: str
+
+
+@dataclass(frozen=True)
+class UnlockResult:
+    """A successful Hear-more: the newly unlocked snippet level.
+
+    ``path`` is the snippet file for ``level``; ``potential_points`` is what
+    a solve would pay at this level (the ladder value, before any bonus).
+    """
+
+    level: int
+    path: Path
+    potential_points: int
+
+
+@dataclass(frozen=True)
+class GuessResult:
+    """The outcome of one ``submit_guess`` submission.
+
+    ``guesses_used``/``guesses_left`` reflect the state AFTER the submission
+    (unchanged for the ``already_solved``/``limit_reached``/``empty``
+    rejections). ``points_awarded`` is non-zero only for ``correct``.
+    ``announce`` is True exactly for the solving guess — per-user solves are
+    singular, so every correct guess is the user's first (pinned: one public
+    announcement per solve).
+    """
+
+    outcome: GuessOutcome
+    matched_title: bool
+    matched_artist: bool
+    is_both: bool
+    guesses_used: int
+    guesses_left: int
+    points_awarded: int
+    announce: bool
+
+
+@dataclass(frozen=True)
+class LeaderboardEntry:
+    """One row of a guild leaderboard.
+
+    ``current_streak`` is the EFFECTIVE streak (pinned #7): 0 when the
+    user's last win is more than one calendar day before the read date.
+    """
+
+    user_id: str
+    total_points: int
+    wins: int
+    current_streak: int
 
 
 def _seed(date_str: str, guild_id: str, skip_count: int) -> int:
@@ -225,6 +314,23 @@ class GameEngine:
             (guild_id, date_str),
         )
         return ChallengeRow.from_row(row) if row is not None else None
+
+    def _challenge_row_by_id(self, challenge_id: int) -> ChallengeRow:
+        row = self._db.query_one(
+            "SELECT * FROM challenges WHERE id = ?", (challenge_id,)
+        )
+        if row is None:
+            raise EngineError(f"unknown challenge id {challenge_id}")
+        return ChallengeRow.from_row(row)
+
+    def _challenge_user_row(
+        self, challenge_id: int, user_id: str
+    ) -> ChallengeUserRow | None:
+        row = self._db.query_one(
+            "SELECT * FROM challenge_users WHERE challenge_id = ? AND user_id = ?",
+            (challenge_id, user_id),
+        )
+        return ChallengeUserRow.from_row(row) if row is not None else None
 
     def _song_row(self, song_id: int) -> SongRow:
         row = self._db.query_one("SELECT * FROM songs WHERE id = ?", (song_id,))
@@ -476,6 +582,288 @@ class GameEngine:
     def refresh_catalog(self) -> RefreshResult:
         """Passthrough for the admin reload-catalog command."""
         return self._catalog_refresher()
+
+    # -- gameplay ----------------------------------------------------------------
+
+    def unlock_snippet(self, challenge_id: int, user_id: str) -> UnlockResult:
+        """Unlock the next-longer snippet for a user (the Hear-more button).
+
+        Increments the user's ``snippet_level`` (0 -> 4) and returns the new
+        level's snippet path and remaining point potential. Refused with zero
+        mutation (``UnlockRefusedError``) when the user already solved this
+        challenge or is already at the maximum level. The per-user row is
+        upserted on this first interaction (pinned #13). The snippet cache is
+        re-healed on every unlock (idempotent ``ensure_snippets``, pinned #14).
+
+        Writes no timestamps, so it needs no injected ``now``.
+        """
+        challenge = self._challenge_row_by_id(challenge_id)
+        max_level = len(self._settings.snippet_lengths) - 1
+        with self._db.transaction():
+            state = self._challenge_user_row(challenge_id, user_id)
+            if state is not None and state.solved:
+                raise UnlockRefusedError(
+                    "solved",
+                    f"user {user_id} already solved challenge {challenge_id}",
+                )
+            level = state.snippet_level if state is not None else 0
+            if level >= max_level:
+                raise UnlockRefusedError(
+                    "max_level",
+                    f"user {user_id} is already at max snippet level {max_level}",
+                )
+            new_level = level + 1
+            self._upsert_challenge_user(
+                challenge_id,
+                user_id,
+                snippet_level=new_level,
+                guesses_used=state.guesses_used if state is not None else 0,
+                solved=False,
+                points_awarded=0,
+                solved_at=None,
+            )
+        # Outside the write transaction: snippet generation can be slow.
+        paths = self._snippets.ensure_snippets(
+            _song_for_generator(self._song_row(challenge.song_id)),
+            challenge.id,
+            challenge.snippet_offset_sec,
+            self._settings.snippet_lengths,
+        )
+        return UnlockResult(
+            level=new_level,
+            path=paths[new_level],
+            potential_points=self._settings.snippet_points[new_level],
+        )
+
+    def submit_guess(
+        self, challenge_id: int, user_id: str, text: str, now: datetime
+    ) -> GuessResult:
+        """Process one guess; update per-user state, the guess log, and stats.
+
+        Outcomes (see `GuessOutcome`): an empty-after-strip guess is a
+        validation rejection — not counted, not logged, never matching
+        (pinned #15). Post-solve and post-limit submissions are rejected
+        without state change or log rows (pinned #13). Any other submission
+        consumes one of the day's guesses (the winning guess included) and is
+        logged verbatim. A correct guess banks ``SNIPPET_POINTS[level]`` —
+        round-half-up x1.5 when one guess matches BOTH title and artist
+        (pinned #6) — and updates ``user_stats`` (points, wins, streaks).
+        All writes happen in one transaction.
+        """
+        challenge = self._challenge_row_by_id(challenge_id)
+        max_guesses = self._settings.max_guesses_per_day
+
+        stripped = text.strip()
+        if not stripped:
+            state = self._challenge_user_row(challenge_id, user_id)
+            used = state.guesses_used if state is not None else 0
+            return GuessResult(
+                outcome="empty",
+                matched_title=False,
+                matched_artist=False,
+                is_both=False,
+                guesses_used=used,
+                guesses_left=max_guesses - used,
+                points_awarded=0,
+                announce=False,
+            )
+
+        with self._db.transaction():
+            state = self._challenge_user_row(challenge_id, user_id)
+            if state is not None and state.solved:
+                return GuessResult(
+                    outcome="already_solved",
+                    matched_title=False,
+                    matched_artist=False,
+                    is_both=False,
+                    guesses_used=state.guesses_used,
+                    guesses_left=max_guesses - state.guesses_used,
+                    points_awarded=0,
+                    announce=False,
+                )
+            used = state.guesses_used if state is not None else 0
+            if used >= max_guesses:
+                return GuessResult(
+                    outcome="limit_reached",
+                    matched_title=False,
+                    matched_artist=False,
+                    is_both=False,
+                    guesses_used=used,
+                    guesses_left=0,
+                    points_awarded=0,
+                    announce=False,
+                )
+
+            song = self._song_row(challenge.song_id)
+            match = match_guess(stripped, song)
+            new_used = used + 1
+            created_at = self._utc_iso(now)
+            level = state.snippet_level if state is not None else 0
+            solved = match.is_correct
+            points = self._points_for_level(level) if solved else 0
+            if solved and match.is_both:
+                points = self._apply_bonus(points)
+            solved_at = created_at if solved else None
+
+            self._upsert_challenge_user(
+                challenge_id,
+                user_id,
+                snippet_level=level,
+                guesses_used=new_used,
+                solved=solved,
+                points_awarded=points,
+                solved_at=solved_at,
+            )
+            self._db.execute(
+                "INSERT INTO guesses"
+                " (challenge_id, user_id, text, matched_title, matched_artist,"
+                " is_correct, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    challenge_id,
+                    user_id,
+                    text,
+                    int(match.matched_title),
+                    int(match.matched_artist),
+                    int(solved),
+                    created_at,
+                ),
+            )
+            if solved:
+                self._apply_win(
+                    challenge.guild_id, user_id, points, date.fromisoformat(challenge.date)
+                )
+
+            return GuessResult(
+                outcome="correct" if solved else "wrong",
+                matched_title=match.matched_title,
+                matched_artist=match.matched_artist,
+                is_both=match.is_both,
+                guesses_used=new_used,
+                guesses_left=max_guesses - new_used,
+                points_awarded=points,
+                announce=solved,
+            )
+
+    def leaderboard(
+        self, guild_id: str, now: datetime, limit: int = 10
+    ) -> list[LeaderboardEntry]:
+        """The guild's top players: points DESC, wins DESC, user_id ASC.
+
+        ``current_streak`` is the EFFECTIVE streak (pinned #7): computed on
+        read from ``last_win_date`` against the local date of ``now`` — a gap
+        of more than one calendar day reads as 0 without touching the stored
+        value (which is only rewritten on the next solve).
+        """
+        today = self._local_date(now)
+        rows = self._db.query(
+            "SELECT user_id, total_points, wins, current_streak, last_win_date"
+            " FROM user_stats WHERE guild_id = ?"
+            " ORDER BY total_points DESC, wins DESC, user_id ASC LIMIT ?",
+            (guild_id, limit),
+        )
+        entries: list[LeaderboardEntry] = []
+        for row in rows:
+            last_win_raw = row["last_win_date"]
+            stored_streak = int(row["current_streak"])
+            effective = 0
+            if last_win_raw is not None:
+                last_win = date.fromisoformat(str(last_win_raw))
+                if (today - last_win).days <= 1:
+                    effective = stored_streak
+            entries.append(
+                LeaderboardEntry(
+                    user_id=str(row["user_id"]),
+                    total_points=int(row["total_points"]),
+                    wins=int(row["wins"]),
+                    current_streak=effective,
+                )
+            )
+        return entries
+
+    # -- gameplay helpers --------------------------------------------------------
+
+    def _points_for_level(self, level: int) -> int:
+        return self._settings.snippet_points[level]
+
+    def _apply_bonus(self, points: int) -> int:
+        """The both-fields bonus: round-half-up (pinned #6). 75 -> 113, 15 -> 23."""
+        return int(points * self._settings.both_correct_multiplier + 0.5)
+
+    def _upsert_challenge_user(
+        self,
+        challenge_id: int,
+        user_id: str,
+        *,
+        snippet_level: int,
+        guesses_used: int,
+        solved: bool,
+        points_awarded: int,
+        solved_at: str | None,
+    ) -> None:
+        """Insert or update the per-user row for a challenge (pinned #13)."""
+        self._db.execute(
+            "INSERT INTO challenge_users"
+            " (challenge_id, user_id, snippet_level, guesses_used, solved,"
+            " points_awarded, solved_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(challenge_id, user_id) DO UPDATE SET"
+            " snippet_level = excluded.snippet_level,"
+            " guesses_used = excluded.guesses_used,"
+            " solved = excluded.solved,"
+            " points_awarded = excluded.points_awarded,"
+            " solved_at = excluded.solved_at",
+            (
+                challenge_id,
+                user_id,
+                snippet_level,
+                guesses_used,
+                int(solved),
+                points_awarded,
+                solved_at,
+            ),
+        )
+
+    def _apply_win(
+        self, guild_id: str, user_id: str, points: int, win_date: date
+    ) -> None:
+        """Bank a solve into ``user_stats``: points, wins, and streaks.
+
+        ``win_date`` is the solved challenge's local date. The streak extends
+        when it follows ``last_win_date`` by exactly one calendar day, holds
+        for a same-day/out-of-order win (never regresses ``last_win_date``),
+        and otherwise resets to 1. ``best_streak`` only ever grows.
+        """
+        row = self._db.query_one(
+            "SELECT * FROM user_stats WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        prev = UserStatsRow.from_row(row) if row is not None else None
+
+        if prev is None or prev.last_win_date is None:
+            streak = 1
+            last_win = win_date
+        else:
+            last_win = date.fromisoformat(prev.last_win_date)
+            if win_date <= last_win:
+                streak = prev.current_streak
+            elif (win_date - last_win).days == 1:
+                streak = prev.current_streak + 1
+            else:
+                streak = 1
+            last_win = max(last_win, win_date)
+        best = max(prev.best_streak if prev is not None else 0, streak)
+
+        self._db.execute(
+            "INSERT INTO user_stats"
+            " (guild_id, user_id, total_points, wins, current_streak, best_streak,"
+            " last_win_date) VALUES (?, ?, ?, 1, ?, ?, ?)"
+            " ON CONFLICT(guild_id, user_id) DO UPDATE SET"
+            " total_points = total_points + excluded.total_points,"
+            " wins = wins + 1,"
+            " current_streak = excluded.current_streak,"
+            " best_streak = excluded.best_streak,"
+            " last_win_date = excluded.last_win_date",
+            (guild_id, user_id, points, streak, best, last_win.isoformat()),
+        )
 
     # -- assembly --------------------------------------------------------------
 
