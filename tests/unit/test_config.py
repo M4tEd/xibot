@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 
 import pytest
 
 from songbot.config import ConfigError, Settings, load_settings
+
+skip_if_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses filesystem permission checks",
+)
 
 REQUIRED_ENV = {
     "DISCORD_BOT_TOKEN": "test-token",
@@ -296,6 +302,59 @@ class TestDirectories:
         )
         with pytest.raises(ConfigError, match="LOCAL_MUSIC_DIR"):
             load(env_file)
+
+    @skip_if_root
+    def test_read_only_existing_cache_dir_rejected(self, tmp_path: Path) -> None:
+        """Regression: an existing but read-only SNIPPET_CACHE_DIR must not load."""
+        cache_dir = tmp_path / "snippets"
+        cache_dir.mkdir()
+        cache_dir.chmod(0o500)
+        try:
+            env_file = write_env(tmp_path, {**VALID_ENV, "SNIPPET_CACHE_DIR": str(cache_dir)})
+            with pytest.raises(ConfigError) as exc_info:
+                load(env_file)
+            message = str(exc_info.value)
+            assert "SNIPPET_CACHE_DIR" in message
+            assert str(cache_dir) in message
+        finally:
+            cache_dir.chmod(0o700)
+
+    @skip_if_root
+    def test_read_only_existing_database_parent_rejected(self, tmp_path: Path) -> None:
+        """Regression: a DATABASE_PATH whose existing parent is read-only must not load."""
+        parent = tmp_path / "db"
+        parent.mkdir()
+        parent.chmod(0o500)
+        try:
+            env_file = write_env(
+                tmp_path, {**VALID_ENV, "DATABASE_PATH": str(parent / "songbot.db")}
+            )
+            with pytest.raises(ConfigError) as exc_info:
+                load(env_file)
+            message = str(exc_info.value)
+            assert "DATABASE_PATH" in message
+            assert str(parent) in message
+        finally:
+            parent.chmod(0o700)
+
+    def test_writable_existing_runtime_dirs_accepted(self, tmp_path: Path) -> None:
+        """Existing WRITABLE runtime dirs still load (the writability check has teeth
+        only for non-writable dirs)."""
+        cache_dir = tmp_path / "snippets"
+        cache_dir.mkdir()
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        env_file = write_env(
+            tmp_path,
+            {
+                **VALID_ENV,
+                "SNIPPET_CACHE_DIR": str(cache_dir),
+                "DATABASE_PATH": str(db_dir / "songbot.db"),
+            },
+        )
+        settings = load(env_file)
+        assert settings.snippet_cache_dir == cache_dir
+        assert settings.database_path == db_dir / "songbot.db"
 
 
 class TestAllProblemsListed:

@@ -341,6 +341,82 @@ class TestFailures:
             gen.ensure_snippets(_local_song(), challenge_id=16, offset=20.0, lengths=LENGTHS)
         assert _leftover_files(tmp_path / "cache") == []
 
+    def test_source_failure_removes_stale_incomplete_levels(self, tmp_path: Path) -> None:
+        """VAL-SNIP-011: a failed regeneration removes the 0-byte partials it targeted.
+
+        Regression: source-preparation failure used to leave pre-existing
+        0-byte level files behind even though the call intended to regenerate
+        them — a partial artifact survived in the cache.
+        """
+        gen = SnippetGenerator(tmp_path / "cache")
+        good = gen.ensure_snippets(_local_song(), challenge_id=18, offset=OFFSET, lengths=LENGTHS)
+        # Levels 1 and 3 become stale partials (0-byte); the rest stay complete.
+        good[1].write_bytes(b"")
+        good[3].write_bytes(b"")
+        kept = {level: _file_state(path) for level, path in good.items() if level not in (1, 3)}
+
+        missing = tmp_path / "gone.mp3"
+        with pytest.raises(SnippetSourceError, match=r"gone\.mp3"):
+            gen.ensure_snippets(
+                _local_song(missing), challenge_id=18, offset=OFFSET, lengths=LENGTHS
+            )
+
+        assert not good[1].exists(), "stale 0-byte level 1 survived the failed regeneration"
+        assert not good[3].exists(), "stale 0-byte level 3 survived the failed regeneration"
+        for level, state in kept.items():
+            assert _file_state(good[level]) == state, (
+                f"pre-existing complete level {level} was touched"
+            )
+        partials = [p for p in _leftover_files(tmp_path / "cache") if p.stat().st_size == 0]
+        assert partials == [], f"zero-byte partials left behind: {partials}"
+
+    def test_source_failure_with_only_stale_partials_removes_challenge_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """VAL-SNIP-011: a challenge dir holding only 0-byte partials is removed entirely."""
+        gen = SnippetGenerator(tmp_path / "cache")
+        challenge_dir = tmp_path / "cache" / "20"
+        challenge_dir.mkdir(parents=True)
+        (challenge_dir / "0.mp3").write_bytes(b"")
+        (challenge_dir / "1.mp3").write_bytes(b"")
+
+        with pytest.raises(SnippetSourceError, match=r"gone\.mp3"):
+            gen.ensure_snippets(
+                _local_song(tmp_path / "gone.mp3"), challenge_id=20, offset=OFFSET, lengths=LENGTHS
+            )
+
+        assert not challenge_dir.exists(), "empty challenge dir survived the failed run"
+        assert _leftover_files(tmp_path / "cache") == []
+
+    def test_download_failure_removes_stale_incomplete_levels(self, tmp_path: Path) -> None:
+        """VAL-SNIP-011, YouTube path: a failed re-download also clears stale partials."""
+        stub = StubSectionDownloader(MP3_FIXTURE)
+        gen = SnippetGenerator(tmp_path, section_downloader=stub)
+        song = _youtube_song()
+        good = gen.ensure_snippets(song, challenge_id=19, offset=OFFSET, lengths=LENGTHS)
+        good[2].write_bytes(b"")
+        kept = {level: _file_state(path) for level, path in good.items() if level != 2}
+        # Drop the cached intermediate so the next run MUST re-download (and fail).
+        for section in (tmp_path / "sections").glob("19.*"):
+            section.unlink()
+
+        def failing_downloader(
+            url: str, start: float, end: float, dest_base: Path, timeout: float
+        ) -> Path:
+            raise RuntimeError("network boom")
+
+        gen2 = SnippetGenerator(tmp_path, section_downloader=failing_downloader)
+        with pytest.raises(SnippetGenerationError, match="network boom"):
+            gen2.ensure_snippets(song, challenge_id=19, offset=OFFSET, lengths=LENGTHS)
+
+        assert not good[2].exists(), "stale 0-byte level 2 survived the failed regeneration"
+        for level, state in kept.items():
+            assert _file_state(good[level]) == state, (
+                f"pre-existing complete level {level} was touched"
+            )
+        partials = [p for p in _leftover_files(tmp_path) if p.stat().st_size == 0]
+        assert partials == [], f"zero-byte partials left behind: {partials}"
+
 
 class TestYouTubeFlow:
     """Expected behavior: one section download, local cuts, cached intermediate."""

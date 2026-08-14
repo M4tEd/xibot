@@ -179,10 +179,15 @@ def load_settings(
     if database_path.exists() and database_path.is_dir():
         problems.append(f"DATABASE_PATH '{database_path}' exists but is a directory")
     else:
-        _check_dir_creatable(database_path.parent, "DATABASE_PATH parent directory", problems)
+        _check_dir_creatable(
+            database_path.parent,
+            "DATABASE_PATH parent directory",
+            problems,
+            must_be_writable=True,
+        )
 
     snippet_cache_dir = Path(optional("SNIPPET_CACHE_DIR", str(DEFAULT_SNIPPET_CACHE_DIR)))
-    _check_dir_creatable(snippet_cache_dir, "SNIPPET_CACHE_DIR", problems)
+    _check_dir_creatable(snippet_cache_dir, "SNIPPET_CACHE_DIR", problems, must_be_writable=True)
 
     health_port = _parse_int(
         optional("HEALTH_PORT", str(DEFAULT_HEALTH_PORT)),
@@ -327,14 +332,24 @@ def _parse_number_list(
     return tuple(values)
 
 
-def _check_dir_creatable(path: Path, field: str, problems: list[str]) -> None:
-    """Append a problem if `path` cannot be created as a directory.
+def _check_dir_creatable(
+    path: Path, field: str, problems: list[str], *, must_be_writable: bool = False
+) -> None:
+    """Append a problem if `path` cannot serve as a usable directory.
+
+    A missing directory must be creatable (nearest existing ancestor is a
+    writable directory). An existing path must be a directory, and when
+    ``must_be_writable`` is true — for runtime directories the bot writes
+    into (snippet cache dir, database parent dir) — it must also be
+    writable, so a read-only directory fails at load instead of at runtime.
 
     Does NOT create anything (creation happens on first use by callers).
     """
     if path.exists():
         if not path.is_dir():
             problems.append(f"{field} '{path}' exists but is not a directory")
+        elif must_be_writable and not os.access(path, os.W_OK):
+            problems.append(f"{field} '{path}' exists but is not writable")
         return
     ancestor = path
     while not ancestor.exists():

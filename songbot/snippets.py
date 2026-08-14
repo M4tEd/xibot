@@ -25,7 +25,8 @@ ffprobe-verified and raises on >50ms duration deviation. Failures raise a
 clear named error (`SnippetSourceError` for missing/corrupt/too-short source
 audio, `SnippetGenerationError` for ffmpeg/yt-dlp/verification failures) and
 leave no partial cache files: anything the failed call created is removed,
-while complete pre-existing files are kept.
+along with any incomplete (0-byte) pre-existing level files it intended to
+regenerate, while complete pre-existing files are kept.
 """
 
 from __future__ import annotations
@@ -150,7 +151,10 @@ class SnippetGenerator:
         ``lengths`` maps level index -> target duration in seconds (level 0 is
         the shortest). Existing non-empty files are skipped untouched; missing
         or 0-byte levels are (re)generated. When nothing is missing the source
-        audio is never touched (no re-download, no re-encode).
+        audio is never touched (no re-download, no re-encode). On failure,
+        every level this call intended to (re)generate is removed — including
+        pre-existing 0-byte partials — while pre-existing complete levels
+        survive untouched.
 
         Raises:
             ValueError: on invalid arguments (bad offset/lengths/challenge_id).
@@ -168,7 +172,6 @@ class SnippetGenerator:
             return targets
 
         max_len = max(float(v) for v in lengths)
-        created: list[Path] = []
         intermediate: Path | None = None
         try:
             if song.source == "youtube":
@@ -182,14 +185,20 @@ class SnippetGenerator:
             self._challenge_dir(cid).mkdir(parents=True, exist_ok=True)
             for level in sorted(needed):
                 self._generate_level(cut_source, cut_base, float(lengths[level]), targets[level])
-                created.append(targets[level])
         except BaseException:
-            self._cleanup_after_failure(created, self._challenge_dir(cid), intermediate)
+            # Remove every level file this call intended to (re)generate: both
+            # files it finished writing AND pre-existing incomplete (0-byte)
+            # partials it would have replaced, so no partial artifact survives
+            # (VAL-SNIP-011). Pre-existing COMPLETE levels are not in `needed`
+            # and are left untouched.
+            self._cleanup_after_failure(
+                list(needed.values()), self._challenge_dir(cid), intermediate
+            )
             raise
         logger.info(
             "challenge %s: generated %d snippet level(s) for %r at offset %.3fs",
             cid,
-            len(created),
+            len(needed),
             song.audio_ref,
             offset,
         )
@@ -393,14 +402,19 @@ class SnippetGenerator:
     # -- cleanup and layout ---------------------------------------------------
 
     def _cleanup_after_failure(
-        self, created: list[Path], challenge_dir: Path, intermediate: Path | None
+        self, targets: list[Path], challenge_dir: Path, intermediate: Path | None
     ) -> None:
-        """Remove everything the failed call created; keep pre-existing files.
+        """Remove the failed call's in-scope level files; keep everything else.
 
-        A failed YouTube run also discards the section intermediate: any cut
-        failure implicates it, and the next call re-downloads a fresh copy.
+        ``targets`` are the level paths the call intended to (re)generate —
+        both files it finished writing and pre-existing incomplete (0-byte)
+        partials it would have replaced — so no partial artifact survives a
+        failure. Pre-existing COMPLETE levels are never in ``targets`` and
+        survive untouched. A failed YouTube run also discards the section
+        intermediate: any cut failure implicates it, and the next call
+        re-downloads a fresh copy.
         """
-        for path in created:
+        for path in targets:
             path.unlink(missing_ok=True)
         if intermediate is not None:
             intermediate.unlink(missing_ok=True)
