@@ -16,8 +16,12 @@ them. ``Retro Waves - Sunset Drive.mp3`` is deliberately left UNTAGGED so the
 catalog's ``Artist - Title.ext`` filename fallback is exercised.
 
 The script is idempotent: files that already exist are skipped (pass
-``--force`` to rebuild them). Requires ``ffmpeg`` and ``ffprobe`` on PATH plus
-mutagen (a project dependency — run it with the venv python).
+``--force`` to rebuild them). Each song is built failure-atomically: render,
+duration check, and tagging all happen on a ``.part`` staging file that is
+renamed into place only after every step succeeds, so a failed build never
+leaves a broken fixture behind for later runs to skip. Requires ``ffmpeg``
+and ``ffprobe`` on PATH plus mutagen (a project dependency — run it with the
+venv python).
 """
 
 from __future__ import annotations
@@ -134,7 +138,11 @@ def melody_expression(song: FixtureSong) -> str:
 
 
 def render_song(song: FixtureSong, dest: Path, ffmpeg: str) -> None:
-    """Render one song to ``dest`` via ffmpeg aevalsrc (atomic via .part file)."""
+    """Render one song's audio to ``dest`` via ffmpeg aevalsrc.
+
+    Writes exactly the path it is given; staging/atomicity is the caller's job
+    (see :func:`build_song`).
+    """
     expr = melody_expression(song)
     input_arg = f"aevalsrc={expr}:d={DURATION_SEC}:s={SAMPLE_RATE}"
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", input_arg]
@@ -142,19 +150,14 @@ def render_song(song: FixtureSong, dest: Path, ffmpeg: str) -> None:
         cmd += ["-c:a", "libmp3lame", "-q:a", "4"]
     else:
         cmd += ["-c:a", "aac", "-b:a", "128k"]
-    tmp = dest.with_name(f"{dest.stem}.part{dest.suffix}")
-    cmd.append(str(tmp))
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SEC, check=False,
+    cmd.append(str(dest))
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SEC, check=False,
+    )
+    if result.returncode != 0:
+        raise FixtureGenerationError(
+            f"ffmpeg failed for {song.filename}: {result.stderr.strip()}"
         )
-        if result.returncode != 0:
-            raise FixtureGenerationError(
-                f"ffmpeg failed for {song.filename}: {result.stderr.strip()}"
-            )
-        tmp.replace(dest)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 def probe_duration(path: Path, ffprobe: str) -> float:
@@ -183,6 +186,39 @@ def tag_file(path: Path, title: str, artist: str) -> None:
     audio.save()
 
 
+def build_song(song: FixtureSong, dest: Path, ffmpeg: str, ffprobe: str) -> str:
+    """Render, verify, and tag one song failure-atomically; return its status line.
+
+    Every step operates on a ``.part`` staging file next to ``dest``; the
+    staging file is renamed into place only after render, duration check, and
+    tagging have ALL succeeded. On any failure the staging file is removed and
+    ``dest`` is left untouched (absent, or — for a ``--force`` rebuild — the
+    previous file), so a later normal run regenerates the fixture instead of
+    skipping a silently broken one.
+    """
+    tmp = dest.with_name(f"{dest.stem}.part{dest.suffix}")
+    try:
+        render_song(song, tmp, ffmpeg)
+        duration = probe_duration(tmp, ffprobe)
+        if abs(duration - DURATION_SEC) > DURATION_TOLERANCE_SEC:
+            raise FixtureGenerationError(
+                f"{song.filename}: duration {duration:.3f}s deviates from "
+                f"{DURATION_SEC}s by more than {DURATION_TOLERANCE_SEC}s"
+            )
+        if song.tagged:
+            tag_file(tmp, song.title, song.artist)
+            line = f"generated (tagged): {song.filename} [{duration:.3f}s]"
+        else:
+            line = (
+                f"generated (untagged, filename fallback): {song.filename} "
+                f"[{duration:.3f}s]"
+            )
+        tmp.replace(dest)
+        return line
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def generate_fixtures(output_dir: Path, *, force: bool = False) -> list[str]:
     """Generate the full fixture library into ``output_dir``.
 
@@ -202,20 +238,7 @@ def generate_fixtures(output_dir: Path, *, force: bool = False) -> list[str]:
         if dest.exists() and not force:
             results.append(f"skipped (exists): {song.filename}")
             continue
-        render_song(song, dest, ffmpeg)
-        duration = probe_duration(dest, ffprobe)
-        if abs(duration - DURATION_SEC) > DURATION_TOLERANCE_SEC:
-            dest.unlink(missing_ok=True)
-            raise FixtureGenerationError(
-                f"{song.filename}: duration {duration:.3f}s deviates from "
-                f"{DURATION_SEC}s by more than {DURATION_TOLERANCE_SEC}s"
-            )
-        if song.tagged:
-            tag_file(dest, song.title, song.artist)
-            results.append(f"generated (tagged): {song.filename} [{duration:.3f}s]")
-        else:
-            results.append(f"generated (untagged, filename fallback): {song.filename} "
-                           f"[{duration:.3f}s]")
+        results.append(build_song(song, dest, ffmpeg, ffprobe))
     return results
 
 

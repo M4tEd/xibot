@@ -186,6 +186,70 @@ class TestIdempotency:
         assert (retro.artist, retro.title) == ("Retro Waves", "Sunset Drive")
 
 
+class TestTagWriteFailureAtomicity:
+    """A tag-write failure must not leave a silently-broken fixture behind.
+
+    Regression tests for the hardening-docs scrutiny round-1 finding: the
+    rendered file used to be moved into place BEFORE tagging, so a mutagen
+    failure left an untagged/partially-tagged fixture at the destination that
+    later normal runs would SKIP (file exists). The whole per-song build
+    (render + verify + tag) must now be failure-atomic via the .part staging
+    file.
+    """
+
+    def test_tag_failure_leaves_nothing_and_rerun_regenerates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module = _load_script_module()
+        import mutagen
+
+        def failing_file(*args, **kwargs):
+            raise RuntimeError("injected tag-write failure")
+
+        with monkeypatch.context() as m:
+            m.setattr(mutagen, "File", failing_file)
+            with pytest.raises(RuntimeError, match="injected tag-write failure"):
+                module.generate_fixtures(tmp_path)
+        leftovers = sorted(p.name for p in tmp_path.iterdir())
+        assert leftovers == [], f"tag failure left artifacts: {leftovers}"
+
+        # A subsequent normal run must regenerate the failed fixture (not SKIP
+        # a broken leftover) and produce a fully working library.
+        lines = module.generate_fixtures(tmp_path)
+        assert len(lines) == len(EXPECTED_FILES)
+        assert all("generated" in line for line in lines)
+        songs = LocalDirectoryProvider(tmp_path).fetch()
+        assert len(songs) == 8
+        by_name = {Path(song.audio_ref).name: song for song in songs}
+        aurora = by_name["Aurora Fields - Solar Bloom.mp3"]
+        assert (aurora.artist, aurora.title) == ("Aurora Fields", "Solar Bloom")
+        retro = by_name[UNTAGGED_FILE]
+        assert (retro.artist, retro.title) == ("Retro Waves", "Sunset Drive")
+
+    def test_force_rebuild_tag_failure_preserves_previous_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module = _load_script_module()
+        module.generate_fixtures(tmp_path)
+        first = tmp_path / "Aurora Fields - Solar Bloom.mp3"
+        before = _sha256(first)
+
+        import mutagen
+
+        def failing_file(*args, **kwargs):
+            raise RuntimeError("injected tag-write failure")
+
+        with monkeypatch.context() as m:
+            m.setattr(mutagen, "File", failing_file)
+            with pytest.raises(RuntimeError, match="injected tag-write failure"):
+                module.generate_fixtures(tmp_path, force=True)
+        # The failed rebuild never touched the previously generated file and
+        # left no staging artifacts behind.
+        assert first.is_file()
+        assert _sha256(first) == before
+        assert list(tmp_path.glob("*.part*")) == []
+
+
 class TestSongTable:
     """Pure-data checks on the script's song table (no ffmpeg needed)."""
 
