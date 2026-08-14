@@ -255,6 +255,28 @@ class TestHearMore:
             assert row is not None
             assert row["c"] == 0
 
+    async def test_hear_more_creates_zero_valued_user_stats_row(
+        self, ctx: HarnessContext, posted: dict[str, Any], db: Database
+    ) -> None:
+        """VAL-SCORE-005 through the real view: a hear-more-only user gets a
+        zero-valued user_stats row, yet the leaderboard stays friendly-empty
+        (VAL-SCORE-012) until somebody scores."""
+        await scenario_hear_more(ctx, ALICE, 1, DAY1, now_pinned=True)
+
+        row = db.query_one(
+            "SELECT total_points, wins, current_streak, best_streak, last_win_date"
+            " FROM user_stats WHERE guild_id = 'guild-1' AND user_id = 'alice'"
+        )
+        assert row is not None
+        assert (row["total_points"], row["wins"]) == (0, 0)
+        assert (row["current_streak"], row["best_streak"]) == (0, 0)
+        assert row["last_win_date"] is None
+
+        out = json_roundtrip(await scenario_leaderboard(ctx, BOB, DAY1, now_pinned=True))
+        assert kinds(out) == ["ephemeral"]
+        assert "no scores" in out["payloads"][0]["content"].lower()
+        assert out["state"]["entries"] == []
+
 
 class TestGuess:
     async def test_correct_guess_flow_modal_ephemeral_announcement(

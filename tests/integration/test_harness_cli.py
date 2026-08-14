@@ -923,7 +923,13 @@ class TestCrossDayFlows:
         assert day1b["song"]["artist"] in reveal_b
         assert "nobody got it" in reveal_b.lower()
         assert "<@carol>" not in reveal_b
-        assert db_rows(tmp_path, "SELECT COUNT(*) FROM user_stats") == [(0,)]
+        # VAL-SCORE-005: carol's wrong guess registered a zero-valued stats
+        # row — no points, no win, no streak — so "nobody got it" stays true.
+        assert db_rows(
+            tmp_path,
+            "SELECT total_points, wins, current_streak, best_streak, last_win_date"
+            " FROM user_stats WHERE user_id = 'carol'",
+        ) == [(0, 0, 0, 0, None)]
 
 
 class TestServe:

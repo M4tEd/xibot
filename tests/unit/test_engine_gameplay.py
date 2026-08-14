@@ -277,7 +277,16 @@ class TestSubmitGuessOutcomes:
 
         row = _challenge_user(db, challenge_id, "eve")
         assert (row["solved"], row["guesses_used"], row["points_awarded"]) == (0, 1, 0)
-        assert _user_stats(db, "eve") is None  # no stats row for non-solvers
+        # VAL-SCORE-005: the first processed guess registers a zero-valued
+        # user_stats row (VAL-SCORE-006 explicitly allows the row to exist as
+        # long as every value is zero/NULL).
+        stats = _user_stats(db, "eve")
+        assert stats is not None
+        assert stats["total_points"] == 0
+        assert stats["wins"] == 0
+        assert stats["current_streak"] == 0
+        assert stats["best_streak"] == 0
+        assert stats["last_win_date"] is None
 
     def test_guess_log_preserves_raw_text_verbatim(
         self, engine: GameEngine, db: Database, challenge_id: int
@@ -572,12 +581,125 @@ class TestLeaderboard:
         assert engine.leaderboard("g1", NOW) == []
 
     def test_non_scoring_interactions_do_not_enter_leaderboard(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        """Hear-more and wrong guesses create zero-valued user_stats rows
+        (VAL-SCORE-005) but never leaderboard entries (0-point filter)."""
+        engine.unlock_snippet(challenge_id, "frank")
+        engine.submit_guess(challenge_id, "grace", WRONG, NOW)
+        assert _user_stats(db, "frank") is not None
+        assert _user_stats(db, "grace") is not None
+        assert engine.leaderboard("g1", NOW) == []
+
+
+class TestUserStatsRowOnInteraction:
+    """VAL-SCORE-005 regression: the first interaction with a challenge
+    (hear-more OR a processed guess — the pinned-#13 challenge_users upsert
+    point) also upserts a zero-valued per-guild user_stats row, so a user who
+    never solves still has wins=0/total_points=0 on record. The leaderboard
+    must keep excluding 0-point users (VAL-SCORE-011/012 preserved), and the
+    first solve must upgrade the zero row in place (no lost points, no
+    double row).
+    """
+
+    def test_hear_more_only_user_has_zero_valued_stats_row(
+        self, engine: GameEngine, db: Database
+    ) -> None:
+        """The VAL-SCORE-005 dave/erin/frank scenario at SQL level."""
+        _add_song(db)
+        # Day 1: dave solves; erin only hears more and guesses wrong.
+        day1 = engine.ensure_today_challenge("g1", "c1", DAY1)
+        _solve(engine, day1.id, "dave", DAY1)
+        engine.unlock_snippet(day1.id, "erin")
+        erin_wrong = engine.submit_guess(day1.id, "erin", WRONG, DAY1)
+        assert erin_wrong.outcome == "wrong"
+        # Day 2: dave does not play; erin solves.
+        day2 = engine.ensure_today_challenge("g1", "c1", DAY2)
+        _solve(engine, day2.id, "erin", DAY2)
+        # Day 3: dave solves; erin does not play; frank only presses hear-more.
+        day3 = engine.ensure_today_challenge("g1", "c1", DAY3)
+        _solve(engine, day3.id, "dave", DAY3)
+        engine.unlock_snippet(day3.id, "frank")
+
+        rows = db.query(
+            "SELECT user_id, total_points, wins, current_streak, best_streak,"
+            " last_win_date FROM user_stats WHERE guild_id = 'g1' ORDER BY user_id"
+        )
+        by_user = {str(row["user_id"]): dict(row) for row in rows}
+        assert set(by_user) == {"dave", "erin", "frank"}  # exactly one row each
+        assert (by_user["dave"]["wins"], by_user["dave"]["total_points"]) == (2, 200)
+        assert (by_user["erin"]["wins"], by_user["erin"]["total_points"]) == (1, 100)
+        frank = by_user["frank"]
+        assert frank["total_points"] == 0
+        assert frank["wins"] == 0
+        assert frank["current_streak"] == 0
+        assert frank["best_streak"] == 0
+        assert frank["last_win_date"] is None
+
+    def test_first_wrong_guess_also_creates_the_zero_row(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        """A processed guess is a first interaction too (pinned #13): the
+        zero-valued row appears even without any hear-more press."""
+        result = engine.submit_guess(challenge_id, "grace", WRONG, NOW)
+        assert result.outcome == "wrong"
+        stats = _user_stats(db, "grace")
+        assert stats is not None
+        assert (stats["total_points"], stats["wins"]) == (0, 0)
+        assert stats["last_win_date"] is None
+
+    def test_zero_point_users_never_enter_leaderboard(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        """VAL-SCORE-011 preserved: only solvers are listed; the zero-valued
+        rows exist in SQL but are filtered out of the leaderboard."""
+        engine.unlock_snippet(challenge_id, "frank")  # hear-more only
+        engine.submit_guess(challenge_id, "grace", WRONG, NOW)  # wrong only
+        _solve(engine, challenge_id, "alice", NOW)
+
+        entries = engine.leaderboard("g1", NOW)
+        assert [e.user_id for e in entries] == ["alice"]
+        frank = _user_stats(db, "frank")
+        grace = _user_stats(db, "grace")
+        assert frank is not None
+        assert frank["total_points"] == 0
+        assert grace is not None
+        assert grace["total_points"] == 0
+
+    def test_guild_with_only_zero_point_users_gets_empty_leaderboard(
         self, engine: GameEngine, challenge_id: int
     ) -> None:
-        """Hear-more and wrong guesses alone never create leaderboard entries."""
+        """VAL-SCORE-012 preserved: a guild where nobody has scored still
+        reads empty (the adapter renders the friendly 'no scores yet')."""
         engine.unlock_snippet(challenge_id, "frank")
         engine.submit_guess(challenge_id, "grace", WRONG, NOW)
         assert engine.leaderboard("g1", NOW) == []
+
+    def test_solve_after_hear_more_upgrades_the_zero_row(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        """The first solve updates the pre-existing zero row in place: exact
+        points/wins/streak, and still exactly one row (no double insert)."""
+        engine.unlock_snippet(challenge_id, "erin")
+        engine.unlock_snippet(challenge_id, "erin")  # level 2 -> 50 potential
+        before = _user_stats(db, "erin")
+        assert before is not None
+        assert before["total_points"] == 0
+
+        result = engine.submit_guess(challenge_id, "erin", TITLE, NOW)
+        assert result.outcome == "correct"
+        assert result.points_awarded == 50
+
+        rows = db.query(
+            "SELECT * FROM user_stats WHERE guild_id = 'g1' AND user_id = 'erin'"
+        )
+        assert len(rows) == 1  # no double row
+        stats = dict(rows[0])
+        assert stats["total_points"] == 50
+        assert stats["wins"] == 1
+        assert stats["current_streak"] == 1
+        assert stats["best_streak"] == 1
+        assert stats["last_win_date"] == TODAY
 
 
 def _db_snapshot(db: Database) -> dict[str, list[dict[str, object]]]:

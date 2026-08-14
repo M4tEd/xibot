@@ -12,10 +12,14 @@ in solve order), ``skip_today_song`` (pinned decision #5), and
 Gameplay: ``unlock_snippet`` (per-user snippet ladder 0..4 with descending
 point potential), ``submit_guess`` (fuzzy matching, scoring with the pinned
 round-half-up both-bonus, guess log, wins/streaks — all atomic), and
-``leaderboard`` (total_points DESC, wins DESC, user_id ASC; effective streak
-computed on read, pinned #7). Both gameplay entry points refuse revealed
-challenges with zero mutation (the VAL-GUESS-019 lockout: ``challenge_closed``
-/ ``UnlockRefusedError(reason="closed")``).
+``leaderboard`` (total_points DESC, wins DESC, user_id ASC, scoring users
+only via ``total_points > 0``; effective streak computed on read, pinned #7).
+The first interaction (hear-more or a processed guess — the pinned-#13
+``challenge_users`` upsert point) also registers a zero-valued ``user_stats``
+row (VAL-SCORE-005), which the leaderboard filter keeps unlisted until the
+first solve. Both gameplay entry points refuse revealed challenges with zero
+mutation (the VAL-GUESS-019 lockout: ``challenge_closed`` /
+``UnlockRefusedError(reason="closed")``).
 
 Determinism: song and offset are drawn from ``random.Random`` seeded by
 ``sha256(date | guild_id | skip_count)`` — stable across processes (never
@@ -619,8 +623,9 @@ class GameEngine:
         active (``"closed"`` — the revealed-challenge lockout, VAL-GUESS-019),
         when the user already solved this challenge, or is already at the
         maximum level. The per-user row is upserted on this first interaction
-        (pinned #13). The snippet cache is re-healed on every unlock
-        (idempotent ``ensure_snippets``, pinned #14).
+        (pinned #13), and a zero-valued ``user_stats`` row is registered
+        alongside it (VAL-SCORE-005). The snippet cache is re-healed on every
+        unlock (idempotent ``ensure_snippets``, pinned #14).
 
         Writes no timestamps, so it needs no injected ``now``.
         """
@@ -648,6 +653,7 @@ class GameEngine:
                     f"user {user_id} is already at max snippet level {max_level}",
                 )
             new_level = level + 1
+            self._ensure_user_stats_row(challenge.guild_id, user_id)
             self._upsert_challenge_user(
                 challenge_id,
                 user_id,
@@ -683,7 +689,9 @@ class GameEngine:
         logged, never matching (pinned #15). Post-solve and post-limit
         submissions are rejected without state change or log rows
         (pinned #13). Any other submission consumes one of the day's guesses
-        (the winning guess included) and is logged verbatim. A correct guess
+        (the winning guess included) and is logged verbatim; as a first
+        interaction it also registers a zero-valued ``user_stats`` row
+        (VAL-SCORE-005). A correct guess
         banks ``SNIPPET_POINTS[level]`` — round-half-up x1.5 when one guess
         matches BOTH title and artist (pinned #6) — and updates
         ``user_stats`` (points, wins, streaks). All writes happen in one
@@ -760,6 +768,7 @@ class GameEngine:
                 points = self._apply_bonus(points)
             solved_at = created_at if solved else None
 
+            self._ensure_user_stats_row(challenge.guild_id, user_id)
             self._upsert_challenge_user(
                 challenge_id,
                 user_id,
@@ -804,15 +813,19 @@ class GameEngine:
     ) -> list[LeaderboardEntry]:
         """The guild's top players: points DESC, wins DESC, user_id ASC.
 
-        ``current_streak`` is the EFFECTIVE streak (pinned #7): computed on
-        read from ``last_win_date`` against the local date of ``now`` — a gap
-        of more than one calendar day reads as 0 without touching the stored
-        value (which is only rewritten on the next solve).
+        Only scoring users are listed: the ``total_points > 0`` filter keeps
+        the zero-valued rows created on first interaction (VAL-SCORE-005) out
+        of the leaderboard, so a guild where nobody has scored still reads as
+        empty (VAL-SCORE-011/012). ``current_streak`` is the EFFECTIVE streak
+        (pinned #7): computed on read from ``last_win_date`` against the
+        local date of ``now`` — a gap of more than one calendar day reads as
+        0 without touching the stored value (which is only rewritten on the
+        next solve).
         """
         today = self._local_date(now)
         rows = self._db.query(
             "SELECT user_id, total_points, wins, current_streak, last_win_date"
-            " FROM user_stats WHERE guild_id = ?"
+            " FROM user_stats WHERE guild_id = ? AND total_points > 0"
             " ORDER BY total_points DESC, wins DESC, user_id ASC LIMIT ?",
             (guild_id, limit),
         )
@@ -843,6 +856,25 @@ class GameEngine:
     def _apply_bonus(self, points: int) -> int:
         """The both-fields bonus: round-half-up (pinned #6). 75 -> 113, 15 -> 23."""
         return int(points * self._settings.both_correct_multiplier + 0.5)
+
+    def _ensure_user_stats_row(self, guild_id: str, user_id: str) -> None:
+        """Insert a zero-valued ``user_stats`` row when none exists.
+
+        Companion to the pinned-#13 ``challenge_users` upsert: the first
+        interaction with a challenge (hear-more or a processed guess)
+        registers the user in the guild's stats table with all-zero values
+        and ``last_win_date = NULL``, so even a user who never solves has the
+        contract-required row on record (VAL-SCORE-005). ``INSERT OR IGNORE``
+        keeps it idempotent; the leaderboard filters these rows out via
+        ``total_points > 0`` until the first solve banks points, and
+        ``_apply_win`` upgrades the zero row in place on that solve.
+        """
+        self._db.execute(
+            "INSERT OR IGNORE INTO user_stats"
+            " (guild_id, user_id, total_points, wins, current_streak, best_streak,"
+            " last_win_date) VALUES (?, ?, 0, 0, 0, 0, NULL)",
+            (guild_id, user_id),
+        )
 
     def _upsert_challenge_user(
         self,
@@ -885,7 +917,11 @@ class GameEngine:
         ``win_date`` is the solved challenge's local date. The streak extends
         when it follows ``last_win_date`` by exactly one calendar day, holds
         for a same-day/out-of-order win (never regresses ``last_win_date``),
-        and otherwise resets to 1. ``best_streak`` only ever grows.
+        and otherwise resets to 1. ``best_streak`` only ever grows. The row
+        usually already exists as the zero-valued first-interaction row
+        (VAL-SCORE-005); the upsert's additive conflict clause upgrades it in
+        place (points/wins accumulate onto the zeros), and a ``None``
+        ``last_win_date`` correctly starts the streak at 1.
         """
         row = self._db.query_one(
             "SELECT * FROM user_stats WHERE guild_id = ? AND user_id = ?",
