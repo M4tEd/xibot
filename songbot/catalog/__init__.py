@@ -1,8 +1,8 @@
 """Catalog providers: Song dataclass, CatalogProvider protocol, combined fetch.
 
-The combined ``refresh_catalog`` upsert lives in ``songbot.catalog.refresh``
-(catalog-refresh feature). This package root defines the shared contract every
-provider implements.
+This package root defines the shared contract every provider implements and
+re-exports the combined ``refresh_catalog`` upsert (implemented in
+``songbot.catalog.refresh``).
 """
 
 from __future__ import annotations
@@ -10,7 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
-__all__ = ["CatalogProvider", "CatalogSource", "Song"]
+__all__ = [
+    "CatalogProvider",
+    "CatalogSource",
+    "RefreshResult",
+    "Song",
+    "SourceRefresh",
+    "refresh_catalog",
+]
 
 CatalogSource = Literal["local", "youtube"]
 """Known catalog source identifiers."""
@@ -43,3 +50,12 @@ class CatalogProvider(Protocol):
     def fetch(self) -> list[Song]:
         """Return the full song list for this source (empty list if none)."""
         ...
+
+
+# Re-exported last: songbot.catalog.refresh imports Song/CatalogProvider from
+# this module, so the names above must exist before the import runs.
+from songbot.catalog.refresh import (  # noqa: E402
+    RefreshResult,
+    SourceRefresh,
+    refresh_catalog,
+)
