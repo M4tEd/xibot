@@ -102,6 +102,10 @@ git clone <repo-url> && cd SongBot
 uv venv --python 3.12
 uv pip install -e . && uv pip install --group dev
 
+# Recreate the synthetic demo music library at data/fixture-music/ (gitignored,
+# so fresh clones must regenerate it; the script is idempotent and needs ffmpeg)
+.venv/bin/python scripts/generate_fixture_music.py
+
 # Configure
 cp .env.example .env   # then edit .env (see below)
 ```
@@ -122,7 +126,7 @@ error listing every problem.
 | `DISCORD_GUILD_ID` | *(required)* | ID of the server (guild) the bot serves. Right-click the server name → *Copy Server ID* (Developer Mode). |
 | `DISCORD_CHANNEL_ID` | *(required)* | ID of the channel the daily challenge is posted to. Right-click the channel → *Copy Channel ID*. |
 | `YOUTUBE_PLAYLIST_URL` | `""` (disabled) | Public/unlisted YouTube playlist used as a song catalog. Empty disables the YouTube provider. |
-| `LOCAL_MUSIC_DIR` | `""` (disabled) | Directory of local audio files (mp3/m4a/flac/ogg) used as a song catalog; artist/title come from tags with an `Artist - Title.ext` filename fallback. Empty disables the local provider. For a self-contained demo point it at `./data/fixture-music` (a generated library of 8 synthetic 30s songs, gitignored); for real use point it at your own music folder. |
+| `LOCAL_MUSIC_DIR` | `""` (disabled) | Directory of local audio files (mp3/m4a/flac/ogg) used as a song catalog; artist/title come from tags with an `Artist - Title.ext` filename fallback. Empty disables the local provider. For a self-contained demo point it at `./data/fixture-music` (a generated library of 8 synthetic 30s songs, gitignored — fresh clones recreate it with `.venv/bin/python scripts/generate_fixture_music.py`); for real use point it at your own music folder. |
 | `DAILY_POST_TIME` | `12:00` | Daily post time, strict zero-padded `HH:MM` (00:00–23:59) in `TIMEZONE`. |
 | `TIMEZONE` | `America/Halifax` | IANA timezone name governing post time, challenge dates, and streaks. |
 | `MAX_GUESSES_PER_DAY` | `6` | Guesses per player per challenge (≥ 1). Wrong guesses are free but count toward the limit; the winning guess counts too. |
@@ -206,7 +210,8 @@ uses the bare name as a stable user id (`--user 42:alice` sets an explicit id).
 ### Example: a full day of play, then the next-day reveal
 
 Use an isolated database and cache so the demo doesn't touch real state, and a
-local-only catalog:
+local-only catalog. On a fresh clone, first run `.venv/bin/python
+scripts/generate_fixture_music.py` to recreate `data/fixture-music/`:
 
 ```bash
 export DATABASE_PATH=/tmp/songbot-demo/songbot.db
