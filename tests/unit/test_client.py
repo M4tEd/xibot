@@ -87,6 +87,11 @@ def _make_stack(tmp_path: Path, *, fail_snippets: bool = False) -> _Stack:
     db = Database.open(settings.database_path)
     snippets = FakeSnippets(settings.snippet_cache_dir, fail=fail_snippets)
     engine = GameEngine(db, settings, snippets)
+    # Mirror the live client's env bootstrap: the configured guild/channel
+    # pair lands in guild_settings, which the scheduler iterates.
+    engine.set_guild_channel(
+        GUILD_ID, CHANNEL_ID, set_by="env", now=datetime(2026, 8, 1, tzinfo=UTC)
+    )
     return _Stack(settings=settings, db=db, engine=engine, snippets=snippets)
 
 
@@ -110,10 +115,10 @@ class _FakeHealthStarter:
 
 class _FakeCommandSyncer:
     def __init__(self) -> None:
-        self.trees: list[Any] = []
+        self.syncs: list[tuple[Any, int]] = []
 
-    async def __call__(self, tree: Any) -> None:
-        self.trees.append(tree)
+    async def __call__(self, tree: Any, guild: discord.abc.Snowflake) -> None:
+        self.syncs.append((tree, guild.id))
 
 
 class _RecordingSender:
@@ -225,22 +230,68 @@ class TestSetupHook:
 
             guild_commands = client.tree.get_commands(guild=GUILD_OBJECT)
             assert {c.name for c in guild_commands} == {
+                "songbot-setup",
                 "songbot-post",
                 "songbot-skip",
                 "songbot-reload",
             }
             # Guild-scoped only: nothing lands on the global tree.
             assert client.tree.get_commands() == []
-            # The (faked) sync ran exactly once with this client's tree.
-            assert len(syncer.trees) == 1
+            # The (faked) sync ran exactly once, for the configured guild.
+            assert syncer.syncs == [(client.tree, int(GUILD_ID))]
         finally:
             await client.close()
 
-    async def test_registers_persistent_view_for_latest_challenge(
+    async def test_setup_hook_seeds_the_env_bootstrap_guild(
+        self, tmp_path: Path
+    ) -> None:
+        # A stack built WITHOUT the usual seeding simulates a first boot.
+        settings = _settings(tmp_path)
+        db = Database.open(settings.database_path)
+        snippets = FakeSnippets(settings.snippet_cache_dir)
+        engine = GameEngine(db, settings, snippets)
+        client = _make_client(_Stack(settings, db, engine, snippets))
+        try:
+            assert engine.all_guild_settings() == []
+
+            await client.setup_hook()
+
+            row = engine.guild_settings(GUILD_ID)
+            assert row is not None
+            assert row.channel_id == CHANNEL_ID
+            assert row.set_by == "env"
+        finally:
+            await client.close()
+
+    async def test_setup_hook_without_bootstrap_pair_syncs_nothing(
+        self, tmp_path: Path, syncer: _FakeCommandSyncer
+    ) -> None:
+        settings = _settings(tmp_path)
+        multi_only = Settings(**{**settings.__dict__, "guild_id": None, "channel_id": None})  # type: ignore[arg-type]
+        db = Database.open(settings.database_path)
+        engine = GameEngine(db, multi_only, FakeSnippets(multi_only.snippet_cache_dir))
+        client = SongBotClient(
+            multi_only,
+            db,
+            engine,
+            clock=lambda: DAY1_PM,
+            post_sender=_RecordingSender().post,
+            reveal_sender=_RecordingSender().reveal,
+            health_starter=_FakeHealthStarter(),
+            command_syncer=syncer,
+        )
+        try:
+            await client.setup_hook()
+
+            assert syncer.syncs == []
+            assert client.tree.get_commands() == []
+        finally:
+            await client.close()
+
+    async def test_registers_lazy_persistent_fallback_view(
         self, stack: _Stack
     ) -> None:
         _add_song(stack.db, "song-1")
-        challenge = stack.engine.ensure_today_challenge(GUILD_ID, CHANNEL_ID, DAY1_PM)
         client = _make_client(stack)
         try:
             with mock.patch.object(client, "add_view", wraps=client.add_view) as spy:
@@ -250,7 +301,10 @@ class TestSetupHook:
             view = spy.call_args.args[0]
             assert isinstance(view, DailyChallengeView)
             assert view.is_persistent()
-            assert view._challenge_id == challenge.id
+            # Multi-guild: the fallback is LAZY — no fixed challenge binding;
+            # it resolves the clicking guild's latest challenge at press time.
+            assert view._challenge_id is None
+            assert view._guild_id is None
             custom_ids = {
                 child.custom_id
                 for child in view.children
@@ -266,7 +320,7 @@ class TestSetupHook:
         finally:
             await client.close()
 
-    async def test_no_persistent_view_when_no_challenge_exists(
+    async def test_persistent_fallback_registered_even_with_no_challenges(
         self, stack: _Stack
     ) -> None:
         client = _make_client(stack)
@@ -274,8 +328,44 @@ class TestSetupHook:
             with mock.patch.object(client, "add_view", wraps=client.add_view) as spy:
                 await client.setup_hook()
 
-            assert spy.call_count == 0
-            assert client._connection._view_store.persistent_views == []
+            # Lazy resolution makes registration safe on a fresh install.
+            assert spy.call_count == 1
+            assert client._connection._view_store.persistent_views
+        finally:
+            await client.close()
+
+    async def test_on_guild_join_syncs_that_guild_once(
+        self, stack: _Stack, syncer: _FakeCommandSyncer
+    ) -> None:
+        client = _make_client(stack, syncer=syncer)
+        try:
+            new_guild = discord.Object(id=424242)
+
+            await client.on_guild_join(new_guild)  # type: ignore[arg-type]
+            await client.on_guild_join(new_guild)  # type: ignore[arg-type]  # idempotent
+
+            assert syncer.syncs == [(client.tree, 424242)]
+            assert len(client.tree.get_commands(guild=new_guild)) == 4
+        finally:
+            await client.close()
+
+    async def test_on_guild_remove_drops_configuration(
+        self, stack: _Stack
+    ) -> None:
+        _add_song(stack.db, "song-1")
+        challenge = stack.engine.ensure_today_challenge(GUILD_ID, CHANNEL_ID, DAY1_PM)
+        client = _make_client(stack)
+        try:
+            assert stack.engine.guild_settings(GUILD_ID) is not None
+
+            await client.on_guild_remove(discord.Object(id=int(GUILD_ID)))  # type: ignore[arg-type]
+
+            assert stack.engine.guild_settings(GUILD_ID) is None
+            # Game history is kept — only the post target is dropped.
+            row = stack.db.query_one(
+                "SELECT 1 FROM challenges WHERE id = ?", (challenge.id,)
+            )
+            assert row is not None
         finally:
             await client.close()
 
@@ -402,17 +492,15 @@ class TestSchedulerTick:
         _, challenge2 = sender.events[2]
         assert challenge2.date == "2026-08-14"
 
-    async def test_post_refreshes_persistent_view_binding(self, stack: _Stack) -> None:
+    async def test_post_does_not_re_register_views(self, stack: _Stack) -> None:
+        """The lazy persistent fallback needs no per-post re-binding."""
         _add_song(stack.db, "song-1")
         client = _make_client(stack)
 
         with mock.patch.object(client, "add_view", wraps=client.add_view) as spy:
             await client._scheduler_tick(DAY1_PM)
 
-        assert spy.call_count == 1
-        view = spy.call_args.args[0]
-        assert isinstance(view, DailyChallengeView)
-        assert view._challenge_id is not None
+        assert spy.call_count == 0  # registration happens once, in setup_hook
 
     async def test_catalog_empty_is_logged_not_raised(
         self, stack: _Stack, sender: _RecordingSender, caplog: pytest.LogCaptureFixture
@@ -457,6 +545,115 @@ class TestSchedulerTick:
 
         # 13:00 ADT -> 23h until the next post, capped at MAX_SLEEP_SEC.
         assert client._seconds_until_next_check(DAY1_PM) == client_module.MAX_SLEEP_SEC
+
+
+class TestMultiGuildScheduler:
+    """The scheduler iterates every configured guild, isolated per guild."""
+
+    GUILD_B = "2222222222"
+    CHANNEL_B = "999888777"
+
+    def _add_guild_b(self, stack: _Stack) -> None:
+        stack.engine.set_guild_channel(
+            self.GUILD_B,
+            self.CHANNEL_B,
+            set_by="test",
+            now=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+
+    async def test_posts_to_every_configured_guild(
+        self, stack: _Stack, sender: _RecordingSender
+    ) -> None:
+        _add_song(stack.db, "song-1")
+        _add_song(stack.db, "song-2")
+        self._add_guild_b(stack)
+        client = _make_client(stack, sender=sender)
+
+        await client._scheduler_tick(DAY1_PM)
+
+        assert [kind for kind, _ in sender.events] == ["post", "post"]
+        by_guild = {c.guild_id: c for _, c in sender.events}
+        assert set(by_guild) == {GUILD_ID, self.GUILD_B}
+        assert by_guild[GUILD_ID].channel_id == CHANNEL_ID
+        assert by_guild[self.GUILD_B].channel_id == self.CHANNEL_B
+        # Per-guild picks: each guild has its own challenge row for the date.
+        rows = stack.db.query("SELECT guild_id, date FROM challenges")
+        assert {(r["guild_id"], r["date"]) for r in rows} == {
+            (GUILD_ID, "2026-08-13"),
+            (self.GUILD_B, "2026-08-13"),
+        }
+
+    async def test_unconfigured_guilds_are_not_touched(
+        self, stack: _Stack, sender: _RecordingSender
+    ) -> None:
+        """A guild with challenges but no guild_settings row gets no posts."""
+        _add_song(stack.db, "song-1")
+        # A challenge exists for some other guild (history), but only the
+        # seeded guild is configured.
+        stack.engine.ensure_today_challenge("ghost-guild", "ghost-channel", DAY1_PM)
+        client = _make_client(stack, sender=sender)
+
+        await client._scheduler_tick(DAY2_NOON)
+
+        assert [c.guild_id for _, c in sender.events] == [GUILD_ID]
+
+    async def test_one_guilds_failure_never_blocks_another(
+        self, stack: _Stack, sender: _RecordingSender, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _add_song(stack.db, "song-1")
+        _add_song(stack.db, "song-2")
+        self._add_guild_b(stack)
+
+        class _FlakySender(_RecordingSender):
+            async def post(self, challenge: Challenge) -> None:
+                if challenge.guild_id == GUILD_ID:
+                    raise RuntimeError("discord 500")
+                await super().post(challenge)
+
+        flaky = _FlakySender()
+        client = _make_client(stack, sender=flaky)
+
+        with caplog.at_level(logging.ERROR, logger="songbot.bot.client"):
+            delay = await client._scheduler_tick(DAY1_PM)
+
+        # Guild B posted; guild A's failure is logged and drives the retry.
+        assert [c.guild_id for _, c in flaky.events] == [self.GUILD_B]
+        assert delay == client_module.RETRY_DELAY_SEC
+        assert any(GUILD_ID in record.message for record in caplog.records)
+        # Pinned #16: A's just-created challenge was rolled back.
+        assert stack.db.query_one(
+            "SELECT 1 FROM challenges WHERE guild_id = ?", (GUILD_ID,)
+        ) is None
+
+        # The retry posts A only (B is no longer due) on the same day.
+        class _FixedSender(_RecordingSender):
+            pass
+
+        fixed = _FixedSender()
+        client._post_sender = fixed.post
+        await client._scheduler_tick(DAY1_PM)
+
+        assert [c.guild_id for _, c in fixed.events] == [GUILD_ID]
+
+    async def test_reveal_targets_the_channel_the_challenge_was_posted_in(
+        self, stack: _Stack, sender: _RecordingSender
+    ) -> None:
+        """A channel change mid-game never moves the reveal of an old post."""
+        _add_song(stack.db, "song-1")
+        _add_song(stack.db, "song-2")
+        client = _make_client(stack, sender=sender)
+        await client._scheduler_tick(DAY1_PM)
+        # Admin re-runs /songbot-setup pointing at a new channel.
+        stack.engine.set_guild_channel(GUILD_ID, "333444555", set_by="admin", now=DAY2_NOON)
+
+        await client._scheduler_tick(DAY2_NOON)
+
+        kinds = [kind for kind, _ in sender.events]
+        assert kinds == ["post", "reveal", "post"]
+        reveal = sender.events[1][1]
+        assert reveal.channel_id == CHANNEL_ID  # the OLD channel
+        new_post = sender.events[2][1]
+        assert new_post.channel_id == "333444555"
 
 
 class TestEntrypoint:

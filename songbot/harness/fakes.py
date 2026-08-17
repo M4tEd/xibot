@@ -236,15 +236,20 @@ class FakeInteraction:
     """Drives real view/modal callbacks without any discord.py gateway.
 
     Only the attributes the adapter callbacks may touch exist here:
-    ``user``, ``channel``, ``response``, ``followup``, ``message``.
+    ``user``, ``channel``, ``response``, ``followup``, ``message``, and
+    ``guild_id`` (the guild being acted on — multi-guild admin/view
+    resolution; a string, matching the harness's string-id convention).
     """
 
-    def __init__(self, recorder: Recorder, user: FakeUser) -> None:
+    def __init__(
+        self, recorder: Recorder, user: FakeUser, *, guild_id: str | None = None
+    ) -> None:
         self.user = user
         self.channel = FakeChannel(recorder)
         self.response = FakeResponse(recorder, user)
         self.followup = FakeFollowup(recorder, user)
         self.message: None = None
+        self.guild_id = guild_id
 
 
 def find_button(view: discord.ui.View, custom_id: str) -> discord.ui.Button[Any]:

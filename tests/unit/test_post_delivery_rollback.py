@@ -65,6 +65,12 @@ def _interaction(*, manage_guild: bool = True) -> FakeInteraction:
     return FakeInteraction.for_user(ADMIN_ID, "admin", manage_guild=manage_guild)
 
 
+def _seed_guild(engine: GameEngine) -> None:
+    """Configure guild-1's post channel (what /songbot-setup or the env
+    bootstrap does live); the admin bodies look it up per interaction."""
+    engine.set_guild_channel("guild-1", "channel-1", set_by="test", now=DAY1)
+
+
 def _kinds(out: dict[str, Any]) -> list[str]:
     return [p["kind"] for p in out["payloads"]]
 
@@ -252,6 +258,7 @@ class TestAdminPath:
     ) -> None:
         _add_song(db)
         engine, fake = _make_engine(tmp_path, db)
+        _seed_guild(engine)
         poster = _FlakyPoster()
         commands = AdminCommands(
             engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
@@ -278,6 +285,7 @@ class TestAdminPath:
     ) -> None:
         _add_song(db)
         engine, _ = _make_engine(tmp_path, db)
+        _seed_guild(engine)
         poster = _FlakyPoster()
         commands = AdminCommands(
             engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
@@ -303,6 +311,7 @@ class TestAdminPath:
     ) -> None:
         _add_song(db)
         engine, fake = _make_engine(tmp_path, db)
+        _seed_guild(engine)
         poster = _FlakyPoster()
         poster.fail = False
         commands = AdminCommands(
@@ -328,6 +337,7 @@ class TestAdminPath:
     ) -> None:
         _add_song(db)  # Neon Skyline / Midnight Circuit
         engine, _ = _make_engine(tmp_path, db)
+        _seed_guild(engine)
         poster = _FlakyPoster()
         commands = AdminCommands(
             engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster

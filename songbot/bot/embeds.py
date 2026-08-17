@@ -31,6 +31,7 @@ from songbot.engine import (
 
 __all__ = [
     "ADMIN_CATALOG_EMPTY_MESSAGE",
+    "ADMIN_NOT_CONFIGURED_MESSAGE",
     "ADMIN_POST_ALREADY_MESSAGE",
     "ADMIN_POST_FAILED_MESSAGE",
     "ADMIN_POST_SUCCESS_MESSAGE",
@@ -40,6 +41,7 @@ __all__ = [
     "EMPTY_GUESS_MESSAGE",
     "EMPTY_LEADERBOARD_MESSAGE",
     "HEAR_MORE_SOLVED_MESSAGE",
+    "NO_ACTIVE_CHALLENGE_MESSAGE",
     "PERMISSION_DENIED_MESSAGE",
     "announcement_content",
     "daily_challenge_embed",
@@ -50,6 +52,7 @@ __all__ = [
     "leaderboard_embed",
     "reload_ack_content",
     "reveal_embed",
+    "setup_ack_content",
     "skip_refusal_content",
     "snippet_attachment",
 ]
@@ -68,6 +71,13 @@ EMPTY_LEADERBOARD_MESSAGE = "No scores yet — be the first to solve a daily son
 
 HEAR_MORE_SOLVED_MESSAGE = "You've already solved this one — no more snippets needed. ✅"
 """Hear-more rejection for a user who already solved the challenge."""
+
+NO_ACTIVE_CHALLENGE_MESSAGE = (
+    "There's no active challenge right now — check back after the next daily post! 🎵"
+)
+"""The graceful ephemeral notice for gameplay before any challenge exists
+(VAL-CROSS-017) — shared by the harness scenarios and the persistent fallback
+view when a click resolves to a guild with no challenges at all."""
 
 PERMISSION_DENIED_MESSAGE = (
     "🚫 You need the **Manage Server** permission to use SongBot admin commands."
@@ -100,6 +110,12 @@ challenge.
 
 ADMIN_SKIP_SUCCESS_MESSAGE = "⏭️ Skipped — today's song has been replaced with a new one."
 """Ephemeral ack for a successful /songbot-skip (never names either song)."""
+
+ADMIN_NOT_CONFIGURED_MESSAGE = (
+    "⚙️ SongBot isn't set up in this server yet — run /songbot-setup to pick "
+    "the daily-challenge channel."
+)
+"""Ephemeral ack when an admin command needs a channel the guild never configured."""
 
 
 def format_seconds(seconds: float) -> str:
@@ -261,6 +277,16 @@ def hear_more_refusal_content(reason: UnlockRefusedReason, settings: Settings) -
 def snippet_attachment(path: Path) -> discord.File:
     """Attach a snippet file under the pinned-#9 filename (never the song's)."""
     return discord.File(path, filename=ATTACHMENT_FILENAME)
+
+
+def setup_ack_content(channel_mention: str, settings: Settings) -> str:
+    """The ephemeral ack for /songbot-setup: where posts land and when."""
+    return (
+        f"✅ Daily challenges will be posted in {channel_mention}.\n"
+        f"The first post lands at the next scheduled time "
+        f"(**{settings.daily_post_time} {settings.timezone}**) — or post one "
+        "right now with /songbot-post."
+    )
 
 
 def skip_refusal_content(reason: SkipRefusedReason) -> str:
