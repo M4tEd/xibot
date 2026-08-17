@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import discord
 import pytest
@@ -73,6 +74,10 @@ def poster() -> _RecordingPoster:
 def commands(
     engine: GameEngine, tmp_path: Path, poster: _RecordingPoster
 ) -> AdminCommands:
+    # The fake interactions act on "guild-1"; configure its post channel so
+    # the guild-scoped bodies find it (the live client seeds this from the
+    # env bootstrap or /songbot-setup).
+    engine.set_guild_channel("guild-1", "channel-1", set_by="test", now=DAY1)
     return AdminCommands(
         engine,
         _settings(tmp_path),
@@ -81,8 +86,12 @@ def commands(
     )
 
 
-def _interaction(*, manage_guild: bool = True) -> FakeInteraction:
-    return FakeInteraction.for_user(ADMIN_ID, "admin", manage_guild=manage_guild)
+def _interaction(
+    *, manage_guild: bool = True, guild_id: str | None = "guild-1"
+) -> FakeInteraction:
+    return FakeInteraction.for_user(
+        ADMIN_ID, "admin", manage_guild=manage_guild, guild_id=guild_id
+    )
 
 
 def _row_count(db: Database, table: str) -> int:
@@ -128,7 +137,15 @@ class TestPermissionGate:
             engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
         )
 
-        for method in (spied.post_now, spied.skip_song, spied.reload_catalog):
+        async def setup_via(interaction: FakeInteraction) -> Any:
+            return await spied.setup_channel(interaction, "channel-1", "#channel-1")
+
+        for method in (
+            spied.post_now,
+            spied.skip_song,
+            spied.reload_catalog,
+            setup_via,
+        ):
             interaction = _interaction(manage_guild=False)
             result = await method(interaction)
 
@@ -143,7 +160,14 @@ class TestPermissionGate:
         # Zero state change and no engine/catalog work happened at all.
         assert poster.posted == []
         assert refresh_calls == 0
-        for table in ("songs", "challenges", "challenge_users", "guesses", "user_stats"):
+        for table in (
+            "songs",
+            "challenges",
+            "challenge_users",
+            "guesses",
+            "user_stats",
+            "guild_settings",
+        ):
             assert _row_count(db, table) == 0
 
 
@@ -418,7 +442,7 @@ class TestReloadCatalog:
 
 
 class TestRegistration:
-    def test_registers_three_guild_commands_with_manage_guild_default(
+    def test_registers_four_guild_commands_with_manage_guild_default(
         self, commands: AdminCommands
     ) -> None:
         client = discord.Client(intents=discord.Intents.default())
@@ -429,8 +453,157 @@ class TestRegistration:
 
         registered = tree.get_commands(guild=guild)
         names = {command.name for command in registered}
-        assert names == {"songbot-post", "songbot-skip", "songbot-reload"}
+        assert names == {
+            "songbot-setup",
+            "songbot-post",
+            "songbot-skip",
+            "songbot-reload",
+        }
         for command in registered:
             assert isinstance(command, app_commands.Command)
             assert command.default_permissions is not None
             assert command.default_permissions.manage_guild is True
+
+    def test_setup_command_takes_a_text_channel_option(
+        self, commands: AdminCommands
+    ) -> None:
+        client = discord.Client(intents=discord.Intents.default())
+        tree = app_commands.CommandTree(client)
+        register_admin_commands(tree, commands, guild=discord.Object(id=1234567890))
+
+        setup = next(
+            c
+            for c in tree.get_commands(guild=discord.Object(id=1234567890))
+            if c.name == "songbot-setup"
+        )
+        params = setup.parameters
+        assert len(params) == 1
+        assert params[0].name == "channel"
+        assert params[0].required is True
+        assert discord.ChannelType.text in params[0].channel_types
+
+    def test_registration_is_per_guild(self, commands: AdminCommands) -> None:
+        """Multi-guild: one registration call per joined guild, no global leak."""
+        client = discord.Client(intents=discord.Intents.default())
+        tree = app_commands.CommandTree(client)
+        guild_a = discord.Object(id=111)
+        guild_b = discord.Object(id=222)
+
+        register_admin_commands(tree, commands, guild=guild_a)
+        register_admin_commands(tree, commands, guild=guild_b)
+
+        assert len(tree.get_commands(guild=guild_a)) == 4
+        assert len(tree.get_commands(guild=guild_b)) == 4
+        assert tree.get_commands() == []  # nothing global
+
+
+class TestSetupChannel:
+    """Multi-guild configuration: /songbot-setup writes guild_settings."""
+
+    async def test_configures_channel_and_acks_ephemerally(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        interaction = _interaction()
+
+        result = await commands.setup_channel(interaction, "999888", "#daily-song")
+
+        assert result.outcome == "configured"
+        row = db.query_one("SELECT * FROM guild_settings WHERE guild_id = 'guild-1'")
+        assert row is not None
+        assert row["channel_id"] == "999888"
+        assert row["set_by"] == str(ADMIN_ID)
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        ack = interaction.payloads[0]
+        assert ack.recipient == str(ADMIN_ID)
+        assert ack.content is not None
+        assert "#daily-song" in ack.content
+        # The ack advertises the global schedule and the manual post path.
+        assert "12:00" in ack.content
+        assert "/songbot-post" in ack.content
+
+    async def test_re_setup_updates_channel_keeps_created_at(
+        self,
+        commands: AdminCommands,
+        db: Database,
+        engine: GameEngine,
+        tmp_path: Path,
+        poster: _RecordingPoster,
+    ) -> None:
+        # The commands fixture seeded guild-1 -> channel-1 at DAY1.
+        before = db.query_one(
+            "SELECT created_at FROM guild_settings WHERE guild_id = 'guild-1'"
+        )
+        assert before is not None
+
+        later = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
+        later_commands = AdminCommands(
+            engine, _settings(tmp_path), clock=lambda: later, post_sender=poster
+        )
+        result = await later_commands.setup_channel(_interaction(), "777", "#new-home")
+
+        assert result.outcome == "configured"
+        row = db.query_one(
+            "SELECT channel_id, created_at, updated_at FROM guild_settings"
+            " WHERE guild_id = 'guild-1'"
+        )
+        assert row is not None
+        assert row["channel_id"] == "777"
+        assert row["created_at"] == before["created_at"]
+        assert row["updated_at"] != before["created_at"]
+
+    async def test_denied_without_permission_zero_mutation(
+        self, db: Database, tmp_path: Path, poster: _RecordingPoster
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        commands = AdminCommands(
+            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+        )
+        interaction = _interaction(manage_guild=False)
+
+        result = await commands.setup_channel(interaction, "999888", "#daily-song")
+
+        assert result.outcome == "denied"
+        assert _row_count(db, "guild_settings") == 0
+
+    async def test_post_after_setup_uses_the_new_channel(
+        self, commands: AdminCommands, db: Database, poster: _RecordingPoster
+    ) -> None:
+        _add_song(db)
+        await commands.setup_channel(_interaction(), "999888", "#daily-song")
+
+        result = await commands.post_now(_interaction())
+
+        assert result.outcome == "posted"
+        assert poster.posted[0].channel_id == "999888"
+        row = db.query_one("SELECT channel_id FROM challenges")
+        assert row is not None
+        assert row["channel_id"] == "999888"
+
+
+class TestNotConfigured:
+    """A guild that never ran /songbot-setup gets the not-configured ack."""
+
+    async def test_post_now_not_configured_zero_mutation(
+        self, commands: AdminCommands, db: Database, poster: _RecordingPoster
+    ) -> None:
+        _add_song(db)
+        interaction = _interaction(guild_id="guild-never-set-up")
+
+        result = await commands.post_now(interaction)
+
+        assert result.outcome == "not_configured"
+        assert poster.posted == []
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        content = interaction.payloads[0].content or ""
+        assert "/songbot-setup" in content
+        assert _row_count(db, "challenges") == 0
+
+    async def test_skip_in_unconfigured_guild_is_plain_no_challenge_refusal(
+        self, commands: AdminCommands, db: Database
+    ) -> None:
+        interaction = _interaction(guild_id="guild-never-set-up")
+
+        result = await commands.skip_song(interaction)
+
+        assert result.outcome == "refused"
+        assert result.reason == "no_challenge"

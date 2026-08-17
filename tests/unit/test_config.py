@@ -138,13 +138,40 @@ class TestMissingRequired:
             load(env_file)
         message = str(exc_info.value)
         assert "DISCORD_BOT_TOKEN" in message
-        assert "DISCORD_GUILD_ID" in message
-        assert "DISCORD_CHANNEL_ID" in message
 
     def test_empty_required_key_is_missing(self, tmp_path: Path) -> None:
-        env_file = write_env(tmp_path, {**VALID_ENV, "DISCORD_GUILD_ID": ""})
-        with pytest.raises(ConfigError, match="DISCORD_GUILD_ID"):
+        env_file = write_env(tmp_path, {**VALID_ENV, "DISCORD_BOT_TOKEN": ""})
+        with pytest.raises(ConfigError, match="DISCORD_BOT_TOKEN"):
             load(env_file)
+
+
+class TestGuildChannelBootstrapPair:
+    """Multi-guild: the env pair is an optional bootstrap — both or neither."""
+
+    def test_neither_set_is_valid_and_yields_none(self, tmp_path: Path) -> None:
+        env_file = write_env(
+            tmp_path,
+            {k: v for k, v in VALID_ENV.items() if "GUILD" not in k and "CHANNEL" not in k},
+        )
+        settings = load(env_file)
+        assert settings.guild_id is None
+        assert settings.channel_id is None
+
+    def test_guild_without_channel_is_an_error(self, tmp_path: Path) -> None:
+        env_file = write_env(tmp_path, {**VALID_ENV, "DISCORD_CHANNEL_ID": ""})
+        with pytest.raises(ConfigError, match="set together"):
+            load(env_file)
+
+    def test_channel_without_guild_is_an_error(self, tmp_path: Path) -> None:
+        env_file = write_env(tmp_path, {**VALID_ENV, "DISCORD_GUILD_ID": ""})
+        with pytest.raises(ConfigError, match="set together"):
+            load(env_file)
+
+    def test_both_set_is_valid(self, tmp_path: Path) -> None:
+        env_file = write_env(tmp_path, VALID_ENV)
+        settings = load(env_file)
+        assert settings.guild_id == "123456789"
+        assert settings.channel_id == "987654321"
 
 
 class TestTimezoneValidation:

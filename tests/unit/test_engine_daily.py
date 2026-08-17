@@ -453,6 +453,86 @@ class TestPerGuildIsolation:
         ) is None
 
 
+class TestGuildSettings:
+    """The per-guild post-target store backing multi-guild /songbot-setup."""
+
+    def test_set_then_get_round_trip(self, db: Database, tmp_path: Path) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+
+        row = engine.set_guild_channel("g1", "c1", set_by="user-1", now=NOW)
+
+        assert row.guild_id == "g1"
+        assert row.channel_id == "c1"
+        assert row.set_by == "user-1"
+        assert row.created_at == row.updated_at
+        assert engine.guild_settings("g1") == row
+
+    def test_upsert_updates_channel_and_keeps_created_at(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        first = engine.set_guild_channel("g1", "c1", set_by="user-1", now=NOW)
+        later = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
+
+        second = engine.set_guild_channel("g1", "c2", set_by="user-2", now=later)
+
+        assert second.channel_id == "c2"
+        assert second.set_by == "user-2"
+        assert second.created_at == first.created_at
+        assert second.updated_at != first.updated_at
+        assert len(engine.all_guild_settings()) == 1  # still one row
+
+    def test_unknown_guild_is_none(self, db: Database, tmp_path: Path) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        assert engine.guild_settings("nope") is None
+
+    def test_all_guild_settings_ordered_by_guild_id(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        engine.set_guild_channel("g2", "c2", set_by="t", now=NOW)
+        engine.set_guild_channel("g1", "c1", set_by="t", now=NOW)
+
+        assert [row.guild_id for row in engine.all_guild_settings()] == ["g1", "g2"]
+
+    def test_remove_guild_settings_drops_only_that_guild(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        engine.set_guild_channel("g1", "c1", set_by="t", now=NOW)
+        engine.set_guild_channel("g2", "c2", set_by="t", now=NOW)
+
+        engine.remove_guild_settings("g1")
+
+        assert engine.guild_settings("g1") is None
+        assert engine.guild_settings("g2") is not None
+
+    def test_latest_challenge_id(self, db: Database, tmp_path: Path) -> None:
+        _add_songs(db, 3)
+        engine, _ = _make_engine(tmp_path, db)
+        assert engine.latest_challenge_id("g1") is None
+
+        first = engine.ensure_today_challenge("g1", "c1", NOW)
+        assert engine.latest_challenge_id("g1") == first.id
+        # Another guild's challenges never leak into the lookup.
+        assert engine.latest_challenge_id("g2") is None
+
+    def test_reveal_carries_the_challenge_row_channel(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """The reveal targets the channel the challenge was POSTED to."""
+        _add_songs(db, 3)
+        engine, _ = _make_engine(tmp_path, db)
+        engine.ensure_today_challenge("g1", "c1", NOW)
+        next_day = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
+
+        reveal = engine.peek_reveal("g1", next_day)
+
+        assert reveal is not None
+        assert reveal.guild_id == "g1"
+        assert reveal.channel_id == "c1"
+
+
 class TestPeekReveal:
     """The read-only half of the delivery-coupled reveal (pinned #17).
 

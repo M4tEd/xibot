@@ -50,6 +50,7 @@ from songbot.db import (
     ChallengeStatus,
     ChallengeUserRow,
     Database,
+    GuildSettingsRow,
     SongRow,
     UserStatsRow,
 )
@@ -192,10 +193,15 @@ class Reveal:
     """The reveal of a previous challenge: song identity + winners.
 
     ``winners`` is in solve order (``solved_at`` ascending). Empty when
-    nobody solved ("nobody got it").
+    nobody solved ("nobody got it"). ``guild_id``/``channel_id`` come from
+    the challenge row itself, so the reveal is delivered to the channel the
+    challenge was posted in even if the guild's configured channel changed
+    since.
     """
 
     challenge_id: int
+    guild_id: str
+    channel_id: str
     date: str
     song: SongRow
     winners: tuple[Winner, ...]
@@ -356,6 +362,67 @@ class GameEngine:
     def _songs_empty(self) -> bool:
         row = self._db.query_one("SELECT COUNT(*) AS c FROM songs")
         return row is None or int(row["c"]) == 0
+
+    # -- guild configuration (multi-guild post targets) ------------------------
+
+    def set_guild_channel(
+        self, guild_id: str, channel_id: str, *, set_by: str, now: datetime
+    ) -> GuildSettingsRow:
+        """Upsert a guild's daily-post channel; return the stored row.
+
+        Used by /songbot-setup and by the client's env bootstrap seed. A
+        re-configuration keeps the original ``created_at`` and refreshes
+        ``updated_at``. Existing challenge rows keep the channel they were
+        posted to — only future posts use the new channel.
+        """
+        iso_now = self._utc_iso(now)
+        with self._db.transaction():
+            self._db.execute(
+                "INSERT INTO guild_settings"
+                " (guild_id, channel_id, set_by, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(guild_id) DO UPDATE SET"
+                " channel_id = excluded.channel_id, set_by = excluded.set_by,"
+                " updated_at = excluded.updated_at",
+                (guild_id, channel_id, set_by, iso_now, iso_now),
+            )
+        row = self.guild_settings(guild_id)
+        if row is None:  # pragma: no cover - the upsert just wrote it
+            raise EngineError(f"guild_settings upsert lost guild {guild_id}")
+        return row
+
+    def guild_settings(self, guild_id: str) -> GuildSettingsRow | None:
+        """A guild's configured post target, or None when not set up."""
+        row = self._db.query_one(
+            "SELECT * FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        )
+        return GuildSettingsRow.from_row(row) if row is not None else None
+
+    def all_guild_settings(self) -> list[GuildSettingsRow]:
+        """Every configured guild's post target (the scheduler's work list)."""
+        return [
+            GuildSettingsRow.from_row(row)
+            for row in self._db.query(
+                "SELECT * FROM guild_settings ORDER BY guild_id"
+            )
+        ]
+
+    def remove_guild_settings(self, guild_id: str) -> None:
+        """Drop a guild's configuration (the bot left the guild).
+
+        Challenge/score history is KEPT — re-adding the bot and re-running
+        /songbot-setup resumes the guild's game where it left off.
+        """
+        self._db.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
+
+    def latest_challenge_id(self, guild_id: str) -> int | None:
+        """The id of the guild's most recent challenge (persistent-view binding)."""
+        row = self._db.query_one(
+            "SELECT id FROM challenges WHERE guild_id = ?"
+            " ORDER BY date DESC, id DESC LIMIT 1",
+            (guild_id,),
+        )
+        return int(row["id"]) if row is not None else None
 
     # -- song selection --------------------------------------------------------
 
@@ -533,6 +600,8 @@ class GameEngine:
         )
         return Reveal(
             challenge_id=target.id,
+            guild_id=target.guild_id,
+            channel_id=target.channel_id,
             date=target.date,
             song=self._song_row(target.song_id),
             winners=winners,

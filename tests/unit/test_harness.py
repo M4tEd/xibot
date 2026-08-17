@@ -31,6 +31,7 @@ from songbot.harness.cli import (
     parse_user,
     scenario_admin_post,
     scenario_admin_reload,
+    scenario_admin_setup,
     scenario_admin_skip,
     scenario_advance_day,
     scenario_guess,
@@ -490,14 +491,21 @@ class TestReset:
         out = json_roundtrip(scenario_reset(ctx))
 
         assert out["payloads"] == []
-        for table in ("songs", "challenges", "challenge_users", "guesses", "user_stats"):
+        for table in (
+            "songs",
+            "challenges",
+            "challenge_users",
+            "guesses",
+            "user_stats",
+            "guild_settings",
+        ):
             row = ctx.db.query_one(f"SELECT COUNT(*) AS c FROM {table}")
             assert row is not None
             assert row["c"] == 0
         snippet_dir = tmp_path / "snippets"
         assert list(snippet_dir.rglob("*.mp3")) == []
         # Migrations survive a reset (the schema itself is not wiped).
-        assert ctx.db.schema_version() == 2
+        assert ctx.db.schema_version() == 3
 
     async def test_post_after_reset_works(self, ctx: HarnessContext, db: Database) -> None:
         _add_song(db)
@@ -538,6 +546,55 @@ class TestStatus:
         out = json_roundtrip(scenario_status(ctx, DAY2))
         assert out["state"]["date"] == "2026-08-14"
         assert out["state"]["challenge"] is None
+
+
+class TestAdminSetup:
+    """The admin-setup scenario drives the REAL /songbot-setup body."""
+
+    async def test_admin_setup_configures_channel_and_acks(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        out = json_roundtrip(await scenario_admin_setup(ctx, ADMIN, "999888", DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        ack = out["payloads"][0]
+        assert ack["recipient"] == "admin"
+        assert "#999888" in ack["content"]
+        assert out["state"]["outcome"] == "configured"
+        assert out["state"]["guild_settings"] == {
+            "guild_id": "guild-1",
+            "channel_id": "999888",
+            "set_by": "admin",
+        }
+        row = db.query_one("SELECT channel_id FROM guild_settings WHERE guild_id = 'guild-1'")
+        assert row is not None
+        assert row["channel_id"] == "999888"
+
+    async def test_admin_setup_non_admin_denied_without_changing_the_row(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        # The context seeded guild-1 -> channel-1 at build time.
+        out = json_roundtrip(await scenario_admin_setup(ctx, NON_ADMIN, "999888", DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        assert "manage server" in out["payloads"][0]["content"].lower()
+        assert out["state"]["outcome"] == "denied"
+        row = db.query_one("SELECT channel_id FROM guild_settings WHERE guild_id = 'guild-1'")
+        assert row is not None
+        assert row["channel_id"] == "channel-1"  # unchanged
+
+    async def test_admin_setup_then_admin_post_uses_the_new_channel(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_admin_setup(ctx, ADMIN, "999888", DAY1)
+
+        out = json_roundtrip(await scenario_admin_post(ctx, ADMIN, DAY1))
+
+        assert out["state"]["outcome"] == "posted"
+        row = db.query_one("SELECT channel_id FROM challenges")
+        assert row is not None
+        assert row["channel_id"] == "999888"
 
 
 class TestAdminPost:

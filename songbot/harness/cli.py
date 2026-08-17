@@ -40,15 +40,23 @@ and the retry delivers the reveal before posting. From an empty state it
 posts the local date of ``--now`` (or the real clock) with no reveal
 (VAL-CROSS-018).
 
-Admin scenarios — ``admin-post`` / ``admin-skip`` / ``admin-reload`` — drive
-the REAL ``AdminCommands`` bodies (songbot/bot/admin.py) with the invoking
-user's Manage-Guild permission simulated by ``--as-admin``/``--as-non-admin``
-(exactly one required). A denied invocation records exactly one ephemeral
-permission-denied payload and mutates nothing (VAL-ADMIN-009). A same-day
-repeat ``admin-post`` prints the pinned-#4 compact form
-``{"already_posted": true, "messages": []}`` just like ``post``
-(VAL-CROSS-015); an empty catalog prints ``{"error": "catalog_empty"}``
-(pinned #11).
+Admin scenarios — ``admin-setup`` / ``admin-post`` / ``admin-skip`` /
+``admin-reload`` — drive the REAL ``AdminCommands`` bodies
+(songbot/bot/admin.py) with the invoking user's Manage-Guild permission
+simulated by ``--as-admin``/``--as-non-admin`` (exactly one required). A
+denied invocation records exactly one ephemeral permission-denied payload
+and mutates nothing (VAL-ADMIN-009). A same-day repeat ``admin-post``
+prints the pinned-#4 compact form ``{"already_posted": true, "messages":
+[]}`` just like ``post`` (VAL-CROSS-015); an empty catalog prints
+``{"error": "catalog_empty"}`` (pinned #11). ``admin-setup`` upserts the
+guild's post channel (multi-guild configuration, ``--channel`` overrides
+the default harness channel).
+
+Multi-guild: the harness drives ONE guild per run — the
+DISCORD_GUILD_ID/DISCORD_CHANNEL_ID bootstrap pair when set, else the
+deterministic ``harness-guild``/``harness-channel`` defaults — and seeds its
+``guild_settings`` row (if absent) at startup, mirroring the live client's
+env bootstrap.
 
 ``serve`` runs ONLY the health endpoint (mode="harness", HEALTH_PORT) and
 makes no Discord requests. The harness never constructs a Discord client, so
@@ -71,7 +79,12 @@ from typing import Any, cast
 import discord
 
 from songbot.bot.admin import AdminCommands
-from songbot.bot.embeds import daily_challenge_embed, reveal_embed, snippet_attachment
+from songbot.bot.embeds import (
+    NO_ACTIVE_CHALLENGE_MESSAGE,
+    daily_challenge_embed,
+    reveal_embed,
+    snippet_attachment,
+)
 from songbot.bot.health import serve_health
 from songbot.bot.modals import GuessModal
 from songbot.bot.views import DailyChallengeView
@@ -106,6 +119,7 @@ __all__ = [
     "parse_user",
     "scenario_admin_post",
     "scenario_admin_reload",
+    "scenario_admin_setup",
     "scenario_admin_skip",
     "scenario_advance_day",
     "scenario_guess",
@@ -117,10 +131,11 @@ __all__ = [
     "scenario_status",
 ]
 
-NO_ACTIVE_CHALLENGE_MESSAGE = (
-    "There's no active challenge right now — check back after the next daily post! 🎵"
-)
-"""The graceful ephemeral notice for gameplay before any challenge exists (VAL-CROSS-017)."""
+DEFAULT_HARNESS_GUILD_ID = "harness-guild"
+"""The guild scenarios act on when no DISCORD_GUILD_ID bootstrap is set."""
+
+DEFAULT_HARNESS_CHANNEL_ID = "harness-channel"
+"""The channel scenarios post to when no DISCORD_CHANNEL_ID bootstrap is set."""
 
 
 class UsageError(Exception):
@@ -129,11 +144,32 @@ class UsageError(Exception):
 
 @dataclass
 class HarnessContext:
-    """The real stack a scenario runs against: settings + db + engine."""
+    """The real stack a scenario runs against: settings + db + engine.
+
+    ``guild_id``/``channel_id`` are the ONE guild the harness drives: the env
+    bootstrap pair when set, else the deterministic harness defaults (pass
+    explicit values to override; the empty string means "resolve"). The
+    guild's ``guild_settings`` row is seeded (if absent) whenever the context
+    is built, so the admin command bodies' configured-channel lookup works
+    exactly like live — and an earlier ``admin-setup`` invocation's choice
+    survives across harness runs.
+    """
 
     settings: Settings
     db: Database
     engine: GameEngine
+    guild_id: str = ""
+    channel_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.guild_id:
+            self.guild_id = self.settings.guild_id or DEFAULT_HARNESS_GUILD_ID
+        if not self.channel_id:
+            self.channel_id = self.settings.channel_id or DEFAULT_HARNESS_CHANNEL_ID
+        if self.engine.guild_settings(self.guild_id) is None:
+            self.engine.set_guild_channel(
+                self.guild_id, self.channel_id, set_by="harness", now=datetime.now(UTC)
+            )
 
     @classmethod
     def from_settings(cls, settings: Settings) -> HarnessContext:
@@ -281,6 +317,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_admin_flags(admin_reload)
 
+    admin_setup = sub.add_parser(
+        "admin-setup", help="Run /songbot-setup (set the guild's post channel)."
+    )
+    add_admin_flags(admin_setup)
+    admin_setup.add_argument(
+        "--channel",
+        default=None,
+        help="The channel id to configure (default: the harness channel).",
+    )
+
     reset = sub.add_parser("reset", help="Wipe all DB tables and the snippet cache.")
     add_now(reset)
 
@@ -361,11 +407,11 @@ def _counts(ctx: HarnessContext) -> dict[str, int]:
 
 
 def _view_for(ctx: HarnessContext, challenge_id: int, now: datetime) -> DailyChallengeView:
-    """The REAL persistent view for a challenge, with the scenario clock injected."""
+    """The REAL message-bound view for a challenge, with the scenario clock."""
     return DailyChallengeView(
         ctx.engine,
         challenge_id,
-        guild_id=ctx.settings.guild_id,
+        guild_id=ctx.guild_id,
         settings=ctx.settings,
         clock=lambda: now,
     )
@@ -380,7 +426,7 @@ def _resolve_challenge(
     status (a revealed one drives the real closed-challenge notice). Without
     ``--now``: the guild's most recent ACTIVE challenge (the "current post").
     """
-    guild_id = ctx.settings.guild_id
+    guild_id = ctx.guild_id
     if now_pinned:
         row = ctx.db.query_one(
             "SELECT * FROM challenges WHERE guild_id = ? AND date = ?",
@@ -447,9 +493,7 @@ async def scenario_post(
     """
     record = record_post if record_post is not None else _record_daily_post
     try:
-        challenge = ctx.engine.ensure_today_challenge(
-            ctx.settings.guild_id, ctx.settings.channel_id, now
-        )
+        challenge = ctx.engine.ensure_today_challenge(ctx.guild_id, ctx.channel_id, now)
     except CatalogEmptyError:
         return {"error": "catalog_empty"}
     if not challenge.created:
@@ -523,7 +567,7 @@ async def scenario_leaderboard(
     # keeps the real callback drivable before any challenge exists (VAL-CROSS-017).
     view = _view_for(ctx, row.id if row is not None else 0, now)
     await press_button(view, "songbot:leaderboard", FakeInteraction(recorder, user))
-    entries = ctx.engine.leaderboard(ctx.settings.guild_id, now)
+    entries = ctx.engine.leaderboard(ctx.guild_id, now)
     return _transcript(
         "leaderboard", recorder, {"entries": [asdict(entry) for entry in entries]}
     )
@@ -554,8 +598,8 @@ async def scenario_advance_day(
     record = record_post if record_post is not None else _record_daily_post
     send_reveal = record_reveal if record_reveal is not None else _record_reveal
     recorder = Recorder()
-    target = _advance_target(ctx.settings, ctx.db, now)
-    reveal = ctx.engine.peek_reveal(ctx.settings.guild_id, target)
+    target = _advance_target(ctx, now)
+    reveal = ctx.engine.peek_reveal(ctx.guild_id, target)
     reveal_state: dict[str, Any] | None = None
     if reveal is not None:
         try:
@@ -565,16 +609,14 @@ async def scenario_advance_day(
             # next advance-day retries the reveal BEFORE posting.
             return {"error": "reveal_failed", "message": str(exc)}
         # Mark revealed ONLY after the reveal send succeeded (pinned #17).
-        ctx.engine.mark_revealed(ctx.settings.guild_id, target)
+        ctx.engine.mark_revealed(ctx.guild_id, target)
         reveal_state = {
             "challenge_id": reveal.challenge_id,
             "date": reveal.date,
             "winners": len(reveal.winners),
         }
     try:
-        challenge = ctx.engine.ensure_today_challenge(
-            ctx.settings.guild_id, ctx.settings.channel_id, target
-        )
+        challenge = ctx.engine.ensure_today_challenge(ctx.guild_id, ctx.channel_id, target)
     except CatalogEmptyError:
         return {"error": "catalog_empty"}
     if challenge.created:
@@ -592,11 +634,12 @@ async def scenario_advance_day(
     )
 
 
-def _advance_target(settings: Settings, db: Database, now: datetime) -> datetime:
+def _advance_target(ctx: HarnessContext, now: datetime) -> datetime:
     """The next day's post datetime: latest challenge date + 1 day at post time."""
-    row = db.query_one(
+    settings = ctx.settings
+    row = ctx.db.query_one(
         "SELECT MAX(date) AS latest FROM challenges WHERE guild_id = ?",
-        (settings.guild_id,),
+        (ctx.guild_id,),
     )
     latest_raw = row["latest"] if row is not None else None
     if latest_raw is None:
@@ -659,7 +702,7 @@ def _today_challenge_state(ctx: HarnessContext, now: datetime) -> dict[str, Any]
     """
     row = ctx.db.query_one(
         "SELECT * FROM challenges WHERE guild_id = ? AND date = ?",
-        (ctx.settings.guild_id, _local_date(ctx.settings, now).isoformat()),
+        (ctx.guild_id, _local_date(ctx.settings, now).isoformat()),
     )
     if row is None:
         return None
@@ -697,7 +740,10 @@ async def scenario_admin_post(
     commands = _admin_commands(ctx, recorder, now, record_post=record_post)
     # The fake is duck-typed, not an Interaction subclass — same cast the
     # button/modal drivers use (see fakes.press_button).
-    interaction = cast("discord.Interaction[Any]", FakeInteraction(recorder, user))
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
     result = await commands.post_now(interaction)
     if result.outcome == "already_posted":
         return {"already_posted": True, "messages": []}
@@ -709,6 +755,44 @@ async def scenario_admin_post(
         "admin-post",
         recorder,
         {"outcome": result.outcome, "challenge": _today_challenge_state(ctx, now)},
+    )
+
+
+async def scenario_admin_setup(
+    ctx: HarnessContext, user: FakeUser, channel_id: str, now: datetime
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-setup body (multi-guild configuration).
+
+    Success: exactly one ephemeral ack naming the channel mention, and the
+    guild's ``guild_settings`` row is upserted (``state.guild_settings``
+    carries the stored row). A non-admin invocation records exactly one
+    ephemeral denial and mutates nothing (VAL-ADMIN-009).
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
+    result = await commands.setup_channel(
+        interaction, channel_id, channel_mention=f"#{channel_id}"
+    )
+    row = ctx.engine.guild_settings(ctx.guild_id)
+    return _transcript(
+        "admin-setup",
+        recorder,
+        {
+            "outcome": result.outcome,
+            "guild_settings": (
+                {
+                    "guild_id": row.guild_id,
+                    "channel_id": row.channel_id,
+                    "set_by": row.set_by,
+                }
+                if row is not None
+                else None
+            ),
+        },
     )
 
 
@@ -724,7 +808,10 @@ async def scenario_admin_skip(
     """
     recorder = Recorder()
     commands = _admin_commands(ctx, recorder, now)
-    interaction = cast("discord.Interaction[Any]", FakeInteraction(recorder, user))
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
     result = await commands.skip_song(interaction)
     return _transcript(
         "admin-skip",
@@ -747,7 +834,10 @@ async def scenario_admin_reload(
     """
     recorder = Recorder()
     commands = _admin_commands(ctx, recorder, now)
-    interaction = cast("discord.Interaction[Any]", FakeInteraction(recorder, user))
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
     result = await commands.reload_catalog(interaction)
     sources = [
         {
@@ -768,9 +858,20 @@ async def scenario_admin_reload(
 
 
 def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
-    """Wipe every data table and the snippet cache (schema/migrations survive)."""
+    """Wipe every data table and the snippet cache (schema/migrations survive).
+
+    ``guild_settings`` is wiped too (full clean slate); the next harness run
+    re-seeds the harness guild's row at context build.
+    """
     with ctx.db.transaction():
-        for table in ("guesses", "challenge_users", "challenges", "user_stats", "songs"):
+        for table in (
+            "guesses",
+            "challenge_users",
+            "challenges",
+            "user_stats",
+            "songs",
+            "guild_settings",
+        ):
             ctx.db.execute(f"DELETE FROM {table}")
     cache_dir = ctx.settings.snippet_cache_dir
     if cache_dir.exists():
@@ -781,7 +882,7 @@ def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
 
 def scenario_status(ctx: HarnessContext, now: datetime) -> dict[str, Any]:
     """Today's date, challenge status, song identity (test-only), counts, leaderboard."""
-    guild_id = ctx.settings.guild_id
+    guild_id = ctx.guild_id
     today = _local_date(ctx.settings, now).isoformat()
     challenge_state: dict[str, Any] | None = None
     row = ctx.db.query_one(
@@ -824,7 +925,7 @@ async def scenario_serve(ctx: HarnessContext) -> int:
         host="127.0.0.1",
         port=ctx.settings.health_port,
         mode="harness",
-        guild_id=ctx.settings.guild_id,
+        guild_id=ctx.guild_id,
     )
 
 
@@ -872,6 +973,13 @@ async def _dispatch(
     if args.scenario == "admin-reload":
         return await scenario_admin_reload(
             ctx, _admin_user(args.user, as_admin=args.as_admin), now
+        )
+    if args.scenario == "admin-setup":
+        return await scenario_admin_setup(
+            ctx,
+            _admin_user(args.user, as_admin=args.as_admin),
+            args.channel if args.channel is not None else ctx.channel_id,
+            now,
         )
     if args.scenario == "reset":
         return scenario_reset(ctx)

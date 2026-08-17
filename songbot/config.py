@@ -55,8 +55,8 @@ class Settings:
     """
 
     discord_token: str
-    guild_id: str
-    channel_id: str
+    guild_id: str | None  # env bootstrap guild; None = configure via /songbot-setup only
+    channel_id: str | None  # env bootstrap channel; set/unset together with guild_id
     youtube_playlist_url: str | None
     local_music_dir: Path | None
     daily_post_time: str  # strict "HH:MM", 00:00-23:59
@@ -115,8 +115,18 @@ def load_settings(
         return raw[key].strip()
 
     discord_token = required("DISCORD_BOT_TOKEN")
-    guild_id = required("DISCORD_GUILD_ID")
-    channel_id = required("DISCORD_CHANNEL_ID")
+
+    # Multi-guild: the env pair is an optional BOOTSTRAP for one server
+    # (upserted into `guild_settings` at startup). Every other server
+    # configures its post channel via /songbot-setup. The pair must be set
+    # together or not at all — half a mapping is always a mistake.
+    guild_id = optional("DISCORD_GUILD_ID", "") or None
+    channel_id = optional("DISCORD_CHANNEL_ID", "") or None
+    if (guild_id is None) != (channel_id is None):
+        problems.append(
+            "DISCORD_GUILD_ID and DISCORD_CHANNEL_ID must be set together "
+            "(both or neither)"
+        )
 
     youtube_playlist_url = optional("YOUTUBE_PLAYLIST_URL", "") or None
 
@@ -213,8 +223,8 @@ def load_settings(
     # to `problems`, and a non-empty `problems` raises before this point.
     return Settings(
         discord_token=_assert_present(discord_token),
-        guild_id=_assert_present(guild_id),
-        channel_id=_assert_present(channel_id),
+        guild_id=guild_id,
+        channel_id=channel_id,
         youtube_playlist_url=youtube_playlist_url,
         local_music_dir=local_music_dir,
         daily_post_time=daily_post_time,

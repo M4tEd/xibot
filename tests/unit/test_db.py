@@ -32,6 +32,7 @@ EXPECTED_TABLES = {
     "challenge_users",
     "guesses",
     "user_stats",
+    "guild_settings",
 }
 
 # Exact PRAGMA table_info tuples (name, type, notnull, dflt_value, pk) per the
@@ -92,6 +93,14 @@ EXPECTED_COLUMNS: dict[str, list[tuple[str, str, int, str | None, int]]] = {
         ("current_streak", "INTEGER", 1, "0", 0),
         ("best_streak", "INTEGER", 1, "0", 0),
         ("last_win_date", "TEXT", 0, None, 0),
+    ],
+    # migration 3: multi-guild post targets (the /songbot-setup store)
+    "guild_settings": [
+        ("guild_id", "TEXT", 1, None, 1),
+        ("channel_id", "TEXT", 1, None, 0),
+        ("set_by", "TEXT", 1, None, 0),
+        ("created_at", "TEXT", 1, None, 0),
+        ("updated_at", "TEXT", 1, None, 0),
     ],
 }
 
@@ -188,7 +197,7 @@ class TestMigration:
     def test_migrate_returns_applied_versions_then_nothing(self, tmp_path: Path) -> None:
         database = Database(tmp_path / "songbot.db")
         try:
-            assert database.migrate() == [1, 2]
+            assert database.migrate() == [1, 2, 3]
             assert database.migrate() == []
         finally:
             database.close()
@@ -201,13 +210,13 @@ class TestMigration:
         try:
             assert second.migrate() == []
             assert second.schema_version() == SCHEMA_VERSION
-            assert count(second, "schema_migrations") == 2
+            assert count(second, "schema_migrations") == 3
         finally:
             second.close()
 
     def test_schema_migrations_records_version_and_timestamp(self, db: Database) -> None:
         rows = db.query("SELECT version, applied_at FROM schema_migrations ORDER BY version")
-        assert [int(row["version"]) for row in rows] == [1, 2]
+        assert [int(row["version"]) for row in rows] == [1, 2, 3]
         for row in rows:
             # applied_at must be a parseable ISO-8601 timestamp
             parsed = datetime.fromisoformat(str(row["applied_at"]))
@@ -233,8 +242,52 @@ class TestMigration:
             song_id = insert_song(database)
             challenge_id = insert_challenge(database, song_id)
 
-            assert database.migrate() == [2]
-            assert database.schema_version() == 2
+            assert database.migrate() == [2, 3]
+            assert database.schema_version() == 3
+            row = database.query_one(
+                "SELECT skip_count FROM challenges WHERE id = ?", (challenge_id,)
+            )
+            assert row is not None
+            assert row["skip_count"] == 0
+        finally:
+            database.close()
+
+    def test_migration_3_adds_guild_settings_to_a_v2_database(
+        self, tmp_path: Path
+    ) -> None:
+        """Upgrading a v2 database: guild_settings appears, game data untouched."""
+        path = tmp_path / "songbot.db"
+        database = Database(path)
+        try:
+            # Simulate a v2 database: migrations 1+2 applied by hand.
+            from songbot.db import MIGRATIONS
+
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            for version, statements in MIGRATIONS:
+                if version > 2:
+                    continue
+                for statement in statements:
+                    database.execute(statement)
+                database.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, NOW),
+                )
+            song_id = insert_song(database)
+            challenge_id = insert_challenge(database, song_id)
+
+            assert database.migrate() == [3]
+            assert database.schema_version() == 3
+
+            table = database.query_one(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'guild_settings'"
+            )
+            assert table is not None
+            assert count(database, "guild_settings") == 0
+            # Pre-existing rows survive the upgrade.
             row = database.query_one(
                 "SELECT skip_count FROM challenges WHERE id = ?", (challenge_id,)
             )
