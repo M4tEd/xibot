@@ -108,6 +108,8 @@ class TestRevealEmbed:
     def test_names_song_and_winners(self) -> None:
         reveal = Reveal(
             challenge_id=3,
+            guild_id="guild-1",
+            channel_id="channel-1",
             date="2026-08-13",
             song=SONG,
             winners=(
@@ -139,6 +141,8 @@ class TestRevealEmbed:
     def test_without_winners_says_nobody_got_it(self) -> None:
         reveal = Reveal(
             challenge_id=3,
+            guild_id="guild-1",
+            channel_id="channel-1",
             date="2026-08-13",
             song=SONG,
             winners=(),
@@ -153,6 +157,8 @@ class TestRevealEmbed:
     def test_reveal_title_is_not_a_daily_post_title(self) -> None:
         reveal = Reveal(
             challenge_id=3,
+            guild_id="guild-1",
+            channel_id="channel-1",
             date="2026-08-13",
             song=SONG,
             winners=(),
