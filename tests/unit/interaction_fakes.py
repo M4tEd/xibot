@@ -8,6 +8,8 @@ ONLY attributes the adapter callbacks may touch:
 - ``interaction.response`` (``send_message``/``send_modal``)
 - ``interaction.followup``
 - ``interaction.message``
+- ``interaction.guild_id`` (the guild being acted on — multi-guild admin/view
+  resolution)
 
 Every outgoing payload is recorded as a `RecordedPayload` so tests can assert
 on kind (``ephemeral``/``channel``/``announcement``/``modal``), content,
@@ -121,18 +123,29 @@ class FakeFollowup:
 
 @dataclass
 class FakeInteraction:
-    """Drives real view/modal callbacks without any discord.py gateway."""
+    """Drives real view/modal callbacks without any discord.py gateway.
+
+    ``guild_id`` mirrors ``discord.Interaction.guild_id`` (None in DMs); the
+    admin bodies and the persistent-fallback view read it to resolve the
+    guild being acted on. A string, matching the engine's TEXT guild ids.
+    """
 
     user: FakeUser
     channel: FakeChannel
     response: FakeResponse
     followup: FakeFollowup
     message: None = None
+    guild_id: str | None = None
     payloads: list[RecordedPayload] = field(default_factory=list)
 
     @classmethod
     def for_user(
-        cls, user_id: int, name: str, *, manage_guild: bool = False
+        cls,
+        user_id: int,
+        name: str,
+        *,
+        manage_guild: bool = False,
+        guild_id: str | None = "guild-1",
     ) -> FakeInteraction:
         interaction = cls.__new__(cls)
         interaction.user = FakeUser(
@@ -143,6 +156,7 @@ class FakeInteraction:
         interaction.response = FakeResponse(interaction)
         interaction.followup = FakeFollowup(interaction)
         interaction.message = None
+        interaction.guild_id = guild_id
         return interaction
 
 
