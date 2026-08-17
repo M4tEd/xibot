@@ -29,6 +29,7 @@ __all__ = [
     "ChallengeUserRow",
     "Database",
     "GuessRow",
+    "GuildSettingsRow",
     "SongRow",
     "UserStatsRow",
 ]
@@ -36,7 +37,7 @@ __all__ = [
 ChallengeStatus = Literal["active", "revealed"]
 """Valid values for `challenges.status`."""
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Latest schema version; bump when appending to `MIGRATIONS`."""
 
 _BUSY_TIMEOUT_MS = 5000
@@ -119,11 +120,29 @@ _MIGRATION_002_CHALLENGE_SKIP_COUNT: tuple[str, ...] = (
     """,
 )
 
+_MIGRATION_003_GUILD_SETTINGS: tuple[str, ...] = (
+    # Multi-guild support: one row per configured guild, mapping it to the
+    # channel the daily challenge is posted to. Populated by /songbot-setup
+    # (or seeded from the DISCORD_GUILD_ID/DISCORD_CHANNEL_ID env bootstrap);
+    # the scheduler iterates this table. `set_by` records who configured it
+    # (a user id, "env", or "harness") for auditability.
+    """
+    CREATE TABLE guild_settings (
+        guild_id TEXT NOT NULL PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        set_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+)
+
 # Versioned migrations, applied in ascending order. Never edit an applied
 # migration; append a new (version, statements) entry instead.
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _MIGRATION_001_INITIAL),
     (2, _MIGRATION_002_CHALLENGE_SKIP_COUNT),
+    (3, _MIGRATION_003_GUILD_SETTINGS),
 )
 
 
@@ -251,6 +270,33 @@ class GuessRow:
             matched_artist=bool(row["matched_artist"]),
             is_correct=bool(row["is_correct"]),
             created_at=row["created_at"],
+        )
+
+
+@dataclass(frozen=True)
+class GuildSettingsRow:
+    """A row of `guild_settings`: one configured guild's post target.
+
+    ``set_by`` records the row's provenance (a user id, ``"env"``, or
+    ``"harness"``); ``created_at`` is the first-configuration timestamp and
+    ``updated_at`` the most recent re-configuration.
+    """
+
+    guild_id: str
+    channel_id: str
+    set_by: str
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> GuildSettingsRow:
+        """Build a typed `GuildSettingsRow` from a `SELECT * FROM guild_settings` row."""
+        return cls(
+            guild_id=row["guild_id"],
+            channel_id=row["channel_id"],
+            set_by=row["set_by"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
 

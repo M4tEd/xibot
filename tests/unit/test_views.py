@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from songbot.bot.embeds import NO_ACTIVE_CHALLENGE_MESSAGE
 from songbot.bot.modals import GuessModal
 from songbot.bot.views import DailyChallengeView
 from songbot.db import Database
@@ -205,6 +206,105 @@ class TestGuessButton:
         assert isinstance(modal, GuessModal)
 
         modal.guess._value = TITLE  # harness drives the real modal like discord would
+        await modal.on_submit(interaction)
+
+        row = db.query_one(
+            "SELECT solved FROM challenge_users WHERE challenge_id = ? AND user_id = '1001'",
+            (challenge.id,),
+        )
+        assert row is not None
+        assert row["solved"] == 1
+
+
+class TestPersistentFallback:
+    """The lazy restart-recovery view: resolves the click's guild at press time.
+
+    Multi-guild invariant: one global registration (by custom_id) can never
+    act on the wrong guild's game, because the target is resolved from
+    ``interaction.guild_id`` at click time.
+    """
+
+    def _fallback(self, engine: GameEngine, tmp_path: Path) -> DailyChallengeView:
+        return DailyChallengeView(
+            engine, None, guild_id=None, settings=_settings(tmp_path), clock=lambda: NOW
+        )
+
+    def test_constructor_rejects_a_half_bound_view(
+        self, engine: GameEngine, tmp_path: Path
+    ) -> None:
+        with pytest.raises(ValueError, match="set together"):
+            DailyChallengeView(
+                engine, 1, guild_id=None, settings=_settings(tmp_path)
+            )
+        with pytest.raises(ValueError, match="set together"):
+            DailyChallengeView(
+                engine, None, guild_id="g1", settings=_settings(tmp_path)
+            )
+
+    async def test_hear_more_resolves_the_clicking_guilds_latest_challenge(
+        self, engine: GameEngine, db: Database, challenge: Challenge, tmp_path: Path
+    ) -> None:
+        view = self._fallback(engine, tmp_path)
+        interaction = _interaction()
+        interaction.guild_id = "g1"  # the challenge fixture's guild
+
+        await press(view, "songbot:hear_more", interaction)
+
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        assert interaction.payloads[0].attachment is not None
+        row = db.query_one(
+            "SELECT snippet_level FROM challenge_users"
+            " WHERE challenge_id = ? AND user_id = '1001'",
+            (challenge.id,),
+        )
+        assert row is not None
+        assert row["snippet_level"] == 1
+
+    async def test_click_in_a_guild_with_no_challenges_gets_graceful_notice(
+        self, engine: GameEngine, db: Database, challenge: Challenge, tmp_path: Path
+    ) -> None:
+        view = self._fallback(engine, tmp_path)
+        interaction = _interaction()
+        interaction.guild_id = "guild-without-challenges"
+
+        for custom_id in ("songbot:hear_more", "songbot:guess", "songbot:leaderboard"):
+            interaction.payloads.clear()
+            await press(view, custom_id, interaction)
+
+            assert len(interaction.payloads) == 1
+            payload = interaction.payloads[0]
+            assert payload.kind == "ephemeral"
+            assert payload.content == NO_ACTIVE_CHALLENGE_MESSAGE
+            assert payload.attachment is None
+            assert payload.modal is None
+        # Zero mutation anywhere.
+        assert db.query_one("SELECT 1 FROM challenge_users") is None
+
+    async def test_leaderboard_scopes_to_the_clicking_guild(
+        self, engine: GameEngine, db: Database, challenge: Challenge, tmp_path: Path
+    ) -> None:
+        engine.submit_guess(challenge.id, "1001", TITLE, NOW)  # solved in g1
+        view = self._fallback(engine, tmp_path)
+        interaction = _interaction(1002, "bob")
+        interaction.guild_id = "g1"
+
+        await press(view, "songbot:leaderboard", interaction)
+
+        payload = interaction.payloads[0]
+        assert payload.embed is not None
+        assert "<@1001>" in (payload.embed.description or "")
+
+    async def test_guess_modal_binds_the_resolved_challenge(
+        self, engine: GameEngine, db: Database, challenge: Challenge, tmp_path: Path
+    ) -> None:
+        view = self._fallback(engine, tmp_path)
+        interaction = _interaction()
+        interaction.guild_id = "g1"
+
+        await press(view, "songbot:guess", interaction)
+        modal = interaction.payloads[0].modal
+        assert isinstance(modal, GuessModal)
+        modal.guess._value = TITLE
         await modal.on_submit(interaction)
 
         row = db.query_one(

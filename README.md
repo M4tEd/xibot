@@ -129,8 +129,8 @@ error listing every problem.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `DISCORD_BOT_TOKEN` | *(required)* | Bot token from the Discord Developer Portal. Only used by the live bot; the harness and tests never use it. |
-| `DISCORD_GUILD_ID` | *(required)* | ID of the server (guild) the bot serves. Right-click the server name → *Copy Server ID* (Developer Mode). |
-| `DISCORD_CHANNEL_ID` | *(required)* | ID of the channel the daily challenge is posted to. Right-click the channel → *Copy Channel ID*. |
+| `DISCORD_GUILD_ID` | `""` (unset) | Optional bootstrap: ID of one server (guild) to configure at startup. Must be set together with `DISCORD_CHANNEL_ID` — both or neither. Right-click the server name → *Copy Server ID* (Developer Mode). |
+| `DISCORD_CHANNEL_ID` | `""` (unset) | Optional bootstrap: ID of the channel the daily challenge is posted to in the bootstrap guild. Right-click the channel → *Copy Channel ID*. |
 | `YOUTUBE_PLAYLIST_URL` | `""` (disabled) | Public/unlisted YouTube playlist used as a song catalog. Empty disables the YouTube provider. |
 | `LOCAL_MUSIC_DIR` | `""` (disabled) | Directory of local audio files (mp3/m4a/flac/ogg) used as a song catalog; artist/title come from tags with an `Artist - Title.ext` filename fallback. Empty disables the local provider. For a self-contained demo point it at `./data/fixture-music` (a generated library of 8 synthetic 30s songs, gitignored — fresh clones recreate it with `.venv/bin/python scripts/generate_fixture_music.py`); for real use point it at your own music folder. |
 | `DAILY_POST_TIME` | `12:00` | Daily post time, strict zero-padded `HH:MM` (00:00–23:59) in `TIMEZONE`. |
@@ -163,12 +163,39 @@ At least one catalog provider must be enabled or posting fails with a
    https://discord.com/oauth2/authorize?client_id=<YOUR_APPLICATION_ID>&scope=bot+applications.commands&permissions=116736
    ```
 
-4. Copy your server and channel IDs (enable *User Settings → Advanced →
+4. Either copy your server and channel IDs (enable *User Settings → Advanced →
    Developer Mode*, then right-click) into `DISCORD_GUILD_ID` /
-   `DISCORD_CHANNEL_ID`.
+   `DISCORD_CHANNEL_ID` to pre-configure one server, or leave both unset and
+   run `/songbot-setup` in each server after inviting the bot.
 
-Admin slash commands are registered guild-scoped and additionally require the
-invoker to have the **Manage Server** permission.
+Admin slash commands are registered guild-scoped (instant availability in
+every joined server) and additionally require the invoker to have the
+**Manage Server** permission.
+
+### Multiple servers
+
+One bot instance serves any number of servers. Each server picks its own
+post channel — channel names are never involved (the bot stores the channel's
+unique ID), so servers may name their channels however they like:
+
+1. Invite the bot to the server (same invite URL as above).
+2. In that server, run `/songbot-setup` and pick the channel from Discord's
+   channel picker (requires **Manage Server**). That's it — the next daily
+   post lands there, and `/songbot-post` works immediately.
+
+Configuration lives in the `guild_settings` table, so adding a server never
+requires a redeploy. Re-running `/songbot-setup` moves future posts to the
+new channel (the reveal of an already-posted challenge still goes to the
+channel it was posted in). Removing the bot from a server drops that server's
+configuration; its game history is kept and resumes if the bot is re-added
+and set up again.
+
+The `DISCORD_GUILD_ID`/`DISCORD_CHANNEL_ID` pair is a bootstrap for **one**
+server (typically your own): it is upserted on every startup, so for that
+server the env wins over `/songbot-setup` — edit `.env` to change it.
+
+The post schedule (`DAILY_POST_TIME`/`TIMEZONE`) is global: every server
+posts at the same wall-clock time.
 
 ## Running the live bot
 
@@ -182,7 +209,7 @@ health endpoint (`GET http://127.0.0.1:3108/health` →
 exists, and then posts daily at `DAILY_POST_TIME`.
 
 > **Important:** run the live bot on a machine whose network can reach Discord.
-> If your machine sits behind a Netskope-style agent that blocks or flags
+> If your machine sits behind a network security agent that blocks or flags
 > Discord domains, `python -m songbot` **must be run on a different,
 > unrestricted machine** (or network path) — the bot cannot log in or post
 > while Discord traffic is intercepted. On such restricted machines you can
@@ -207,8 +234,14 @@ loop end to end.
 ```
 
 Scenarios: `post` · `hear-more --user U [--times N]` · `guess --user U --text T` ·
-`leaderboard --user U` · `advance-day` · `admin-post|admin-skip|admin-reload
---as-admin|--as-non-admin` · `status` · `reset` · `serve` (health endpoint only).
+`leaderboard --user U` · `advance-day` · `admin-setup [--channel C] |
+admin-post|admin-skip|admin-reload --as-admin|--as-non-admin` · `status` ·
+`reset` · `serve` (health endpoint only).
+
+The harness drives one guild per run: the `DISCORD_GUILD_ID`/
+`DISCORD_CHANNEL_ID` pair when set, else the deterministic `harness-guild`/
+`harness-channel` defaults (seeded into `guild_settings` on startup, exactly
+like the live env bootstrap).
 
 `--now` injects the clock (naive timestamps are read as UTC); `--user alice`
 uses the bare name as a stable user id (`--user 42:alice` sets an explicit id).

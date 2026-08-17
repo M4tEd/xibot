@@ -10,11 +10,13 @@ the live client registers them as discord.py app_commands via
 Discord also hides them from non-admins client-side).
 
 Drivability contract: the bodies touch only ``interaction.user`` (id and
-``guild_permissions``) and ``interaction.response.send_message``. The daily
-post itself goes through the injected `DailyPostSender` — the live client
-sends it to the configured channel, the harness records a ``channel``-kind
-payload; both build the message with the shared real builders
-(`daily_challenge_embed`, `DailyChallengeView`, `snippet_attachment`).
+``guild_permissions``), ``interaction.guild_id`` (the guild being acted on —
+multi-guild: never the env bootstrap), and
+``interaction.response.send_message``. The daily post itself goes through
+the injected `DailyPostSender` — the live client sends it to the guild's
+configured channel, the harness records a ``channel``-kind payload; both
+build the message with the shared real builders (`daily_challenge_embed`,
+`DailyChallengeView`, `snippet_attachment`).
 
 Pinned decisions honored here: #4 (a same-day repeat post is idempotent and
 never double-posts), #5 (skip is refused after a solve/reveal with zero
@@ -35,12 +37,14 @@ from discord import app_commands
 
 from songbot.bot.embeds import (
     ADMIN_CATALOG_EMPTY_MESSAGE,
+    ADMIN_NOT_CONFIGURED_MESSAGE,
     ADMIN_POST_ALREADY_MESSAGE,
     ADMIN_POST_FAILED_MESSAGE,
     ADMIN_POST_SUCCESS_MESSAGE,
     ADMIN_SKIP_SUCCESS_MESSAGE,
     PERMISSION_DENIED_MESSAGE,
     reload_ack_content,
+    setup_ack_content,
     skip_refusal_content,
 )
 from songbot.bot.modals import Clock, utc_now
@@ -70,6 +74,8 @@ AdminOutcome = Literal[
     "skipped",
     "refused",
     "reloaded",
+    "configured",
+    "not_configured",
     "error",
 ]
 """The machine-readable outcome of an admin command body.
@@ -77,6 +83,9 @@ AdminOutcome = Literal[
 ``error`` is the pinned-#16 delivery failure: the daily-post send raised for
 a challenge the call just created, which was rolled back (row deleted,
 snippet cache purged) so a retry reposts the identical challenge.
+``configured``/``not_configured`` are the /songbot-setup outcomes (and the
+``not_configured`` refusal of the other commands in a guild that never ran
+setup).
 """
 
 DailyPostSender = Callable[[Challenge], Awaitable[None]]
@@ -120,8 +129,9 @@ class AdminCommands:
     """The /songbot-* admin command bodies: permission-gated, ephemeral acks.
 
     Args:
-        engine: the game engine (owns all rules).
-        settings: validated configuration (guild/channel ids, timezone).
+        engine: the game engine (owns all rules, including the per-guild
+            channel configuration the setup command writes).
+        settings: validated configuration (post time/timezone for the acks).
         clock: injected time source (defaults to the UTC wall clock; the
             harness passes the ``--now`` clock for determinism).
         post_sender: transport for the daily challenge post (see
@@ -146,22 +156,66 @@ class AdminCommands:
         await interaction.response.send_message(PERMISSION_DENIED_MESSAGE, ephemeral=True)
         return AdminResult("denied")
 
+    @staticmethod
+    def _guild_id_of(interaction: discord.Interaction[Any]) -> str | None:
+        """The invoking guild's id as a string (None in DMs — never configured)."""
+        raw = interaction.guild_id
+        return str(raw) if raw is not None else None
+
+    async def setup_channel(
+        self,
+        interaction: discord.Interaction[Any],
+        channel_id: str,
+        channel_mention: str,
+    ) -> AdminResult:
+        """/songbot-setup: choose (or change) the guild's daily-post channel.
+
+        Multi-guild configuration entry point: upserts the invoking guild's
+        ``guild_settings`` row. The live command passes the picked channel's
+        id and mention; the harness passes plain strings. Existing challenges
+        keep the channel they were posted to — only future posts move.
+        """
+        if not has_manage_guild(interaction):
+            return await self._deny(interaction)
+        guild_id = self._guild_id_of(interaction)
+        if guild_id is None:  # pragma: no cover - the command is guild-only
+            await interaction.response.send_message(
+                ADMIN_NOT_CONFIGURED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("not_configured")
+        self._engine.set_guild_channel(
+            guild_id, channel_id, set_by=str(interaction.user.id), now=self._clock()
+        )
+        await interaction.response.send_message(
+            setup_ack_content(channel_mention, self._settings), ephemeral=True
+        )
+        return AdminResult("configured")
+
     async def post_now(self, interaction: discord.Interaction[Any]) -> AdminResult:
         """/songbot-post: ensure today's challenge exists and post it.
 
         Idempotent (pinned #4): an existing challenge yields the
         already-posted ack and no second post. An empty catalog (pinned #11)
-        yields the empty-catalog ack and no challenge row. If the channel
-        send fails for the challenge THIS call created (pinned #16), the
-        challenge is rolled back (row deleted, snippet cache purged) so a
-        retry reposts the identical challenge — a transient send failure can
-        never suppress the day — and the admin gets an ephemeral error ack.
+        yields the empty-catalog ack and no challenge row. A guild that never
+        ran /songbot-setup gets the not-configured ack and no challenge row.
+        If the channel send fails for the challenge THIS call created
+        (pinned #16), the challenge is rolled back (row deleted, snippet
+        cache purged) so a retry reposts the identical challenge — a
+        transient send failure can never suppress the day — and the admin
+        gets an ephemeral error ack.
         """
         if not has_manage_guild(interaction):
             return await self._deny(interaction)
+        guild_id = self._guild_id_of(interaction)
+        guild = self._engine.guild_settings(guild_id) if guild_id is not None else None
+        if guild is None:
+            await interaction.response.send_message(
+                ADMIN_NOT_CONFIGURED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("not_configured")
         try:
             challenge = self._engine.ensure_today_challenge(
-                self._settings.guild_id, self._settings.channel_id, self._clock()
+                guild.guild_id, guild.channel_id, self._clock()
             )
         except CatalogEmptyError:
             await interaction.response.send_message(
@@ -198,8 +252,14 @@ class AdminCommands:
         """
         if not has_manage_guild(interaction):
             return await self._deny(interaction)
+        guild_id = self._guild_id_of(interaction)
+        if guild_id is None:  # pragma: no cover - the command is guild-only
+            await interaction.response.send_message(
+                ADMIN_NOT_CONFIGURED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("not_configured")
         try:
-            self._engine.skip_today_song(self._settings.guild_id, self._clock())
+            self._engine.skip_today_song(guild_id, self._clock())
         except SkipRefusedError as exc:
             await interaction.response.send_message(
                 skip_refusal_content(exc.reason), ephemeral=True
@@ -230,10 +290,23 @@ def register_admin_commands(
 ) -> None:
     """Register the /songbot-* commands on a command tree (guild-scoped).
 
+    Called once per joined guild (multi-guild: guild-scoped sync gives
+    instant availability in each server without the global-propagation
+    delay); each call builds fresh command objects for that guild.
     ``default_permissions(manage_guild=True)`` hides them from non-admins in
     the Discord client; the bodies re-check `has_manage_guild` so the harness
     permission flag and any client-side permission drift are honored too.
     """
+
+    @app_commands.command(
+        name="songbot-setup",
+        description="Choose the channel SongBot posts the daily challenge in.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def setup_command(
+        interaction: discord.Interaction[Any], channel: discord.TextChannel
+    ) -> None:
+        await commands.setup_channel(interaction, str(channel.id), channel.mention)
 
     @app_commands.command(name="songbot-post", description="Post today's challenge now.")
     @app_commands.default_permissions(manage_guild=True)
@@ -253,6 +326,7 @@ def register_admin_commands(
         await commands.reload_catalog(interaction)
 
     registered: tuple[app_commands.Command[Any, Any, Any], ...] = (
+        setup_command,
         post_command,
         skip_command,
         reload_command,
