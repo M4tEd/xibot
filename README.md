@@ -182,7 +182,7 @@ health endpoint (`GET http://127.0.0.1:3108/health` →
 exists, and then posts daily at `DAILY_POST_TIME`.
 
 > **Important:** run the live bot on a machine whose network can reach Discord.
-> If your machine sits behind a Netskope-style agent that blocks or flags
+> If your machine sits behind a network security agent that blocks or flags
 > Discord domains, `python -m songbot` **must be run on a different,
 > unrestricted machine** (or network path) — the bot cannot log in or post
 > while Discord traffic is intercepted. On such restricted machines you can

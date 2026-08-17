@@ -1,8 +1,9 @@
 """Construct-level tests for the live client wiring (songbot/bot/client.py).
 
-ABSOLUTE CONSTRAINT: the live bot never runs in-mission (Netskope flags all
-Discord traffic). These tests therefore verify CONSTRUCTION and WIRING only —
-a real (unconnected) ``discord.Client`` subclass is instantiated with the
+ABSOLUTE CONSTRAINT: the live bot never runs in-mission (a network security
+agent flags all Discord traffic). These tests therefore verify CONSTRUCTION
+and WIRING only — a real (unconnected) ``discord.Client`` subclass is
+instantiated with the
 production stack seams faked (post/reveal transports, health starter, command
 syncer), and the scheduler logic is driven one tick at a time against a real
 GameEngine on a tmp SQLite DB with the fake snippet service. ``client.run()``,

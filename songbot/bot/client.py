@@ -1,8 +1,9 @@
 """Live Discord client wiring, gateway connect, view registration.
 
-NEVER RUN ON THIS MACHINE during the mission: a Netskope agent blocks/flags
-all Discord domains. This module is exercised at CONSTRUCTION level only
-(pytest with faked transports — no ``client.run()``, no login, no gateway).
+NEVER RUN ON THIS MACHINE during the mission: a network security agent
+blocks/flags all Discord domains. This module is exercised at CONSTRUCTION
+level only (pytest with faked transports — no ``client.run()``, no login, no
+gateway).
 The live playtest is the user's deferred manual step, off-mission.
 
 What ``python -m songbot`` does (when the user runs it off-machine):
@@ -464,8 +465,9 @@ def _log_level(name: str) -> int:
 def main() -> int:
     """``python -m songbot`` entrypoint: load config, then run the live bot.
 
-    NEVER run on this machine (Netskope flags all Discord traffic) — this
-    exists for the user's off-machine deployment and manual playtest.
+    NEVER run on this machine (a network security agent flags all Discord
+    traffic) — this exists for the user's off-machine deployment and manual
+    playtest.
     """
     try:
         settings = load_settings()
