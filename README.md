@@ -23,7 +23,9 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   `songbot-snippet.mp3` so the filename never leaks the song.
 - **Modal guessing** — **Guess** opens a modal text field (no slash-command
   typing). Guesses are fuzzy-matched (rapidfuzz, threshold 85 after
-  normalization); matching the title **or** the artist is correct. Feedback is
+  normalization, plus a per-token fallback that forgives a typo in one token —
+  including inside a combined title+artist guess and on short names like
+  "Halo"); matching the title **or** the artist is correct. Feedback is
   ephemeral; wrong guesses cost nothing. Max 6 guesses per player per day.
 - **Scoring & bonus** — a correct guess awards the points of the player's
   current snippet level. Naming **both** artist and title in a single guess
@@ -40,6 +42,14 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   - `/songbot-skip` — replace today's song with a different one (refused once
     the challenge is revealed or anyone has solved it)
   - `/songbot-reload` — refresh the song catalog from its sources
+  - `/songbot-fixsong` — correct the title/artist of a challenge's song when
+    the catalog parsed it badly (user-uploaded video titles are messy).
+    Targets the latest challenge's song by default, or a specific challenge
+    with `date:` (YYYY-MM-DD); `artist:` may be omitted to keep the current
+    one. The correction applies to new guesses immediately and is re-applied
+    after every catalog reload (the `song_overrides` table); already-recorded
+    guesses keep their original results. The ephemeral ack shows the old →
+    new metadata (admin-only, ephemeral — public posts never name songs)
 - **Next-day reveal** — each new daily post first reveals the previous
   challenge: the song title/artist and a winners summary (or "nobody got it").
 
@@ -235,8 +245,10 @@ loop end to end.
 
 Scenarios: `post` · `hear-more --user U [--times N]` · `guess --user U --text T` ·
 `leaderboard --user U` · `advance-day` · `admin-setup [--channel C] |
-admin-post|admin-skip|admin-reload --as-admin|--as-non-admin` · `status` ·
-`reset` · `serve` (health endpoint only).
+admin-post|admin-skip|admin-reload --as-admin|--as-non-admin` ·
+`admin-fixsong --title T [--artist A] [--date YYYY-MM-DD]
+--as-admin|--as-non-admin` · `status` · `reset` · `serve` (health endpoint
+only).
 
 The harness drives one guild per run: the `DISCORD_GUILD_ID`/
 `DISCORD_CHANNEL_ID` pair when set, else the deterministic `harness-guild`/
@@ -281,6 +293,8 @@ export LOCAL_MUSIC_DIR=./data/fixture-music    # 8-song synthetic demo library
 # Admin flows (permission simulation)
 .venv/bin/python -m songbot.harness admin-skip --as-admin --now "2026-08-14T16:00:00Z"
 .venv/bin/python -m songbot.harness admin-reload --as-non-admin
+# Correct a badly parsed song's metadata (targets the latest challenge's song)
+.venv/bin/python -m songbot.harness admin-fixsong --as-admin --title "Corrected Title" --artist "Corrected Artist"
 
 # Start over
 .venv/bin/python -m songbot.harness reset

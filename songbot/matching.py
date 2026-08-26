@@ -13,6 +13,15 @@ fallback for poorly-parsed YouTube entries — ``raw_title``. A score of
 makes word-order, subset ("Bohemian" vs "Bohemian Rhapsody"), and "The "
 prefix differences immaterial. Title OR artist match is correct; both in one
 guess is the 1.5x-bonus condition (``is_both``).
+
+When the whole-string ratio falls short, a per-token fallback applies: a
+field also matches when EVERY one of its tokens has a close twin among the
+guess tokens (``fuzz.ratio`` >= threshold, or exactly one Levenshtein edit
+apart for tokens of ``_SHORT_TOKEN_MIN_LEN``+ characters). ``token_set_ratio``
+only rewards exact-token subsets, so without this fallback a single typo in
+one token ("Bohemian Rhapsody Quen", "Halp") collapses the score below the
+threshold — which used to cost players the both-fields bonus on combined
+title+artist guesses and made short titles/artists tolerate zero typos.
 """
 
 from __future__ import annotations
@@ -23,11 +32,19 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
 
 __all__ = ["MATCH_THRESHOLD", "MatchResult", "SongLike", "match_guess", "normalize"]
 
 MATCH_THRESHOLD = 85
 """Minimum post-normalization ``token_set_ratio`` for a guess to match."""
+
+_SHORT_TOKEN_MIN_LEN = 4
+"""Minimum token length for the per-token one-edit allowance.
+
+Shorter tokens (1-3 chars, e.g. "U2") stay effectively exact: a single edit
+on them changes too much of the token to forgive.
+"""
 
 _BRACKETED_RE = re.compile(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|【[^】]*】")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -82,6 +99,35 @@ def normalize(text: str) -> str:
     return " ".join(tokens)
 
 
+def _token_close(a: str, b: str, threshold: int) -> bool:
+    """Per-token closeness: ``fuzz.ratio`` >= ``threshold``, or one edit apart.
+
+    The one-edit allowance (substitution, insertion, or deletion) only
+    applies to tokens of ``_SHORT_TOKEN_MIN_LEN``+ characters — it exists for
+    short tokens like "halo"/"halp", whose ratio (75.0) falls below the
+    threshold for a single typo while longer tokens pass it.
+    """
+    if fuzz.ratio(a, b) >= threshold:
+        return True
+    return (
+        min(len(a), len(b)) >= _SHORT_TOKEN_MIN_LEN
+        and Levenshtein.distance(a, b) == 1
+    )
+
+
+def _tokens_cover(guess_tokens: list[str], candidate_tokens: list[str], threshold: int) -> bool:
+    """Per-token fallback: every candidate token has a close twin in the guess.
+
+    Unlike ``token_set_ratio``'s all-or-nothing exact-token intersection,
+    this tolerates a typo in one token of a field — including when the guess
+    carries extra tokens (a combined title+artist guess).
+    """
+    return all(
+        any(_token_close(candidate_token, guess_token, threshold) for guess_token in guess_tokens)
+        for candidate_token in candidate_tokens
+    )
+
+
 def match_guess(
     guess: str, song: SongLike, *, threshold: int = MATCH_THRESHOLD
 ) -> MatchResult:
@@ -89,8 +135,10 @@ def match_guess(
 
     The guess and every candidate are normalized first; the threshold applies
     to the normalized strings (``>= threshold``). An empty-after-normalization
-    guess never matches. The ``raw_title`` fallback is consulted only when
-    neither the parsed title nor the parsed artist matched.
+    guess never matches. A candidate that misses the whole-string threshold
+    can still match via the per-token fallback (`_tokens_cover`). The
+    ``raw_title`` fallback is consulted only when neither the parsed title
+    nor the parsed artist matched.
     """
     normalized = normalize(guess)
     if not normalized:
@@ -99,7 +147,11 @@ def match_guess(
         )
 
     def matches(candidate: str) -> bool:
-        return bool(candidate) and fuzz.token_set_ratio(normalized, candidate) >= threshold
+        if not candidate:
+            return False
+        if fuzz.token_set_ratio(normalized, candidate) >= threshold:
+            return True
+        return _tokens_cover(normalized.split(), candidate.split(), threshold)
 
     matched_title = matches(normalize(song.title))
     matched_artist = matches(normalize(song.artist or ""))

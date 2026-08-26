@@ -41,16 +41,20 @@ posts the local date of ``--now`` (or the real clock) with no reveal
 (VAL-CROSS-018).
 
 Admin scenarios — ``admin-setup`` / ``admin-post`` / ``admin-skip`` /
-``admin-reload`` — drive the REAL ``AdminCommands`` bodies
-(songbot/bot/admin.py) with the invoking user's Manage-Guild permission
-simulated by ``--as-admin``/``--as-non-admin`` (exactly one required). A
-denied invocation records exactly one ephemeral permission-denied payload
-and mutates nothing (VAL-ADMIN-009). A same-day repeat ``admin-post``
-prints the pinned-#4 compact form ``{"already_posted": true, "messages":
-[]}`` just like ``post`` (VAL-CROSS-015); an empty catalog prints
-``{"error": "catalog_empty"}`` (pinned #11). ``admin-setup`` upserts the
-guild's post channel (multi-guild configuration, ``--channel`` overrides
-the default harness channel).
+``admin-reload`` / ``admin-fixsong`` — drive the REAL ``AdminCommands``
+bodies (songbot/bot/admin.py) with the invoking user's Manage-Guild
+permission simulated by ``--as-admin``/``--as-non-admin`` (exactly one
+required). A denied invocation records exactly one ephemeral
+permission-denied payload and mutates nothing (VAL-ADMIN-009). A same-day
+repeat ``admin-post`` prints the pinned-#4 compact form
+``{"already_posted": true, "messages": []}`` just like ``post``
+(VAL-CROSS-015); an empty catalog prints ``{"error": "catalog_empty"}``
+(pinned #11). ``admin-setup`` upserts the guild's post channel
+(multi-guild configuration, ``--channel`` overrides the default harness
+channel). ``admin-fixsong`` corrects a challenge song's title/artist
+(``--title`` required, ``--artist``/``--date`` optional); its ephemeral ack
+and ``state.fix`` show the old -> new metadata (admin-only secrecy
+exception — the harness's ``status`` surface exposes song identity too).
 
 Multi-guild: the harness drives ONE guild per run — the
 DISCORD_GUILD_ID/DISCORD_CHANNEL_ID bootstrap pair when set, else the
@@ -117,6 +121,7 @@ __all__ = [
     "main",
     "parse_now",
     "parse_user",
+    "scenario_admin_fixsong",
     "scenario_admin_post",
     "scenario_admin_reload",
     "scenario_admin_setup",
@@ -316,6 +321,21 @@ def build_parser() -> argparse.ArgumentParser:
         "admin-reload", help="Run /songbot-reload (refresh the catalog)."
     )
     add_admin_flags(admin_reload)
+
+    admin_fixsong = sub.add_parser(
+        "admin-fixsong",
+        help="Run /songbot-fixsong (correct a challenge song's title/artist).",
+    )
+    add_admin_flags(admin_fixsong)
+    admin_fixsong.add_argument("--title", required=True, help="The correct song title.")
+    admin_fixsong.add_argument(
+        "--artist", default=None, help="The correct artist (omit to keep the current one)."
+    )
+    admin_fixsong.add_argument(
+        "--date",
+        default=None,
+        help="Which challenge's song to fix, YYYY-MM-DD (default: the latest).",
+    )
 
     admin_setup = sub.add_parser(
         "admin-setup", help="Run /songbot-setup (set the guild's post channel)."
@@ -857,6 +877,54 @@ async def scenario_admin_reload(
     )
 
 
+async def scenario_admin_fixsong(
+    ctx: HarnessContext,
+    user: FakeUser,
+    title: str,
+    artist: str | None,
+    date: str | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-fixsong body.
+
+    Success: exactly one ephemeral ack showing the old -> new metadata (the
+    admin-only, ephemeral exception to the pinned-#9 secrecy rule), and
+    ``state.fix`` carries the same record. Refusals
+    (``no_challenge``/``invalid_date``/``blank_title``) record one ephemeral
+    refusal with zero mutation; ``state.reason`` carries the machine-readable
+    cause.
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
+    result = await commands.fix_song(interaction, title=title, artist=artist, date=date)
+    fix = result.fix
+    return _transcript(
+        "admin-fixsong",
+        recorder,
+        {
+            "outcome": result.outcome,
+            "reason": result.reason,
+            "fix": (
+                {
+                    "song_id": fix.song_id,
+                    "challenge_id": fix.challenge_id,
+                    "challenge_date": fix.challenge_date,
+                    "old_title": fix.old_title,
+                    "old_artist": fix.old_artist,
+                    "new_title": fix.new_title,
+                    "new_artist": fix.new_artist,
+                }
+                if fix is not None
+                else None
+            ),
+        },
+    )
+
+
 def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
     """Wipe every data table and the snippet cache (schema/migrations survive).
 
@@ -870,6 +938,7 @@ def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
             "challenges",
             "user_stats",
             "songs",
+            "song_overrides",
             "guild_settings",
         ):
             ctx.db.execute(f"DELETE FROM {table}")
@@ -973,6 +1042,15 @@ async def _dispatch(
     if args.scenario == "admin-reload":
         return await scenario_admin_reload(
             ctx, _admin_user(args.user, as_admin=args.as_admin), now
+        )
+    if args.scenario == "admin-fixsong":
+        return await scenario_admin_fixsong(
+            ctx,
+            _admin_user(args.user, as_admin=args.as_admin),
+            args.title,
+            args.artist,
+            args.date,
+            now,
         )
     if args.scenario == "admin-setup":
         return await scenario_admin_setup(

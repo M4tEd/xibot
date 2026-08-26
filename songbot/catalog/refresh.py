@@ -21,6 +21,9 @@ Behavior (binding per architecture.md):
   never rolls back, deletes, or corrupts another source's rows. A failed
   source's own rows are also left exactly as they were: no removal pass runs
   without a successful fetch.
+- **Overrides**: after a source's upsert pass, its `song_overrides` rows
+  (admin metadata corrections via /songbot-fixsong) are re-applied inside the
+  same transaction, so a refresh never clobbers an admin correction.
 
 The return value is a `RefreshResult` with one `SourceRefresh` per enabled
 provider (added/updated/removed/retained counts, or the error).
@@ -59,6 +62,13 @@ ON CONFLICT (source, source_id) DO UPDATE SET
 
 _REFERENCED_SQL = "SELECT 1 FROM challenges WHERE song_id = ? LIMIT 1"
 _DELETE_SQL = "DELETE FROM songs WHERE id = ?"
+
+_OVERRIDES_FOR_SOURCE_SQL = (
+    "SELECT source_id, title, artist FROM song_overrides WHERE source = ?"
+)
+_APPLY_OVERRIDE_SQL = (
+    "UPDATE songs SET title = ?, artist = ? WHERE source = ? AND source_id = ?"
+)
 
 
 @dataclass(frozen=True)
@@ -204,8 +214,28 @@ def _upsert_source(db: Database, source: str, songs: Sequence[Song]) -> SourceRe
         else:
             retained += 1
 
+    _apply_overrides(db, source)
+
     result = SourceRefresh(
         source=source, added=added, updated=updated, removed=removed, retained=retained
     )
     logger.info("Catalog source %r refreshed: %s", source, result)
     return result
+
+
+def _apply_overrides(db: Database, source: str) -> None:
+    """Re-apply admin metadata overrides (/songbot-fixsong) for `source`.
+
+    Runs inside the source's refresh transaction, after the upsert pass, so
+    the provider's metadata never clobbers an admin correction. Overrides for
+    songs absent from the table (deleted, or not yet re-added) match zero
+    rows and simply wait for the song to re-enter the catalog.
+    """
+    for row in db.query(_OVERRIDES_FOR_SOURCE_SQL, (source,)):
+        cursor = db.execute(
+            _APPLY_OVERRIDE_SQL, (row["title"], row["artist"], source, row["source_id"])
+        )
+        if cursor.rowcount:
+            logger.info(
+                "Re-applied metadata override for %s/%s", source, row["source_id"]
+            )

@@ -21,10 +21,12 @@ from songbot.catalog.refresh import RefreshResult
 from songbot.config import Settings
 from songbot.engine import (
     Challenge,
+    FixSongRefusedReason,
     GuessResult,
     LeaderboardEntry,
     Reveal,
     SkipRefusedReason,
+    SongFix,
     UnlockRefusedReason,
     UnlockResult,
 )
@@ -45,6 +47,8 @@ __all__ = [
     "PERMISSION_DENIED_MESSAGE",
     "announcement_content",
     "daily_challenge_embed",
+    "fixsong_ack_content",
+    "fixsong_refusal_content",
     "format_seconds",
     "guess_feedback_content",
     "hear_more_content",
@@ -296,6 +300,36 @@ def skip_refusal_content(reason: SkipRefusedReason) -> str:
     if reason == "revealed":
         return "Today's challenge has already been revealed — it can't be skipped."
     return "Today's challenge already has a solver — it can't be skipped."
+
+
+def fixsong_ack_content(fix: SongFix) -> str:
+    """The ephemeral ack for /songbot-fixsong: exactly what changed, old -> new.
+
+    Names the song — a deliberate, scoped exception to the pinned-#9 secrecy
+    rule: the ack is ephemeral and admin-gated (Manage Server), and the
+    command is unusable blind. Public payloads still never name songs.
+    """
+    old_artist = fix.old_artist or "—"
+    new_artist = fix.new_artist or "—"
+    return (
+        f"🛠️ Corrected the song from the {fix.challenge_date} challenge:\n"
+        f"Title: **{fix.old_title}** → **{fix.new_title}**\n"
+        f"Artist: **{old_artist}** → **{new_artist}**\n"
+        "Applies to new guesses immediately and survives catalog reloads; "
+        "already-recorded guesses keep their original results."
+    )
+
+
+def fixsong_refusal_content(reason: FixSongRefusedReason) -> str:
+    """The ephemeral refusal for /songbot-fixsong (zero mutation)."""
+    if reason == "invalid_date":
+        return "⚠️ Invalid date — use YYYY-MM-DD (the challenge's local date)."
+    if reason == "blank_title":
+        return "⚠️ The corrected title can't be empty."
+    return (
+        "There's no challenge to fix — post one first, "
+        "or pass the date of an earlier challenge."
+    )
 
 
 def reload_ack_content(result: RefreshResult) -> str:

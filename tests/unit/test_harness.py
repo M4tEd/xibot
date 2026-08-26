@@ -29,6 +29,7 @@ from songbot.harness.cli import (
     HarnessContext,
     parse_now,
     parse_user,
+    scenario_admin_fixsong,
     scenario_admin_post,
     scenario_admin_reload,
     scenario_admin_setup,
@@ -498,6 +499,7 @@ class TestReset:
             "guesses",
             "user_stats",
             "guild_settings",
+            "song_overrides",
         ):
             row = ctx.db.query_one(f"SELECT COUNT(*) AS c FROM {table}")
             assert row is not None
@@ -505,7 +507,7 @@ class TestReset:
         snippet_dir = tmp_path / "snippets"
         assert list(snippet_dir.rglob("*.mp3")) == []
         # Migrations survive a reset (the schema itself is not wiped).
-        assert ctx.db.schema_version() == 3
+        assert ctx.db.schema_version() == 4
 
     async def test_post_after_reset_works(self, ctx: HarnessContext, db: Database) -> None:
         _add_song(db)
@@ -776,6 +778,89 @@ class TestAdminSkip:
         assert after["song_id"] == before["song_id"]
         assert after["snippet_offset_sec"] == before["snippet_offset_sec"]
         assert after["skip_count"] == 0
+
+
+class TestAdminFixsong:
+    """The admin-fixsong scenario drives the REAL /songbot-fixsong body."""
+
+    async def test_admin_fixsong_corrects_metadata_and_acks_old_new(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_post(ctx, DAY1)
+
+        out = json_roundtrip(
+            await scenario_admin_fixsong(ctx, ADMIN, "Fixed Title", "Fixed Artist", None, DAY1)
+        )
+
+        assert kinds(out) == ["ephemeral"]
+        assert out["payloads"][0]["recipient"] == "admin"
+        assert out["state"]["outcome"] == "fixed"
+        assert out["state"]["reason"] is None
+        fix = out["state"]["fix"]
+        assert fix["challenge_date"] == "2026-08-13"
+        assert (fix["old_title"], fix["old_artist"]) == (TITLE, ARTIST)
+        assert (fix["new_title"], fix["new_artist"]) == ("Fixed Title", "Fixed Artist")
+        # The ack shows old -> new (the admin-only ephemeral secrecy exception).
+        ack = out["payloads"][0]["content"]
+        for text in (TITLE, ARTIST, "Fixed Title", "Fixed Artist"):
+            assert text in ack
+        # The songs row and the durable override row both carry the fix.
+        song = db.query_one("SELECT title, artist FROM songs")
+        assert song is not None
+        assert (song["title"], song["artist"]) == ("Fixed Title", "Fixed Artist")
+        override = db.query_one("SELECT title, artist FROM song_overrides")
+        assert override is not None
+        assert (override["title"], override["artist"]) == ("Fixed Title", "Fixed Artist")
+
+    async def test_admin_fixsong_then_guess_uses_corrected_metadata(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_post(ctx, DAY1)
+        await scenario_admin_fixsong(ctx, ADMIN, "Fixed Title", "Fixed Artist", None, DAY1)
+
+        out = json_roundtrip(
+            await scenario_guess(ctx, ALICE, "Fixed Title Fixed Artist", DAY1, now_pinned=True)
+        )
+
+        assert out["state"]["user"]["solved"] is True
+        assert out["state"]["user"]["points_awarded"] == 150  # 100 x 1.5 both-bonus
+
+    async def test_admin_fixsong_non_admin_denied_with_zero_mutation(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_post(ctx, DAY1)
+
+        out = json_roundtrip(
+            await scenario_admin_fixsong(ctx, NON_ADMIN, "Fixed Title", None, None, DAY1)
+        )
+
+        assert kinds(out) == ["ephemeral"]
+        assert "manage server" in out["payloads"][0]["content"].lower()
+        assert out["state"]["outcome"] == "denied"
+        assert out["state"]["fix"] is None
+        song = db.query_one("SELECT title, artist FROM songs")
+        assert song is not None
+        assert (song["title"], song["artist"]) == (TITLE, ARTIST)
+        row = db.query_one("SELECT COUNT(*) AS c FROM song_overrides")
+        assert row is not None
+        assert row["c"] == 0
+
+    async def test_admin_fixsong_refused_without_a_challenge(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+
+        out = json_roundtrip(
+            await scenario_admin_fixsong(ctx, ADMIN, "Fixed Title", None, None, DAY1)
+        )
+
+        assert kinds(out) == ["ephemeral"]
+        assert out["state"]["outcome"] == "refused"
+        assert out["state"]["reason"] == "no_challenge"
+        assert out["state"]["fix"] is None
 
 
 class TestAdminReload:

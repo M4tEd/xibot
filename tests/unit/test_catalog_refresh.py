@@ -396,3 +396,96 @@ class TestDuplicates:
         rows = _songs_table(db)
         assert len(rows) == 1
         assert rows[0].title == "First"
+
+
+class TestOverrides:
+    """song_overrides (/songbot-fixsong) re-apply after every refresh.
+
+    The refresh upsert would otherwise clobber admin corrections with the
+    provider's metadata. Overrides are keyed by (source, source_id) with no
+    FK, so they survive the song row's deletion and re-apply on re-add.
+    """
+
+    @staticmethod
+    def _override(
+        db: Database, source: str, source_id: str, title: str, artist: str | None
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        db.execute(
+            "INSERT INTO song_overrides"
+            " (source, source_id, title, artist, set_by, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, 'test', ?, ?)",
+            (source, source_id, title, artist, now, now),
+        )
+
+    def test_refresh_reapplies_override_over_provider_metadata(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        provider = StubProvider([_song("a.mp3", title="Bad Parse", artist="xXUploaderXx")])
+        refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+        self._override(db, "local", "a.mp3", "Real Title", "Real Artist")
+
+        # The provider still reports the bad parse; without the override pass
+        # this second upsert would restore it.
+        result = refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+
+        assert result.ok
+        assert result.by_source("local") == SourceRefresh(source="local", updated=1)
+        row = _songs_table(db)[0]
+        assert row.title == "Real Title"
+        assert row.artist == "Real Artist"
+
+    def test_override_can_clear_the_artist(self, db: Database, tmp_path: Path) -> None:
+        provider = StubProvider([_song("a.mp3", artist="xXUploaderXx")])
+        refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+        self._override(db, "local", "a.mp3", "Real Title", None)
+
+        refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+
+        row = _songs_table(db)[0]
+        assert row.title == "Real Title"
+        assert row.artist is None
+
+    def test_override_for_absent_song_is_a_noop(self, db: Database, tmp_path: Path) -> None:
+        provider = StubProvider([_song("a.mp3")])
+        self._override(db, "local", "ghost.mp3", "Ghost", "Ghost Artist")
+
+        result = refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+
+        assert result.ok
+        rows = _songs_table(db)
+        assert [(row.source_id, row.title) for row in rows] == [("a.mp3", "A Title")]
+
+    def test_override_survives_song_removal_and_readd(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        provider = StubProvider([_song("a.mp3", title="Bad Parse")])
+        refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+        self._override(db, "local", "a.mp3", "Real Title", "Real Artist")
+
+        # The song vanishes from the provider and is deleted (unreferenced);
+        # the override row remains.
+        provider.songs = []
+        refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+        assert _songs_table(db) == []
+
+        # When the song re-enters the catalog, the pending override re-applies.
+        provider.songs = [_song("a.mp3", title="Bad Parse")]
+        refresh_catalog(db, _settings(tmp_path), providers={"local": provider})
+        row = _songs_table(db)[0]
+        assert row.title == "Real Title"
+        assert row.artist == "Real Artist"
+
+    def test_overrides_are_scoped_per_source(self, db: Database, tmp_path: Path) -> None:
+        """An override for youtube/X must not touch the local row X."""
+        local = StubProvider([_song("a.mp3", title="Local Title")])
+        youtube = StubProvider([_youtube_song("a.mp3", title="Video Title")])
+        refresh_catalog(db, _settings(tmp_path), providers={"local": local, "youtube": youtube})
+        self._override(db, "youtube", "a.mp3", "Fixed Video", "Fixed Artist")
+
+        refresh_catalog(db, _settings(tmp_path), providers={"local": local, "youtube": youtube})
+
+        rows = {(row.source, row.source_id): row for row in _songs_table(db)}
+        assert rows[("local", "a.mp3")].title == "Local Title"
+        assert rows[("youtube", "a.mp3")].title == "Fixed Video"
+        assert rows[("youtube", "a.mp3")].artist == "Fixed Artist"

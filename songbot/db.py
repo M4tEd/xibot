@@ -7,7 +7,9 @@ Schema (migration 1) implements the architecture.md data model exactly:
 `songs`, `challenges`, `challenge_users`, `guesses`, `user_stats`, plus the
 `schema_migrations` bookkeeping table. `challenge_users` and `guesses` carry
 `ON DELETE CASCADE` so skip-song can delete + recreate a challenge row
-(pinned design decision #5).
+(pinned design decision #5). Later migrations add `challenges.skip_count`
+(2), `guild_settings` (3), and `song_overrides` (4 — admin-corrected song
+metadata that catalog refreshes re-apply).
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ __all__ = [
 ChallengeStatus = Literal["active", "revealed"]
 """Valid values for `challenges.status`."""
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Latest schema version; bump when appending to `MIGRATIONS`."""
 
 _BUSY_TIMEOUT_MS = 5000
@@ -137,12 +139,34 @@ _MIGRATION_003_GUILD_SETTINGS: tuple[str, ...] = (
     """,
 )
 
+_MIGRATION_004_SONG_OVERRIDES: tuple[str, ...] = (
+    # Admin-corrected song metadata (/songbot-fixsong). The songs row always
+    # carries the effective (corrected) title/artist; this table is the
+    # durable record a catalog refresh re-applies, since the refresh upsert
+    # would otherwise clobber the correction with the provider's metadata.
+    # Keyed by (source, source_id) with no FK: an override survives the song
+    # row's deletion and re-applies if the song re-enters the catalog.
+    """
+    CREATE TABLE song_overrides (
+        source TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        artist TEXT,
+        set_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (source, source_id)
+    )
+    """,
+)
+
 # Versioned migrations, applied in ascending order. Never edit an applied
 # migration; append a new (version, statements) entry instead.
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _MIGRATION_001_INITIAL),
     (2, _MIGRATION_002_CHALLENGE_SKIP_COUNT),
     (3, _MIGRATION_003_GUILD_SETTINGS),
+    (4, _MIGRATION_004_SONG_OVERRIDES),
 )
 
 

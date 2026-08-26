@@ -5,8 +5,11 @@ GameEngine on a tmp SQLite DB with the fake snippet service — no discord.py
 gateway, no network. Covers the Manage-Guild gate that both discord.py and
 the harness flag honor (VAL-ADMIN-009), admin-post idempotency (pinned #4,
 VAL-ADMIN-001/002), skip refusal/replacement semantics (pinned #5,
-VAL-ADMIN-003..006), the reload per-source summary ack (VAL-ADMIN-007), and
-the secrecy invariant (no ack ever names the song, pinned #9).
+VAL-ADMIN-003..006), the reload per-source summary ack (VAL-ADMIN-007), the
+secrecy invariant (no ack ever names the song, pinned #9 — with ONE scoped
+exception: the /songbot-fixsong ephemeral ack shows old -> new metadata to
+the Manage-Server admin, since the command is unusable blind), and the
+fixsong metadata-correction flow (songs row + durable song_overrides row).
 """
 
 from __future__ import annotations
@@ -140,11 +143,15 @@ class TestPermissionGate:
         async def setup_via(interaction: FakeInteraction) -> Any:
             return await spied.setup_channel(interaction, "channel-1", "#channel-1")
 
+        async def fixsong_via(interaction: FakeInteraction) -> Any:
+            return await spied.fix_song(interaction, title="Whatever")
+
         for method in (
             spied.post_now,
             spied.skip_song,
             spied.reload_catalog,
             setup_via,
+            fixsong_via,
         ):
             interaction = _interaction(manage_guild=False)
             result = await method(interaction)
@@ -167,6 +174,7 @@ class TestPermissionGate:
             "guesses",
             "user_stats",
             "guild_settings",
+            "song_overrides",
         ):
             assert _row_count(db, table) == 0
 
@@ -442,7 +450,7 @@ class TestReloadCatalog:
 
 
 class TestRegistration:
-    def test_registers_four_guild_commands_with_manage_guild_default(
+    def test_registers_five_guild_commands_with_manage_guild_default(
         self, commands: AdminCommands
     ) -> None:
         client = discord.Client(intents=discord.Intents.default())
@@ -458,6 +466,7 @@ class TestRegistration:
             "songbot-post",
             "songbot-skip",
             "songbot-reload",
+            "songbot-fixsong",
         }
         for command in registered:
             assert isinstance(command, app_commands.Command)
@@ -492,8 +501,8 @@ class TestRegistration:
         register_admin_commands(tree, commands, guild=guild_a)
         register_admin_commands(tree, commands, guild=guild_b)
 
-        assert len(tree.get_commands(guild=guild_a)) == 4
-        assert len(tree.get_commands(guild=guild_b)) == 4
+        assert len(tree.get_commands(guild=guild_a)) == 5
+        assert len(tree.get_commands(guild=guild_b)) == 5
         assert tree.get_commands() == []  # nothing global
 
 
@@ -607,3 +616,190 @@ class TestNotConfigured:
 
         assert result.outcome == "refused"
         assert result.reason == "no_challenge"
+
+
+DAY2 = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)  # 2026-08-14 13:00 ADT
+
+
+class TestFixSong:
+    """/songbot-fixsong: admin metadata correction for bad catalog parses.
+
+    The ephemeral ack names the song (old -> new) — the deliberate, scoped
+    exception to the pinned-#9 secrecy rule: ephemeral, admin-gated, and the
+    command is unusable blind.
+    """
+
+    async def test_fixes_latest_challenge_song_and_records_override(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)  # song-1: Neon Skyline / Midnight Circuit
+        challenge = engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+
+        interaction = _interaction()
+        result = await commands.fix_song(
+            interaction, title="Fixed Title", artist="Fixed Artist"
+        )
+
+        assert result.outcome == "fixed"
+        assert result.reason is None
+        fix = result.fix
+        assert fix is not None
+        assert fix.song_id == challenge.song.id
+        assert fix.challenge_id == challenge.id
+        assert fix.challenge_date == "2026-08-13"
+        assert (fix.old_title, fix.old_artist) == (TITLE, ARTIST)
+        assert (fix.new_title, fix.new_artist) == ("Fixed Title", "Fixed Artist")
+        # The songs row carries the correction...
+        row = db.query_one("SELECT title, artist FROM songs WHERE id = ?", (fix.song_id,))
+        assert row is not None
+        assert (row["title"], row["artist"]) == ("Fixed Title", "Fixed Artist")
+        # ...and the durable override row survives catalog reloads.
+        override = db.query_one(
+            "SELECT title, artist, set_by FROM song_overrides"
+            " WHERE source = 'local' AND source_id = 'song-1'"
+        )
+        assert override is not None
+        assert (override["title"], override["artist"]) == ("Fixed Title", "Fixed Artist")
+        assert override["set_by"] == str(ADMIN_ID)
+        # Exactly one ephemeral ack showing old -> new (the secrecy exception).
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        ack = interaction.payloads[0]
+        assert ack.recipient == str(ADMIN_ID)
+        content = ack.content or ""
+        for text in (TITLE, ARTIST, "Fixed Title", "Fixed Artist"):
+            assert text in content
+
+    async def test_artist_omitted_keeps_the_current_artist(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)
+        engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+
+        result = await commands.fix_song(_interaction(), title="Fixed Title")
+
+        assert result.outcome == "fixed"
+        assert result.fix is not None
+        assert result.fix.new_artist == ARTIST
+        row = db.query_one("SELECT artist FROM songs")
+        assert row is not None
+        assert row["artist"] == ARTIST
+
+    async def test_blank_artist_clears_the_artist(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)
+        engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+
+        result = await commands.fix_song(_interaction(), title="Fixed Title", artist="   ")
+
+        assert result.outcome == "fixed"
+        assert result.fix is not None
+        assert result.fix.new_artist is None
+        row = db.query_one("SELECT artist FROM songs")
+        assert row is not None
+        assert row["artist"] is None
+
+    async def test_date_targets_an_earlier_challenge_and_default_is_latest(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_two_songs(db)
+        day1 = engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+        day2 = engine.ensure_today_challenge("guild-1", "channel-1", DAY2)
+        assert day2.song.id != day1.song.id  # no repeats until exhausted
+
+        dated = await commands.fix_song(
+            _interaction(), title="Day One Fix", date="2026-08-13"
+        )
+
+        assert dated.outcome == "fixed"
+        assert dated.fix is not None
+        assert dated.fix.challenge_id == day1.id
+        row = db.query_one("SELECT title FROM songs WHERE id = ?", (day1.song.id,))
+        assert row is not None
+        assert row["title"] == "Day One Fix"
+        untouched = db.query_one("SELECT title FROM songs WHERE id = ?", (day2.song.id,))
+        assert untouched is not None
+        assert untouched["title"] != "Day One Fix"
+
+        latest = await commands.fix_song(_interaction(), title="Day Two Fix")
+
+        assert latest.outcome == "fixed"
+        assert latest.fix is not None
+        assert latest.fix.challenge_id == day2.id
+
+    async def test_refused_on_invalid_date_zero_mutation(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)
+        engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+
+        interaction = _interaction()
+        result = await commands.fix_song(interaction, title="X", date="13-08-2026")
+
+        assert result.outcome == "refused"
+        assert result.reason == "invalid_date"
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        row = db.query_one("SELECT title, artist FROM songs")
+        assert row is not None
+        assert (row["title"], row["artist"]) == (TITLE, ARTIST)
+        assert _row_count(db, "song_overrides") == 0
+
+    async def test_refused_without_a_challenge_zero_mutation(
+        self, commands: AdminCommands, db: Database
+    ) -> None:
+        _add_song(db)
+
+        interaction = _interaction()
+        result = await commands.fix_song(interaction, title="X")
+
+        assert result.outcome == "refused"
+        assert result.reason == "no_challenge"
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        row = db.query_one("SELECT title, artist FROM songs")
+        assert row is not None
+        assert (row["title"], row["artist"]) == (TITLE, ARTIST)
+        assert _row_count(db, "song_overrides") == 0
+
+    async def test_refused_on_blank_title_zero_mutation(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)
+        engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+
+        interaction = _interaction()
+        result = await commands.fix_song(interaction, title="   ")
+
+        assert result.outcome == "refused"
+        assert result.reason == "blank_title"
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        row = db.query_one("SELECT title FROM songs")
+        assert row is not None
+        assert row["title"] == TITLE
+        assert _row_count(db, "song_overrides") == 0
+
+    async def test_fix_applies_to_new_guesses_but_is_not_retroactive(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)
+        challenge = engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+        # Before the fix, the future-correct text is a plain wrong guess.
+        before = engine.submit_guess(challenge.id, "uma", "Fixed Title Fixed Artist", DAY1)
+        assert before.outcome == "wrong"
+
+        result = await commands.fix_song(
+            _interaction(), title="Fixed Title", artist="Fixed Artist"
+        )
+        assert result.outcome == "fixed"
+
+        # New guesses match the corrected metadata immediately (both -> bonus).
+        after = engine.submit_guess(challenge.id, "uma", "Fixed Title Fixed Artist", DAY1)
+        assert after.outcome == "correct"
+        assert after.is_both is True
+        assert after.points_awarded == 150  # 100 x 1.5, round-half-up
+
+        # The pre-fix guess row keeps its original result (no re-scoring).
+        rows = db.query(
+            "SELECT is_correct FROM guesses WHERE challenge_id = ? ORDER BY id",
+            (challenge.id,),
+        )
+        assert [bool(row["is_correct"]) for row in rows] == [False, True]

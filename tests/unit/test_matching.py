@@ -231,6 +231,81 @@ class TestMatchGuessThreshold:
         assert result.matched_title is True
 
 
+class TestPerTokenFallback:
+    """The per-token fallback: a field also matches when every one of its
+    tokens has a close twin among the guess tokens (ratio >= 85, or one
+    Levenshtein edit for 4+ char tokens).
+
+    Exists because ``token_set_ratio``'s subset bonus is all-or-nothing per
+    token: one typo breaks the exact-token intersection and the score
+    collapses below 85 — which used to kill the both-fields bonus on
+    combined guesses and made short titles/artists tolerate zero typos.
+    """
+
+    def test_combined_guess_with_typo_in_artist_still_matches_both(self) -> None:
+        """The reported bug: 'Quen' alone passes (88.9), but inside a combined
+        guess the artist check used to fail -> bonus lost."""
+        result = match_guess("Bohemian Rhapsody Quen", QUEEN)
+        assert result.matched_title is True
+        assert result.matched_artist is True
+        assert result.is_both is True
+
+    def test_combined_guess_with_typo_in_title_still_matches_both(self) -> None:
+        """'Bohemian Rhapsodu' alone passes (94.1); adding the artist used to
+        drag the title check below 85 -> bonus lost."""
+        result = match_guess("Bohemian Rhapsodu Queen", QUEEN)
+        assert result.matched_title is True
+        assert result.matched_artist is True
+        assert result.is_both is True
+
+    def test_short_title_single_substitution_matches(self) -> None:
+        # fuzz.ratio("halp", "halo") == 75.0 — below threshold, one edit apart.
+        assert match_guess("Halp", BEYONCE).matched_title is True
+
+    def test_short_artist_single_substitution_matches(self) -> None:
+        # fuzz.ratio("qween", "queen") == 80.0 — below threshold, one edit apart.
+        assert match_guess("Qween", QUEEN).matched_artist is True
+
+    def test_one_edit_allowance_requires_four_chars(self) -> None:
+        """1-3 char tokens stay effectively exact: one edit changes too much."""
+        tiny = Song(
+            source="local",
+            source_id="tiny",
+            title="ABC",
+            artist="U2",
+            duration_sec=30.0,
+            audio_ref="/music/tiny.mp3",
+            raw_title="U2 - ABC",
+        )
+        assert match_guess("abd", tiny).is_correct is False  # ABC, one sub
+        assert match_guess("u3", tiny).is_correct is False  # U2, one sub
+        assert match_guess("abc", tiny).matched_title is True
+        assert match_guess("u2", tiny).matched_artist is True
+
+    def test_near_miss_on_one_token_of_multi_token_field_still_fails(self) -> None:
+        """Every candidate token needs a twin: 'Bohemia' covers 'bohemian'
+        (93.3) but nothing covers 'rhapsody'."""
+        result = match_guess("Bohemia", QUEEN)
+        assert result.is_correct is False
+
+    def test_unrelated_guess_still_rejected(self) -> None:
+        assert match_guess("zxqv unrelated noise", QUEEN).is_correct is False
+
+    def test_fallback_respects_custom_threshold(self) -> None:
+        """The per-token ratio gate uses the same threshold as the field level.
+
+        "rhapsoyd"/"rhapsody" is a transposition: fuzz.ratio 93.75 but two
+        Levenshtein edits, so the one-edit clause cannot rescue it — it
+        passes only while the threshold is <= 93.75.
+        """
+        guess = "Bohemian Rhapsoyd Queen"
+        assert match_guess(guess, QUEEN).is_both is True
+        strict = match_guess(guess, QUEEN, threshold=95)
+        assert strict.matched_title is False
+        assert strict.matched_artist is True
+        assert strict.is_both is False
+
+
 class TestRawTitleFallback:
     """VAL-GUESS-017: raw_title rescues guesses on poorly-parsed YouTube entries."""
 

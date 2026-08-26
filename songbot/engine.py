@@ -60,6 +60,8 @@ __all__ = [
     "CatalogEmptyError",
     "Challenge",
     "EngineError",
+    "FixSongRefusedError",
+    "FixSongRefusedReason",
     "GameEngine",
     "GuessOutcome",
     "GuessResult",
@@ -68,6 +70,7 @@ __all__ = [
     "SkipRefusedError",
     "SkipRefusedReason",
     "SnippetService",
+    "SongFix",
     "UnlockRefusedError",
     "UnlockRefusedReason",
     "UnlockResult",
@@ -78,6 +81,9 @@ logger = logging.getLogger(__name__)
 
 SkipRefusedReason = Literal["no_challenge", "revealed", "solved"]
 """Why `skip_today_song` refused (pinned decision #5)."""
+
+FixSongRefusedReason = Literal["no_challenge", "invalid_date", "blank_title"]
+"""Why `fix_song_metadata` refused (zero mutation)."""
 
 UnlockRefusedReason = Literal["solved", "max_level", "closed"]
 """Why `unlock_snippet` refused: the challenge is closed (no longer active),
@@ -134,6 +140,20 @@ class UnlockRefusedError(EngineError):
         self.reason: UnlockRefusedReason = reason
 
 
+class FixSongRefusedError(EngineError):
+    """fix_song_metadata refused with zero state mutation.
+
+    ``reason`` is ``"no_challenge"`` (the guild has no challenge to fix —
+    none at all, or none on the requested date), ``"invalid_date"`` (the
+    ``date`` argument is not an ISO ``YYYY-MM-DD`` date), or
+    ``"blank_title"`` (the corrected title is empty after stripping).
+    """
+
+    def __init__(self, reason: FixSongRefusedReason, message: str) -> None:
+        super().__init__(message)
+        self.reason: FixSongRefusedReason = reason
+
+
 class SnippetService(Protocol):
     """The snippet operations the engine needs (satisfied by SnippetGenerator).
 
@@ -176,6 +196,28 @@ class Challenge:
     revealed_at: str | None
     snippet_paths: dict[int, Path]
     created: bool
+
+
+@dataclass(frozen=True)
+class SongFix:
+    """The record of an admin metadata correction (`fix_song_metadata`).
+
+    ``old_*``/``new_*`` let the admin ack show exactly what changed. The
+    correction targets the song of one of the guild's challenges (latest by
+    default, or the ``date``-selected one) and is persisted both on the
+    ``songs`` row (effective immediately for new guesses and future reveals)
+    and as a ``song_overrides`` row (re-applied by every catalog refresh, so
+    the provider's metadata never clobbers it). Already-recorded guesses are
+    NOT re-scored.
+    """
+
+    song_id: int
+    challenge_id: int
+    challenge_date: str
+    old_title: str
+    old_artist: str | None
+    new_title: str
+    new_artist: str | None
 
 
 @dataclass(frozen=True)
@@ -682,6 +724,88 @@ class GameEngine:
             # The old row is already gone; do not leave a snippet-less row.
             self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
             raise
+
+    def fix_song_metadata(
+        self,
+        guild_id: str,
+        *,
+        title: str,
+        artist: str | None = None,
+        date_str: str | None = None,
+        set_by: str,
+        now: datetime,
+    ) -> SongFix:
+        """Correct the title/artist of a challenge's song (/songbot-fixsong).
+
+        Targets the song of the guild's MOST RECENT challenge, or of the
+        ``date_str``-selected challenge (ISO ``YYYY-MM-DD``, the challenge's
+        local date) when given. ``artist`` omitted (None) keeps the current
+        artist; a blank-after-strip ``artist`` clears it to None. Refused
+        with zero mutation (``FixSongRefusedError``) when the title is blank,
+        the date is malformed, or the guild has no such challenge.
+
+        The correction writes the ``songs`` row (effective immediately:
+        ``submit_guess`` re-reads the row per guess, and future reveals use
+        it) and upserts a ``song_overrides`` row in the same transaction, so
+        every later catalog refresh re-applies it (refresh.py). Already-logged
+        guesses and awarded points are NOT re-scored.
+        """
+        new_title = title.strip()
+        if not new_title:
+            raise FixSongRefusedError(
+                "blank_title", "corrected title must be non-empty after stripping"
+            )
+        # artist omitted -> keep the current one; blank-after-strip -> clear.
+        stripped_artist = artist.strip() if artist is not None else None
+
+        if date_str is not None:
+            try:
+                date.fromisoformat(date_str)
+            except ValueError:
+                raise FixSongRefusedError(
+                    "invalid_date", f"invalid date {date_str!r}: expected YYYY-MM-DD"
+                ) from None
+            challenge = self._challenge_row(guild_id, date_str)
+        else:
+            row = self._db.query_one(
+                "SELECT * FROM challenges WHERE guild_id = ?"
+                " ORDER BY date DESC, id DESC LIMIT 1",
+                (guild_id,),
+            )
+            challenge = ChallengeRow.from_row(row) if row is not None else None
+        if challenge is None:
+            raise FixSongRefusedError(
+                "no_challenge",
+                f"no challenge to fix in guild {guild_id}"
+                + (f" on {date_str}" if date_str is not None else ""),
+            )
+
+        song = self._song_row(challenge.song_id)
+        new_artist = song.artist if stripped_artist is None else stripped_artist or None
+        iso_now = self._utc_iso(now)
+        with self._db.transaction():
+            self._db.execute(
+                "UPDATE songs SET title = ?, artist = ? WHERE id = ?",
+                (new_title, new_artist, song.id),
+            )
+            self._db.execute(
+                "INSERT INTO song_overrides"
+                " (source, source_id, title, artist, set_by, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(source, source_id) DO UPDATE SET"
+                " title = excluded.title, artist = excluded.artist,"
+                " set_by = excluded.set_by, updated_at = excluded.updated_at",
+                (song.source, song.source_id, new_title, new_artist, set_by, iso_now, iso_now),
+            )
+        return SongFix(
+            song_id=song.id,
+            challenge_id=challenge.id,
+            challenge_date=challenge.date,
+            old_title=song.title,
+            old_artist=song.artist,
+            new_title=new_title,
+            new_artist=new_artist,
+        )
 
     def delete_challenge(self, challenge_id: int) -> None:
         """Roll back a just-created challenge whose channel post failed (pinned #16).

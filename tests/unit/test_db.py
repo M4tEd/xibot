@@ -33,6 +33,7 @@ EXPECTED_TABLES = {
     "guesses",
     "user_stats",
     "guild_settings",
+    "song_overrides",
 }
 
 # Exact PRAGMA table_info tuples (name, type, notnull, dflt_value, pk) per the
@@ -98,6 +99,17 @@ EXPECTED_COLUMNS: dict[str, list[tuple[str, str, int, str | None, int]]] = {
     "guild_settings": [
         ("guild_id", "TEXT", 1, None, 1),
         ("channel_id", "TEXT", 1, None, 0),
+        ("set_by", "TEXT", 1, None, 0),
+        ("created_at", "TEXT", 1, None, 0),
+        ("updated_at", "TEXT", 1, None, 0),
+    ],
+    # migration 4: admin-corrected song metadata (the /songbot-fixsong store,
+    # re-applied by every catalog refresh)
+    "song_overrides": [
+        ("source", "TEXT", 1, None, 1),
+        ("source_id", "TEXT", 1, None, 2),
+        ("title", "TEXT", 1, None, 0),
+        ("artist", "TEXT", 0, None, 0),  # nullable, mirroring songs.artist
         ("set_by", "TEXT", 1, None, 0),
         ("created_at", "TEXT", 1, None, 0),
         ("updated_at", "TEXT", 1, None, 0),
@@ -197,7 +209,7 @@ class TestMigration:
     def test_migrate_returns_applied_versions_then_nothing(self, tmp_path: Path) -> None:
         database = Database(tmp_path / "songbot.db")
         try:
-            assert database.migrate() == [1, 2, 3]
+            assert database.migrate() == [1, 2, 3, 4]
             assert database.migrate() == []
         finally:
             database.close()
@@ -210,13 +222,13 @@ class TestMigration:
         try:
             assert second.migrate() == []
             assert second.schema_version() == SCHEMA_VERSION
-            assert count(second, "schema_migrations") == 3
+            assert count(second, "schema_migrations") == 4
         finally:
             second.close()
 
     def test_schema_migrations_records_version_and_timestamp(self, db: Database) -> None:
         rows = db.query("SELECT version, applied_at FROM schema_migrations ORDER BY version")
-        assert [int(row["version"]) for row in rows] == [1, 2, 3]
+        assert [int(row["version"]) for row in rows] == [1, 2, 3, 4]
         for row in rows:
             # applied_at must be a parseable ISO-8601 timestamp
             parsed = datetime.fromisoformat(str(row["applied_at"]))
@@ -242,8 +254,8 @@ class TestMigration:
             song_id = insert_song(database)
             challenge_id = insert_challenge(database, song_id)
 
-            assert database.migrate() == [2, 3]
-            assert database.schema_version() == 3
+            assert database.migrate() == [2, 3, 4]
+            assert database.schema_version() == 4
             row = database.query_one(
                 "SELECT skip_count FROM challenges WHERE id = ?", (challenge_id,)
             )
@@ -278,8 +290,8 @@ class TestMigration:
             song_id = insert_song(database)
             challenge_id = insert_challenge(database, song_id)
 
-            assert database.migrate() == [3]
-            assert database.schema_version() == 3
+            assert database.migrate() == [3, 4]
+            assert database.schema_version() == 4
 
             table = database.query_one(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"

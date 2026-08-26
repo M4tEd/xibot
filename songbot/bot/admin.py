@@ -1,4 +1,5 @@
-"""Admin slash commands: /songbot-post, /songbot-skip, /songbot-reload.
+"""Admin slash commands: /songbot-setup, /songbot-post, /songbot-skip,
+/songbot-reload, /songbot-fixsong.
 
 All three are gated on the Manage-Guild permission and ack EPHEMERALLY. The
 command bodies (`AdminCommands` methods) are plain coroutines that delegate
@@ -43,6 +44,8 @@ from songbot.bot.embeds import (
     ADMIN_POST_SUCCESS_MESSAGE,
     ADMIN_SKIP_SUCCESS_MESSAGE,
     PERMISSION_DENIED_MESSAGE,
+    fixsong_ack_content,
+    fixsong_refusal_content,
     reload_ack_content,
     setup_ack_content,
     skip_refusal_content,
@@ -53,9 +56,12 @@ from songbot.config import Settings
 from songbot.engine import (
     CatalogEmptyError,
     Challenge,
+    FixSongRefusedError,
+    FixSongRefusedReason,
     GameEngine,
     SkipRefusedError,
     SkipRefusedReason,
+    SongFix,
 )
 
 __all__ = [
@@ -76,6 +82,7 @@ AdminOutcome = Literal[
     "reloaded",
     "configured",
     "not_configured",
+    "fixed",
     "error",
 ]
 """The machine-readable outcome of an admin command body.
@@ -103,14 +110,16 @@ class AdminResult:
 
     discord.py ignores callback return values; the harness uses the outcome
     to shape its JSON output (e.g. the pinned-#4 ``already_posted`` compact
-    form). ``reason`` is set for ``refused`` skips; ``refresh`` carries the
-    per-source catalog summary for ``reloaded``; ``error`` carries the send
+    form). ``reason`` is set for ``refused`` skips/fixes; ``refresh`` carries
+    the per-source catalog summary for ``reloaded``; ``fix`` carries the
+    old/new metadata record for ``fixed``; ``error`` carries the send
     failure's message for ``error`` (pinned #16).
     """
 
     outcome: AdminOutcome
-    reason: SkipRefusedReason | None = None
+    reason: SkipRefusedReason | FixSongRefusedReason | None = None
     refresh: RefreshResult | None = None
+    fix: SongFix | None = None
     error: str | None = None
 
 
@@ -268,6 +277,50 @@ class AdminCommands:
         await interaction.response.send_message(ADMIN_SKIP_SUCCESS_MESSAGE, ephemeral=True)
         return AdminResult("skipped")
 
+    async def fix_song(
+        self,
+        interaction: discord.Interaction[Any],
+        *,
+        title: str,
+        artist: str | None = None,
+        date: str | None = None,
+    ) -> AdminResult:
+        """/songbot-fixsong: correct the title/artist of a challenge's song.
+
+        Targets the guild's most recent challenge's song, or the
+        ``date``-selected one. The correction applies to new guesses
+        immediately and is re-applied after every catalog reload (the
+        ``song_overrides`` table); already-recorded guesses keep their
+        original results. The ephemeral ack shows old -> new metadata — a
+        scoped exception to the pinned-#9 secrecy rule (ephemeral and
+        admin-gated; the command is unusable blind). Refusals
+        (``no_challenge``/``invalid_date``/``blank_title``) mutate nothing.
+        """
+        if not has_manage_guild(interaction):
+            return await self._deny(interaction)
+        guild_id = self._guild_id_of(interaction)
+        if guild_id is None:  # pragma: no cover - the command is guild-only
+            await interaction.response.send_message(
+                ADMIN_NOT_CONFIGURED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("not_configured")
+        try:
+            fix = self._engine.fix_song_metadata(
+                guild_id,
+                title=title,
+                artist=artist,
+                date_str=date,
+                set_by=str(interaction.user.id),
+                now=self._clock(),
+            )
+        except FixSongRefusedError as exc:
+            await interaction.response.send_message(
+                fixsong_refusal_content(exc.reason), ephemeral=True
+            )
+            return AdminResult("refused", reason=exc.reason)
+        await interaction.response.send_message(fixsong_ack_content(fix), ephemeral=True)
+        return AdminResult("fixed", fix=fix)
+
     async def reload_catalog(self, interaction: discord.Interaction[Any]) -> AdminResult:
         """/songbot-reload: upsert the catalog from its sources.
 
@@ -325,11 +378,30 @@ def register_admin_commands(
     async def reload_command(interaction: discord.Interaction[Any]) -> None:
         await commands.reload_catalog(interaction)
 
+    @app_commands.command(
+        name="songbot-fixsong",
+        description="Correct the title/artist of a challenge's song (bad parses).",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        title="The correct song title.",
+        artist="The correct artist (omit to keep the current one).",
+        date="Which challenge's song to fix, YYYY-MM-DD (default: the latest).",
+    )
+    async def fixsong_command(
+        interaction: discord.Interaction[Any],
+        title: str,
+        artist: str | None = None,
+        date: str | None = None,
+    ) -> None:
+        await commands.fix_song(interaction, title=title, artist=artist, date=date)
+
     registered: tuple[app_commands.Command[Any, Any, Any], ...] = (
         setup_command,
         post_command,
         skip_command,
         reload_command,
+        fixsong_command,
     )
     for command in registered:
         tree.add_command(command, guild=guild)
