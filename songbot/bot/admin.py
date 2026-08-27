@@ -29,6 +29,7 @@ reposts it; a pre-existing row is never rolled back).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -223,8 +224,11 @@ class AdminCommands:
             )
             return AdminResult("not_configured")
         try:
-            challenge = self._engine.ensure_today_challenge(
-                guild.guild_id, guild.channel_id, self._clock()
+            challenge = await asyncio.to_thread(
+                self._engine.ensure_today_challenge,
+                guild.guild_id,
+                guild.channel_id,
+                self._clock(),
             )
         except CatalogEmptyError:
             await interaction.response.send_message(
@@ -268,7 +272,7 @@ class AdminCommands:
             )
             return AdminResult("not_configured")
         try:
-            self._engine.skip_today_song(guild_id, self._clock())
+            await asyncio.to_thread(self._engine.skip_today_song, guild_id, self._clock())
         except SkipRefusedError as exc:
             await interaction.response.send_message(
                 skip_refusal_content(exc.reason), ephemeral=True
