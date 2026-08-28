@@ -472,7 +472,12 @@ class SongBotClient(discord.Client):
             # Pinned #17: mark revealed ONLY after the reveal send succeeded.
             self._engine.mark_revealed(guild_id, now)
         try:
-            challenge = self._engine.ensure_today_challenge(guild_id, channel_id, now)
+            # Snippet generation can run ffmpeg/yt-dlp for seconds or minutes;
+            # keep it off the event loop so interactions stay ack-able and
+            # other guilds keep posting.
+            challenge = await asyncio.to_thread(
+                self._engine.ensure_today_challenge, guild_id, channel_id, now
+            )
         except CatalogEmptyError:
             logger.warning(
                 "daily post skipped for guild %s: catalog is empty — add songs"
