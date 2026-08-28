@@ -747,7 +747,8 @@ class TestCrossDayFlows:
         assert db_rows(tmp_path, "SELECT COUNT(*) FROM challenges") == [(9,)]
 
     def test_guess_limit_resets_with_next_day(self, tmp_path: Path) -> None:
-        """VAL-CROSS-011: the 6-guess limit bites, then resets on the new day."""
+        """VAL-CROSS-011: full-value guesses run out (post-limit 10-point mode
+        kicks in), then the count resets on the new day."""
         run_json(tmp_path, "reset")
         run_json(tmp_path, "post", "--now", DAY1_NOW)
         for n in range(1, 7):
@@ -758,10 +759,12 @@ class TestCrossDayFlows:
         seventh = run_json(
             tmp_path, "guess", "--user", "erin", "--text", "wrong 7", "--now", DAY1_NOW
         )
-        assert "no guesses left" in seventh["payloads"][1]["content"].lower()
+        # Past the limit the player is NOT locked out: the guess is processed
+        # and logged, and the feedback offers the 10-point mode.
+        assert "10" in seventh["payloads"][1]["content"]
         assert db_rows(
             tmp_path, "SELECT COUNT(*) FROM guesses WHERE user_id = 'erin'"
-        ) == [(6,)]
+        ) == [(7,)]
 
         run_json(tmp_path, "advance-day", "--now", DAY1_NOW)
         status = run_json(tmp_path, "status", "--now", DAY2_NOW)

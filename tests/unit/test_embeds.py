@@ -306,22 +306,32 @@ class TestGuessFeedbackContent:
         assert "❌" in content
         assert "5" in content
 
-    def test_wrong_last_guess_says_limit_reached(self) -> None:
+    def test_wrong_past_the_limit_offers_10_point_mode(self) -> None:
         content = guess_feedback_content(
             self._result(outcome="wrong", guesses_used=6, guesses_left=0)
         )
         assert "❌" in content
-        assert "0" in content or "last" in content.lower() or "no guesses" in content.lower()
+        assert "keep" in content.lower()  # not locked out
+        assert "10" in content  # the post-limit flat award
 
     def test_already_solved(self) -> None:
         content = guess_feedback_content(self._result(outcome="already_solved"))
         assert "already" in content.lower()
 
-    def test_limit_reached(self) -> None:
+    def test_correct_after_limit(self) -> None:
         content = guess_feedback_content(
-            self._result(outcome="limit_reached", guesses_used=6, guesses_left=0)
+            self._result(
+                outcome="correct_after_limit",
+                matched_title=True,
+                guesses_used=7,
+                guesses_left=0,
+                points_awarded=10,
+                announce=True,
+            )
         )
-        assert "6" in content or "limit" in content.lower()
+        assert "✅" in content
+        assert "10" in content
+        assert "Neon Skyline" not in content  # secrecy: never name the song
 
     def test_empty_guess_asks_for_input(self) -> None:
         content = guess_feedback_content(self._result(outcome="empty", guesses_used=0))

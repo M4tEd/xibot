@@ -20,6 +20,7 @@ import discord
 from songbot.catalog.refresh import RefreshResult
 from songbot.config import Settings
 from songbot.engine import (
+    POST_LIMIT_SOLVE_POINTS,
     Challenge,
     FixSongRefusedReason,
     GuessResult,
@@ -144,14 +145,16 @@ def daily_challenge_embed(challenge: Challenge, settings: Settings) -> discord.E
             "🏆 **Leaderboard** — see today's rankings\n\n"
             f"Right now you hear **{level0_seconds}** — a correct guess is worth "
             f"**{level0_points} points**. You have **{settings.max_guesses_per_day}** "
-            "guesses today."
+            "full-value guesses today — after that, a correct guess still banks "
+            f"**{POST_LIMIT_SOLVE_POINTS} points**."
         ),
         color=discord.Color.blurple(),
     )
     embed.set_footer(
         text=(
             f"Snippet: {level0_seconds} • Worth {level0_points} points • "
-            f"{settings.max_guesses_per_day} guesses per day"
+            f"{settings.max_guesses_per_day} full-value guesses per day, "
+            f"then {POST_LIMIT_SOLVE_POINTS} pts per solve"
         )
     )
     return embed
@@ -238,19 +241,23 @@ def guess_feedback_content(result: GuessResult) -> str:
             f"✅ Correct — you matched {matched} "
             f"**{result.points_awarded} points** banked."
         )
+    if result.outcome == "correct_after_limit":
+        return (
+            "✅ Correct — you're past today's full-value guesses, so this banks "
+            f"**{result.points_awarded} points** (no win or streak)."
+        )
     if result.outcome == "wrong":
         if result.guesses_left > 0:
             return (
                 f"❌ Not quite — **{result.guesses_left}** "
                 f"{'guess' if result.guesses_left == 1 else 'guesses'} left today."
             )
-        return "❌ Not quite — that was your **last guess** for today (0 left)."
+        return (
+            "❌ Not quite — you're out of full-value guesses, but you can keep "
+            f"trying: a correct guess still banks **{POST_LIMIT_SOLVE_POINTS} points**."
+        )
     if result.outcome == "already_solved":
         return "✅ You've already solved today's song!"
-    if result.outcome == "limit_reached":
-        return (
-            f"❌ No guesses left — you've used all {result.guesses_used} for today."
-        )
     if result.outcome == "empty":
         return EMPTY_GUESS_MESSAGE
     return CHALLENGE_CLOSED_MESSAGE

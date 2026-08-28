@@ -308,24 +308,26 @@ class TestSubmitGuessOutcomes:
             (1, 0, 1),
         ]
 
-    def test_six_wrong_guesses_then_limit_reached(
+    def test_wrong_guesses_past_the_limit_are_processed(
         self, engine: GameEngine, db: Database, challenge_id: int
     ) -> None:
-        """VAL-GUESS-008/009: 6th wrong exhausts; 7th rejected, zero mutation."""
+        """VAL-GUESS-008/009: the 6th wrong exhausts full-value guesses; the
+        7th+ are no longer refused — counted, logged, and clamped at 0 left."""
         for i in range(6):
             result = engine.submit_guess(challenge_id, "eve", f"{WRONG} {i}", NOW)
             assert result.outcome == "wrong"
             assert result.guesses_left == 6 - (i + 1)
 
-        rejected = engine.submit_guess(challenge_id, "eve", TITLE, NOW)  # would-be correct
-        assert rejected.outcome == "limit_reached"
-        assert rejected.guesses_used == 6
-        assert rejected.guesses_left == 0
-        assert rejected.announce is False
+        result = engine.submit_guess(challenge_id, "eve", f"{WRONG} 7", NOW)
+        assert result.outcome == "wrong"
+        assert result.guesses_used == 7
+        assert result.guesses_left == 0  # clamped, never negative
+        assert result.points_awarded == 0
+        assert result.announce is False
 
         row = _challenge_user(db, challenge_id, "eve")
-        assert (row["guesses_used"], row["solved"]) == (6, 0)
-        assert len(_guess_rows(db, challenge_id, "eve")) == 6  # rejection not logged
+        assert (row["guesses_used"], row["solved"]) == (7, 0)
+        assert len(_guess_rows(db, challenge_id, "eve")) == 7  # logged like normal
 
     def test_correct_on_sixth_attempt_solves(
         self, engine: GameEngine, db: Database, challenge_id: int
@@ -423,6 +425,110 @@ class TestSubmitGuessOutcomes:
         assert db.query("SELECT * FROM challenge_users") == []
         assert db.query("SELECT * FROM guesses") == []
         assert db.query("SELECT * FROM user_stats") == []
+
+
+class TestPostLimitGuessing:
+    """Guessing past the daily limit (issue #8): submissions are processed,
+    and a correct one solves for a flat 10 points with no win/streak."""
+
+    @staticmethod
+    def _exhaust(engine: GameEngine, challenge_id: int, user_id: str) -> None:
+        for i in range(6):
+            result = engine.submit_guess(challenge_id, user_id, f"{WRONG} {i}", NOW)
+            assert result.outcome == "wrong"
+
+    def test_post_limit_correct_guess_solves_for_10_points(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        self._exhaust(engine, challenge_id, "eve")
+
+        result = engine.submit_guess(challenge_id, "eve", TITLE, NOW)
+        assert result.outcome == "correct_after_limit"
+        assert result.points_awarded == 10
+        assert result.guesses_used == 7
+        assert result.guesses_left == 0
+        assert result.announce is True  # the public solve announcement fires
+
+        row = _challenge_user(db, challenge_id, "eve")
+        assert (row["solved"], row["guesses_used"], row["points_awarded"]) == (1, 7, 10)
+        assert row["solved_at"] is not None
+
+        guesses = _guess_rows(db, challenge_id, "eve")
+        assert len(guesses) == 7  # the solving guess is logged like normal
+        assert guesses[-1]["is_correct"] == 1
+
+        stats = _user_stats(db, "eve")
+        assert stats is not None
+        assert stats["total_points"] == 10
+        # No win/streak: only the flat points are banked.
+        assert stats["wins"] == 0
+        assert stats["current_streak"] == 0
+        assert stats["best_streak"] == 0
+        assert stats["last_win_date"] is None
+
+    def test_post_limit_both_match_has_no_bonus(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        """The 1.5x both-bonus does not apply past the limit: flat 10."""
+        self._exhaust(engine, challenge_id, "carol")
+
+        result = engine.submit_guess(challenge_id, "carol", BOTH_GUESS, NOW)
+        assert result.outcome == "correct_after_limit"
+        assert result.is_both is True
+        assert result.points_awarded == 10
+        assert _challenge_user(db, challenge_id, "carol")["points_awarded"] == 10
+
+    def test_post_limit_solver_appears_in_reveal_winners(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        """A 10-point solve still counts as solved: listed as a reveal winner."""
+        self._exhaust(engine, challenge_id, "eve")
+        engine.submit_guess(challenge_id, "eve", TITLE, NOW)
+
+        reveal = engine.peek_reveal("g1", DAY2)
+        assert reveal is not None
+        assert reveal.challenge_id == challenge_id
+        assert len(reveal.winners) == 1
+        winner = reveal.winners[0]
+        assert winner.user_id == "eve"
+        assert winner.points_awarded == 10
+        assert winner.guesses_used == 7
+
+    def test_guesses_after_post_limit_solve_are_already_solved(
+        self, engine: GameEngine, db: Database, challenge_id: int
+    ) -> None:
+        self._exhaust(engine, challenge_id, "eve")
+        engine.submit_guess(challenge_id, "eve", TITLE, NOW)
+
+        result = engine.submit_guess(challenge_id, "eve", ARTIST, NOW)
+        assert result.outcome == "already_solved"
+        assert result.announce is False
+
+        row = _challenge_user(db, challenge_id, "eve")
+        assert (row["guesses_used"], row["points_awarded"]) == (7, 10)  # unchanged
+        assert len(_guess_rows(db, challenge_id, "eve")) == 7  # rejection not logged
+        stats = _user_stats(db, "eve")
+        assert stats is not None
+        assert stats["total_points"] == 10  # no double award
+
+    def test_post_limit_solve_preserves_existing_streak_and_wins(
+        self, engine: GameEngine, db: Database
+    ) -> None:
+        """A post-limit solve adds points only: a streak earned by real wins
+        is neither extended nor reset, and last_win_date stays put."""
+        _add_song(db)
+        _solve(engine, engine.ensure_today_challenge("g1", "c1", DAY1).id, "ivan", DAY1)
+        day2 = engine.ensure_today_challenge("g1", "c1", DAY2)
+        self._exhaust(engine, day2.id, "ivan")
+        result = engine.submit_guess(day2.id, "ivan", TITLE, DAY2)
+        assert result.outcome == "correct_after_limit"
+
+        stats = _user_stats(db, "ivan")
+        assert stats is not None
+        assert stats["total_points"] == 110  # 100 (real win) + 10 (post-limit)
+        assert stats["wins"] == 1
+        assert stats["current_streak"] == 1
+        assert stats["last_win_date"] == "2026-08-13"  # DAY1, untouched
 
 
 class TestStreaks:

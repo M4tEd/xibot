@@ -3,7 +3,7 @@
 The REAL modal is constructed and submitted via lightweight fakes against a
 REAL GameEngine (tmp SQLite DB, fake snippet service) — no gateway, no
 network. Covers the modal shape (VAL-GUESS-001), correct/wrong/empty/
-already-solved/limit-reached feedback (VAL-GUESS-002/004/006/009/011/018
+already-solved/post-limit feedback (VAL-GUESS-002/004/006/009/011/018
 adapter halves), the first-solve public announcement with <@user_id> mention
 format (VAL-GUESS-012), the secrecy invariant (VAL-GUESS-013: no title/artist
 in any payload), and the revealed-challenge lockout (VAL-GUESS-019 adapter
@@ -202,16 +202,33 @@ class TestSubmitGuess:
         assert reply.content is not None
         assert "already" in reply.content.lower()
 
-    async def test_guess_at_limit_rejected(
+    async def test_guess_past_the_limit_solves_for_10_points(
         self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
         for i in range(6):
             engine.submit_guess(challenge.id, "1001", f"{WRONG} {i}", NOW)
         interaction = await _submit(_modal(engine, challenge, settings), TITLE)
+        assert [p.kind for p in interaction.payloads] == ["ephemeral", "announcement"]
+        reply = interaction.payloads[0]
+        assert reply.content is not None
+        assert "✅" in reply.content
+        assert "10" in reply.content
+        announcement = interaction.payloads[1]
+        assert announcement.content is not None
+        assert "<@1001>" in announcement.content
+        assert "10" in announcement.content
+
+    async def test_wrong_guess_past_the_limit_keeps_playing(
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
+    ) -> None:
+        for i in range(6):
+            engine.submit_guess(challenge.id, "1001", f"{WRONG} {i}", NOW)
+        interaction = await _submit(_modal(engine, challenge, settings), WRONG)
         assert [p.kind for p in interaction.payloads] == ["ephemeral"]
         reply = interaction.payloads[0]
         assert reply.content is not None
         assert "❌" in reply.content
+        assert "10" in reply.content  # the keep-playing 10-point offer
 
     async def test_revealed_challenge_yields_single_closed_notice(
         self, engine: GameEngine, challenge: Challenge, db: Database, settings: Settings
