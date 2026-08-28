@@ -4,7 +4,8 @@ Pure Python — never imports discord, performs I/O only via db/snippets/catalog
 
 Daily lifecycle: ``ensure_today_challenge`` (idempotent per (guild, local
 date), no-repeat song selection with history reset, deterministic seeded
-song+offset picks, catalog auto-bootstrap, snippet cache re-heal), the
+song+offset picks, catalog auto-bootstrap, snippet cache re-heal, bounded
+auto-skip of unsnippable fresh picks — issue #11), the
 pinned-#17 delivery-coupled reveal split — ``peek_reveal`` (read-only:
 compute the stale challenge's song + winners in solve order, zero mutation)
 and ``mark_revealed`` (the mutation the caller applies ONLY after the reveal
@@ -35,7 +36,7 @@ import hashlib
 import logging
 import random
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -55,8 +56,10 @@ from songbot.db import (
     UserStatsRow,
 )
 from songbot.matching import match_guess
+from songbot.snippets import SnippetError
 
 __all__ = [
+    "MAX_AUTO_SKIPS",
     "CatalogEmptyError",
     "Challenge",
     "EngineError",
@@ -78,6 +81,16 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+MAX_AUTO_SKIPS = 3
+"""Automatic song replacements per `ensure_today_challenge` call (issue #11).
+
+When snippet generation fails for a FRESHLY created challenge (e.g. a
+googlevideo 403 on the day's pick), the next deterministic pick is tried
+instead of retrying the identical song+offset on every scheduler tick until
+a manual skip. The bound caps the songs one call burns through; if all fail,
+the last error propagates and the caller's normal retry cadence applies.
+"""
 
 SkipRefusedReason = Literal["no_challenge", "revealed", "solved"]
 """Why `skip_today_song` refused (pinned decision #5)."""
@@ -473,13 +486,13 @@ class GameEngine:
         guild_id: str,
         rng: random.Random,
         *,
-        exclude_song_id: int | None = None,
+        exclude_song_ids: Collection[int] = (),
     ) -> SongRow | None:
         """Pick a song for `guild_id`: no repeats until exhausted, then reset.
 
         Eligible = catalog songs never used by this guild; when empty, the
-        history resets and all songs are eligible again. ``exclude_song_id``
-        (skip-song) additionally bars the just-skipped song from the re-pick
+        history resets and all songs are eligible again. ``exclude_song_ids``
+        (skip-song / auto-skip) additionally bars those songs from the pick
         whenever any alternative exists. Returns None iff the catalog is empty.
         """
         songs = [
@@ -497,8 +510,8 @@ class GameEngine:
         eligible = [song for song in songs if song.id not in used]
         if not eligible:
             eligible = songs  # catalog exhausted for this guild: history resets
-        if exclude_song_id is not None:
-            narrowed = [song for song in eligible if song.id != exclude_song_id]
+        if exclude_song_ids:
+            narrowed = [song for song in eligible if song.id not in exclude_song_ids]
             if narrowed:
                 eligible = narrowed
         return eligible[rng.randrange(len(eligible))]
@@ -540,6 +553,19 @@ class GameEngine:
         (pinned #11 bootstrap); a still-empty catalog raises
         ``CatalogEmptyError`` without inserting any row. A snippet-generation
         failure likewise leaves no row behind.
+
+        Auto-skip (issue #11): when snippet generation fails for a FRESHLY
+        created row (``SnippetError`` — e.g. a googlevideo 403 on the day's
+        pick), the row is deleted and the next deterministic pick
+        (``skip_count`` + 1, failed songs excluded) is tried instead, up to
+        ``MAX_AUTO_SKIPS`` times per call — the scheduler otherwise retries
+        the identical song+offset every 60s until a manual skip. The
+        surviving row carries the ``skip_count`` it took, so a later manual
+        skip continues the same deterministic chain. Only fresh rows are
+        auto-skipped: a pre-existing row's re-heal failure propagates
+        untouched (that challenge may already be posted; ``skip_today_song``
+        is the remedy there). If every attempt fails, the last
+        ``SnippetError`` propagates.
         """
         date_str = self._local_date(now).isoformat()
 
@@ -560,39 +586,77 @@ class GameEngine:
                 else:
                     logger.warning("catalog bootstrap (%s) failed: %s", source.source, source.error)
 
-        rng = random.Random(_seed(date_str, guild_id, skip_count=0))
-        song = self._select_song(guild_id, rng)
-        if song is None:
-            raise CatalogEmptyError(
-                "catalog_empty: no songs in the catalog (auto-refresh found none)"
-            )
-        offset = self._draw_offset(rng, song)
+        last_error: SnippetError | None = None
+        tried: set[int] = set()
+        for skip_count in range(MAX_AUTO_SKIPS + 1):
+            rng = random.Random(_seed(date_str, guild_id, skip_count))
+            song = self._select_song(guild_id, rng, exclude_song_ids=tried)
+            if song is None:
+                if last_error is None:
+                    raise CatalogEmptyError(
+                        "catalog_empty: no songs in the catalog (auto-refresh found none)"
+                    )
+                break  # catalog exhausted by failures; raise the last snippet error
+            if song.id in tried:
+                # Exclusion is best-effort — a tiny catalog may offer no
+                # untried alternative; re-trying a just-failed song in the
+                # same call cannot succeed.
+                break
+            offset = self._draw_offset(rng, song)
 
-        try:
-            cursor = self._db.execute(
-                "INSERT INTO challenges"
-                " (guild_id, channel_id, song_id, date, snippet_offset_sec, status,"
-                " created_at, skip_count) VALUES (?, ?, ?, ?, ?, 'active', ?, 0)",
-                (guild_id, channel_id, song.id, date_str, offset, self._utc_iso(now)),
-            )
-        except sqlite3.IntegrityError:
-            # Lost a race with a concurrent ensure for the same (guild, date):
-            # the UNIQUE constraint held; reuse the winner's row.
-            logger.info("challenge for (%s, %s) created concurrently; reusing", guild_id, date_str)
-            winner = self._challenge_row(guild_id, date_str)
-            if winner is None:  # pragma: no cover - defensive
-                raise EngineError("concurrent challenge insert vanished") from None
-            return self._build_challenge(winner, created=False)
+            try:
+                cursor = self._db.execute(
+                    "INSERT INTO challenges"
+                    " (guild_id, channel_id, song_id, date, snippet_offset_sec, status,"
+                    " created_at, skip_count) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                    (
+                        guild_id,
+                        channel_id,
+                        song.id,
+                        date_str,
+                        offset,
+                        self._utc_iso(now),
+                        skip_count,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Lost a race with a concurrent ensure for the same (guild, date):
+                # the UNIQUE constraint held; reuse the winner's row.
+                logger.info(
+                    "challenge for (%s, %s) created concurrently; reusing", guild_id, date_str
+                )
+                winner = self._challenge_row(guild_id, date_str)
+                if winner is None:  # pragma: no cover - defensive
+                    raise EngineError("concurrent challenge insert vanished") from None
+                return self._build_challenge(winner, created=False)
 
-        assert cursor.lastrowid is not None
-        row = self._challenge_row(guild_id, date_str)
-        assert row is not None
-        try:
-            return self._build_challenge(row, created=True)
-        except BaseException:
-            # Never leave a snippet-less challenge row behind.
-            self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
-            raise
+            assert cursor.lastrowid is not None
+            row = self._challenge_row(guild_id, date_str)
+            assert row is not None
+            try:
+                return self._build_challenge(row, created=True)
+            except SnippetError as exc:
+                # Auto-skip: this song cannot be snippeted right now; delete
+                # the fresh row and try the next deterministic pick.
+                self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
+                tried.add(song.id)
+                last_error = exc
+                logger.warning(
+                    "auto-skip %d/%d for guild %s on %s: snippet generation failed "
+                    "for song %r; trying the next deterministic pick (%s)",
+                    skip_count + 1,
+                    MAX_AUTO_SKIPS,
+                    guild_id,
+                    date_str,
+                    song.title,
+                    exc,
+                )
+            except BaseException:
+                # Never leave a snippet-less challenge row behind.
+                self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
+                raise
+        assert last_error is not None  # every break/loop-exit path sets it
+        raise last_error
 
     def _stale_active_rows(self, guild_id: str, today: str) -> list[ChallengeRow]:
         """Active challenges dated before ``today`` (ISO), most recent first."""
@@ -701,7 +765,7 @@ class GameEngine:
 
         skip_count = old.skip_count + 1
         rng = random.Random(_seed(date_str, guild_id, skip_count))
-        song = self._select_song(guild_id, rng, exclude_song_id=old.song_id)
+        song = self._select_song(guild_id, rng, exclude_song_ids={old.song_id})
         if song is None:  # pragma: no cover - a posted challenge implies songs exist
             raise CatalogEmptyError("catalog_empty: no songs in the catalog")
         offset = self._draw_offset(rng, song, exclude_offset=old.snippet_offset_sec)
