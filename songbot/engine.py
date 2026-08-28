@@ -13,8 +13,10 @@ announcement send succeeds) — ``skip_today_song`` (pinned decision #5), and
 
 Gameplay: ``unlock_snippet`` (per-user snippet ladder 0..4 with descending
 point potential), ``submit_guess`` (fuzzy matching, scoring with the pinned
-round-half-up both-bonus, guess log, wins/streaks — all atomic), and
-``leaderboard`` (total_points DESC, wins DESC, user_id ASC, scoring users
+round-half-up both-bonus, guess log, wins/streaks — all atomic; guesses
+past the daily limit are still processed, and a post-limit solve banks a
+flat ``POST_LIMIT_SOLVE_POINTS`` with no win/streak), and ``leaderboard``
+(total_points DESC, wins DESC, user_id ASC, scoring users
 only via ``total_points > 0``; effective streak computed on read, pinned #7).
 The first interaction (hear-more or a processed guess — the pinned-#13
 ``challenge_users`` upsert point) also registers a zero-valued ``user_stats``
@@ -57,6 +59,7 @@ from songbot.db import (
 from songbot.matching import match_guess
 
 __all__ = [
+    "POST_LIMIT_SOLVE_POINTS",
     "CatalogEmptyError",
     "Challenge",
     "EngineError",
@@ -89,16 +92,25 @@ UnlockRefusedReason = Literal["solved", "max_level", "closed"]
 """Why `unlock_snippet` refused: the challenge is closed (no longer active),
 the user already solved, or the user is at max level."""
 
+POST_LIMIT_SOLVE_POINTS = 10
+"""What a correct guess past the daily guess limit banks (flat, no bonus,
+no win/streak) — the player keeps playing after ``max_guesses_per_day``."""
+
 GuessOutcome = Literal[
-    "correct", "wrong", "already_solved", "limit_reached", "empty", "challenge_closed"
+    "correct", "correct_after_limit", "wrong", "already_solved", "empty",
+    "challenge_closed",
 ]
 """The result of a `submit_guess` submission.
 
 ``challenge_closed`` is the revealed-challenge lockout (VAL-GUESS-019): the
 challenge is no longer ``active``, so the submission is refused with zero
 mutation. ``empty`` is the pinned-#15 validation rejection (empty after
-stripping): never counted, never logged. ``already_solved``/``limit_reached``
-rejections are likewise not logged and do not consume a guess (pinned #13).
+stripping): never counted, never logged. The ``already_solved`` rejection is
+likewise not logged and does not consume a guess (pinned #13). Guesses past
+the daily limit are processed like normal ones: a wrong one is counted and
+logged as ``wrong``, and a correct one is ``correct_after_limit`` — it still
+marks the user solved (reveal winner, public announcement) but banks a flat
+``POST_LIMIT_SOLVE_POINTS`` with no win/streak.
 """
 
 
@@ -268,8 +280,10 @@ class GuessResult:
     """The outcome of one ``submit_guess`` submission.
 
     ``guesses_used``/``guesses_left`` reflect the state AFTER the submission
-    (unchanged for the ``already_solved``/``limit_reached``/``empty``
-    rejections). ``points_awarded`` is non-zero only for ``correct``.
+    (unchanged for the ``already_solved``/``empty`` rejections);
+    ``guesses_left`` clamps at 0 once the daily limit is exhausted.
+    ``points_awarded`` is non-zero only for ``correct`` and
+    ``correct_after_limit`` (the flat ``POST_LIMIT_SOLVE_POINTS``).
     ``announce`` is True exactly for the solving guess — per-user solves are
     singular, so every correct guess is the user's first (pinned: one public
     announcement per solve).
@@ -901,12 +915,16 @@ class GameEngine:
         with zero mutation (VAL-GUESS-019) — this lockout dominates every
         other refusal, including ``empty`` and ``already_solved``. An
         empty-after-strip guess is a validation rejection — not counted, not
-        logged, never matching (pinned #15). Post-solve and post-limit
-        submissions are rejected without state change or log rows
-        (pinned #13). Any other submission consumes one of the day's guesses
-        (the winning guess included) and is logged verbatim; as a first
-        interaction it also registers a zero-valued ``user_stats`` row
-        (VAL-SCORE-005). A correct guess
+        logged, never matching (pinned #15). Post-solve submissions are
+        rejected without state change or log rows (pinned #13). Any other
+        submission consumes one of the day's guesses (the winning guess
+        included) and is logged verbatim — submissions PAST the daily limit
+        are no longer refused: they count and log like normal guesses, and a
+        correct one (``correct_after_limit``) still marks the user solved
+        and fires the public announcement, but banks a flat
+        ``POST_LIMIT_SOLVE_POINTS`` and adds no win/streak. As a first
+        interaction a submission also registers a zero-valued ``user_stats``
+        row (VAL-SCORE-005). A correct guess within the limit
         banks ``SNIPPET_POINTS[level]`` — round-half-up x1.5 when one guess
         matches BOTH title and artist (pinned #6) — and updates
         ``user_stats`` (points, wins, streaks). All writes happen in one
@@ -960,17 +978,7 @@ class GameEngine:
                     announce=False,
                 )
             used = state.guesses_used if state is not None else 0
-            if used >= max_guesses:
-                return GuessResult(
-                    outcome="limit_reached",
-                    matched_title=False,
-                    matched_artist=False,
-                    is_both=False,
-                    guesses_used=used,
-                    guesses_left=0,
-                    points_awarded=0,
-                    announce=False,
-                )
+            over_limit = used >= max_guesses
 
             song = self._song_row(challenge.song_id)
             match = match_guess(stripped, song)
@@ -978,9 +986,15 @@ class GameEngine:
             created_at = self._utc_iso(now)
             level = state.snippet_level if state is not None else 0
             solved = match.is_correct
-            points = self._points_for_level(level) if solved else 0
-            if solved and match.is_both:
-                points = self._apply_bonus(points)
+            if solved and over_limit:
+                # Post-limit solve: flat award, no both-bonus, no win/streak.
+                points = POST_LIMIT_SOLVE_POINTS
+            elif solved:
+                points = self._points_for_level(level)
+                if match.is_both:
+                    points = self._apply_bonus(points)
+            else:
+                points = 0
             solved_at = created_at if solved else None
 
             self._ensure_user_stats_row(challenge.guild_id, user_id)
@@ -1007,18 +1021,26 @@ class GameEngine:
                     created_at,
                 ),
             )
-            if solved:
+            if solved and over_limit:
+                self._apply_points(challenge.guild_id, user_id, points)
+            elif solved:
                 self._apply_win(
                     challenge.guild_id, user_id, points, date.fromisoformat(challenge.date)
                 )
 
             return GuessResult(
-                outcome="correct" if solved else "wrong",
+                outcome=(
+                    "correct_after_limit"
+                    if solved and over_limit
+                    else "correct"
+                    if solved
+                    else "wrong"
+                ),
                 matched_title=match.matched_title,
                 matched_artist=match.matched_artist,
                 is_both=match.is_both,
                 guesses_used=new_used,
-                guesses_left=max_guesses - new_used,
+                guesses_left=max(0, max_guesses - new_used),
                 points_awarded=points,
                 announce=solved,
             )
@@ -1122,6 +1144,21 @@ class GameEngine:
                 points_awarded,
                 solved_at,
             ),
+        )
+
+    def _apply_points(self, guild_id: str, user_id: str, points: int) -> None:
+        """Bank points into ``user_stats`` WITHOUT a win/streak.
+
+        The post-limit solve counterpart to ``_apply_win``: a correct guess
+        past the daily limit still counts as solved (reveal winner, public
+        announcement) but only adds ``total_points`` — wins, streaks, and
+        ``last_win_date`` are untouched. The row is guaranteed to exist
+        (``_ensure_user_stats_row`` runs earlier in the same transaction).
+        """
+        self._db.execute(
+            "UPDATE user_stats SET total_points = total_points + ?"
+            " WHERE guild_id = ? AND user_id = ?",
+            (points, guild_id, user_id),
         )
 
     def _apply_win(

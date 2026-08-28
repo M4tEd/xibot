@@ -26,7 +26,10 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   normalization, plus a per-token fallback that forgives a typo in one token —
   including inside a combined title+artist guess and on short names like
   "Halo"); matching the title **or** the artist is correct. Feedback is
-  ephemeral; wrong guesses cost nothing. Max 6 guesses per player per day.
+  ephemeral; wrong guesses cost nothing. Each player has 6 full-value
+  guesses per day — after that, guesses are still accepted and a correct
+  one still solves (reveal winner + announcement) but banks a flat 10
+  points with no win/streak.
 - **Scoring & bonus** — a correct guess awards the points of the player's
   current snippet level. Naming **both** artist and title in a single guess
   earns a 1.5× bonus (rounded half-up: 75 → 113, 15 → 23). The first correct
@@ -145,7 +148,7 @@ error listing every problem.
 | `LOCAL_MUSIC_DIR` | `""` (disabled) | Directory of local audio files (mp3/m4a/flac/ogg) used as a song catalog; artist/title come from tags with an `Artist - Title.ext` filename fallback. Empty disables the local provider. For a self-contained demo point it at `./data/fixture-music` (a generated library of 8 synthetic 30s songs, gitignored — fresh clones recreate it with `.venv/bin/python scripts/generate_fixture_music.py`); for real use point it at your own music folder. |
 | `DAILY_POST_TIME` | `12:00` | Daily post time, strict zero-padded `HH:MM` (00:00–23:59) in `TIMEZONE`. |
 | `TIMEZONE` | `America/Halifax` | IANA timezone name governing post time, challenge dates, and streaks. |
-| `MAX_GUESSES_PER_DAY` | `6` | Guesses per player per challenge (≥ 1). Wrong guesses are free but count toward the limit; the winning guess counts too. |
+| `MAX_GUESSES_PER_DAY` | `6` | Full-value guesses per player per challenge (≥ 1). Wrong guesses are free but count toward the limit; the winning guess counts too. Guesses past the limit are still accepted — a correct one banks a flat 10 points with no win/streak. |
 | `SNIPPET_LENGTHS` | `1,2,4,8,16` | Comma-separated snippet durations in seconds (the hear-more ladder). First entry ships with the daily post. |
 | `SNIPPET_POINTS` | `100,75,50,30,15` | Comma-separated points per ladder level; must have the same number of entries as `SNIPPET_LENGTHS`. |
 | `BOTH_CORRECT_MULTIPLIER` | `1.5` | Score multiplier when one guess matches both artist and title (> 0; rounded half-up). |
