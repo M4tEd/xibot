@@ -23,13 +23,14 @@ from typing import Any
 import pytest
 
 from songbot.catalog.refresh import RefreshResult, SourceRefresh
-from songbot.db import Database
+from songbot.db import SCHEMA_VERSION, Database
 from songbot.engine import GameEngine
 from songbot.harness.cli import (
     HarnessContext,
     parse_now,
     parse_user,
     scenario_admin_fixsong,
+    scenario_admin_pingrole,
     scenario_admin_post,
     scenario_admin_reload,
     scenario_admin_setup,
@@ -500,6 +501,7 @@ class TestReset:
             "user_stats",
             "guild_settings",
             "song_overrides",
+            "ping_role_settings",
         ):
             row = ctx.db.query_one(f"SELECT COUNT(*) AS c FROM {table}")
             assert row is not None
@@ -507,7 +509,7 @@ class TestReset:
         snippet_dir = tmp_path / "snippets"
         assert list(snippet_dir.rglob("*.mp3")) == []
         # Migrations survive a reset (the schema itself is not wiped).
-        assert ctx.db.schema_version() == 4
+        assert ctx.db.schema_version() == SCHEMA_VERSION
 
     async def test_post_after_reset_works(self, ctx: HarnessContext, db: Database) -> None:
         _add_song(db)
@@ -597,6 +599,68 @@ class TestAdminSetup:
         row = db.query_one("SELECT channel_id FROM challenges")
         assert row is not None
         assert row["channel_id"] == "999888"
+
+
+class TestAdminPingRole:
+    """The admin-pingrole scenario drives the REAL /songbot-pingrole body."""
+
+    async def test_records_announcement_ack_and_persists_config(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        out = json_roundtrip(await scenario_admin_pingrole(ctx, ADMIN, "role-9", "🎵", DAY1))
+
+        assert kinds(out) == ["announcement", "ephemeral"]
+        announcement = out["payloads"][0]
+        assert "🎵" in announcement["content"]
+        assert "<@&role-9>" in announcement["content"]
+        ack = out["payloads"][1]
+        assert ack["recipient"] == "admin"
+        assert out["state"]["outcome"] == "ping_configured"
+        assert out["state"]["ping_role"] == {
+            "guild_id": "guild-1",
+            "channel_id": "channel-1",
+            "message_id": "harness-ping-announcement",
+            "role_id": "role-9",
+            "emoji": "🎵",
+        }
+        row = db.query_one("SELECT role_id FROM ping_role_settings WHERE guild_id = 'guild-1'")
+        assert row is not None
+        assert row["role_id"] == "role-9"
+
+    async def test_non_admin_denied_without_posting_or_persisting(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        out = json_roundtrip(await scenario_admin_pingrole(ctx, NON_ADMIN, "role-9", "🎵", DAY1))
+
+        assert kinds(out) == ["ephemeral"]
+        assert "manage server" in out["payloads"][0]["content"].lower()
+        assert out["state"]["outcome"] == "denied"
+        row = db.query_one("SELECT COUNT(*) AS c FROM ping_role_settings")
+        assert row is not None
+        assert row["c"] == 0
+
+    async def test_daily_post_mentions_the_role_once_configured(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_admin_pingrole(ctx, ADMIN, "role-9", "🎵", DAY1)
+
+        out = json_roundtrip(await scenario_post(ctx, DAY1))
+
+        assert kinds(out) == ["channel"]
+        assert out["payloads"][0]["content"] == "<@&role-9>"
+        # The embed is unchanged (the mention lives in the message content).
+        assert out["payloads"][0]["embed"]["title"].startswith("🎵 Daily Song")
+
+    async def test_daily_post_has_no_content_without_configuration(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+
+        out = json_roundtrip(await scenario_post(ctx, DAY1))
+
+        assert kinds(out) == ["channel"]
+        assert out["payloads"][0]["content"] is None
 
 
 class TestAdminPost:

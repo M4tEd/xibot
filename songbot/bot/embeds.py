@@ -20,6 +20,7 @@ import discord
 from songbot.catalog.refresh import RefreshResult
 from songbot.config import Settings
 from songbot.engine import (
+    POST_LIMIT_SOLVE_POINTS,
     Challenge,
     FixSongRefusedReason,
     GuessResult,
@@ -46,6 +47,7 @@ __all__ = [
     "HEAR_MORE_SOLVED_MESSAGE",
     "NO_ACTIVE_CHALLENGE_MESSAGE",
     "PERMISSION_DENIED_MESSAGE",
+    "PING_ROLE_FAILED_MESSAGE",
     "announcement_content",
     "daily_challenge_embed",
     "fixsong_ack_content",
@@ -55,6 +57,9 @@ __all__ = [
     "hear_more_content",
     "hear_more_refusal_content",
     "leaderboard_embed",
+    "ping_announcement_content",
+    "ping_mention_content",
+    "pingrole_ack_content",
     "reload_ack_content",
     "reveal_embed",
     "setup_ack_content",
@@ -122,6 +127,17 @@ ADMIN_NOT_CONFIGURED_MESSAGE = (
 )
 """Ephemeral ack when an admin command needs a channel the guild never configured."""
 
+PING_ROLE_FAILED_MESSAGE = (
+    "⚠️ Couldn't post the opt-in announcement — the channel send or the emoji "
+    "reaction failed (check the bot's permissions and that the emoji is valid). "
+    "Nothing was saved; please try again."
+)
+"""Ephemeral ack when /songbot-pingrole's announcement post fails.
+
+Generic on purpose: no transport internals. Nothing is persisted on failure,
+so a retry posts a fresh announcement from scratch.
+"""
+
 
 def format_seconds(seconds: float) -> str:
     """Format a snippet length compactly: 1.0 -> "1s", 2.5 -> "2.5s"."""
@@ -150,14 +166,16 @@ def daily_challenge_embed(challenge: Challenge, settings: Settings) -> discord.E
             "🏆 **Leaderboard** — see today's rankings\n\n"
             f"Right now you hear **{level0_seconds}** — a correct guess is worth "
             f"**{level0_points} points**. You have **{settings.max_guesses_per_day}** "
-            "guesses today."
+            "full-value guesses today — after that, a correct guess still banks "
+            f"**{POST_LIMIT_SOLVE_POINTS} points**."
         ),
         color=discord.Color.blurple(),
     )
     embed.set_footer(
         text=(
             f"Snippet: {level0_seconds} • Worth {level0_points} points • "
-            f"{settings.max_guesses_per_day} guesses per day"
+            f"{settings.max_guesses_per_day} full-value guesses per day, "
+            f"then {POST_LIMIT_SOLVE_POINTS} pts per solve"
         )
     )
     return embed
@@ -211,15 +229,19 @@ def leaderboard_embed(entries: Sequence[LeaderboardEntry]) -> discord.Embed:
     )
 
 
-def announcement_content(user_id: str, guesses_used: int, points_awarded: int) -> str:
+def announcement_content(user_id: str, result: GuessResult, settings: Settings) -> str:
     """The public first-solve announcement (VAL-GUESS-012).
 
     Uses the ``<@user_id>`` mention format and NEVER names the song (pinned #9).
+    Reports the snippet length the solver was hearing at solve time
+    (``result.snippet_level`` mapped through the configured ladder), formatted
+    with `format_seconds`.
     """
-    guess_word = "guess" if guesses_used == 1 else "guesses"
+    guess_word = "guess" if result.guesses_used == 1 else "guesses"
+    seconds = format_seconds(settings.snippet_lengths[result.snippet_level])
     return (
-        f"🎉 <@{user_id}> guessed today's song in {guesses_used} {guess_word} "
-        f"for **{points_awarded} points**!"
+        f"🎉 <@{user_id}> guessed today's song in {result.guesses_used} {guess_word} "
+        f"for **{result.points_awarded} points** while hearing **{seconds}** of audio!"
     )
 
 
@@ -248,19 +270,23 @@ def guess_feedback_content(result: GuessResult, mode: GuessMatchMode = "either")
             f"✅ Correct — you matched {matched} "
             f"**{result.points_awarded} points** banked."
         )
+    if result.outcome == "correct_after_limit":
+        return (
+            "✅ Correct — you're past today's full-value guesses, so this banks "
+            f"**{result.points_awarded} points** (no win or streak)."
+        )
     if result.outcome == "wrong":
         if result.guesses_left > 0:
             return (
                 f"❌ Not quite — **{result.guesses_left}** "
                 f"{'guess' if result.guesses_left == 1 else 'guesses'} left today."
             )
-        return "❌ Not quite — that was your **last guess** for today (0 left)."
+        return (
+            "❌ Not quite — you're out of full-value guesses, but you can keep "
+            f"trying: a correct guess still banks **{POST_LIMIT_SOLVE_POINTS} points**."
+        )
     if result.outcome == "already_solved":
         return "✅ You've already solved today's song!"
-    if result.outcome == "limit_reached":
-        return (
-            f"❌ No guesses left — you've used all {result.guesses_used} for today."
-        )
     if result.outcome == "empty":
         return EMPTY_GUESS_MESSAGE
     return CHALLENGE_CLOSED_MESSAGE
@@ -305,6 +331,41 @@ def setup_ack_content(channel_mention: str, settings: Settings) -> str:
         f"(**{settings.daily_post_time} {settings.timezone}**) — or post one "
         "right now with /songbot-post."
     )
+
+
+def ping_announcement_content(emoji: str, role_mention: str) -> str:
+    """The public opt-in announcement posted by /songbot-pingrole.
+
+    Names the role and the emoji but NEVER any song (pinned #9 is trivially
+    preserved — no song identity crosses this builder). Users react with the
+    emoji to receive the role; removing the reaction removes the role.
+    """
+    return (
+        "🎵 **Want a ping when the daily song drops?**\n"
+        f"React with {emoji} to get the {role_mention} role — you'll be "
+        "mentioned in every daily challenge post. Remove your reaction "
+        "anytime to opt out."
+    )
+
+
+def pingrole_ack_content(role_mention: str, emoji: str) -> str:
+    """The ephemeral ack for /songbot-pingrole: what was set up."""
+    return (
+        f"✅ Opt-in announcement posted. Reacting with {emoji} now grants the "
+        f"{role_mention} role (removing the reaction revokes it), and daily "
+        "challenge posts will mention it.\n"
+        "Re-running /songbot-pingrole posts a fresh announcement and "
+        "supersedes the old one."
+    )
+
+
+def ping_mention_content(role_id: str) -> str:
+    """The daily post's message content when a ping role is configured.
+
+    The ``<@&role_id>`` mention pings the role's members (role mentions are
+    explicitly allowed on that send); the embed carries all the copy.
+    """
+    return f"<@&{role_id}>"
 
 
 def skip_refusal_content(reason: SkipRefusedReason) -> str:

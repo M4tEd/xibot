@@ -1,10 +1,11 @@
 """Guess normalization + rapidfuzz fuzzy matching.
 
 ``normalize`` folds a guess or song field to a canonical comparison form:
-NFKD unicode-fold to ASCII (Beyoncé -> beyonce, CJK brackets handled),
-lowercase, bracketed sections (``(...)``, ``[...]``, ``{...}``, ``【...】``)
-removed, punctuation collapsed to whitespace, and noise tokens (``feat`` /
-``ft`` / ``featuring`` / ``remaster`` / ``remastered``) dropped.
+NFKD diacritic folding (Beyoncé -> beyonce, CJK brackets handled, CJK
+scripts preserved), lowercase, bracketed sections (``(...)``, ``[...]``,
+``{...}``, ``【...】``) removed, punctuation collapsed to whitespace, and
+noise tokens (``feat`` / ``ft`` / ``featuring`` / ``remaster`` /
+``remastered``) dropped.
 
 ``match_guess`` compares the normalized guess with rapidfuzz
 ``fuzz.token_set_ratio`` against the normalized title, artist, and — as a
@@ -107,14 +108,22 @@ def normalize(text: str) -> str:
     """Fold ``text`` to its canonical comparison form.
 
     Steps: NFKD decomposition, bracketed-section removal (before the ASCII
-    fold so CJK brackets survive to be removed), ASCII fold (drops combining
-    marks and any remaining non-ASCII), lowercase, punctuation to whitespace,
-    noise-token removal, whitespace collapse.
+    fold so CJK brackets survive to be removed), diacritic stripping that
+    preserves non-Latin scripts (CJK kana voicing marks are kept), lowercase,
+    punctuation to whitespace, noise-token removal, whitespace collapse.
     """
     text = unicodedata.normalize("NFKD", text)
     text = _BRACKETED_RE.sub(" ", text)
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = _NON_ALNUM_RE.sub(" ", text.lower())
+    # Strip combining marks (accents) but keep kana voicing marks (U+3099/309A)
+    # so "Beyoncé" -> "Beyonce" while "が" stays "が".
+    filtered: list[str] = []
+    for ch in text:
+        if unicodedata.category(ch) == "Mn" and ch not in ("\u3099", "\u309a"):
+            continue
+        filtered.append(ch)
+    text = unicodedata.normalize("NFC", "".join(filtered))
+    # Unicode-aware alnum split: keep letters/numbers from any script (CJK etc.)
+    text = "".join(ch if ch.isalnum() else " " for ch in text.lower())
     tokens = [token for token in text.split() if token not in _NOISE_TOKENS]
     return " ".join(tokens)
 

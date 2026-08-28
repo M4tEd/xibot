@@ -4,7 +4,8 @@ Pure Python — never imports discord, performs I/O only via db/snippets/catalog
 
 Daily lifecycle: ``ensure_today_challenge`` (idempotent per (guild, local
 date), no-repeat song selection with history reset, deterministic seeded
-song+offset picks, catalog auto-bootstrap, snippet cache re-heal), the
+song+offset picks, catalog auto-bootstrap, snippet cache re-heal, bounded
+auto-skip of unsnippable fresh picks — issue #11), the
 pinned-#17 delivery-coupled reveal split — ``peek_reveal`` (read-only:
 compute the stale challenge's song + winners in solve order, zero mutation)
 and ``mark_revealed`` (the mutation the caller applies ONLY after the reveal
@@ -13,8 +14,10 @@ announcement send succeeds) — ``skip_today_song`` (pinned decision #5), and
 
 Gameplay: ``unlock_snippet`` (per-user snippet ladder 0..4 with descending
 point potential), ``submit_guess`` (fuzzy matching, scoring with the pinned
-round-half-up both-bonus, guess log, wins/streaks — all atomic), and
-``leaderboard`` (total_points DESC, wins DESC, user_id ASC, scoring users
+round-half-up both-bonus, guess log, wins/streaks — all atomic; guesses
+past the daily limit are still processed, and a post-limit solve banks a
+flat ``POST_LIMIT_SOLVE_POINTS`` with no win/streak), and ``leaderboard``
+(total_points DESC, wins DESC, user_id ASC, scoring users
 only via ``total_points > 0``; effective streak computed on read, pinned #7).
 The first interaction (hear-more or a processed guess — the pinned-#13
 ``challenge_users`` upsert point) also registers a zero-valued ``user_stats``
@@ -35,7 +38,7 @@ import hashlib
 import logging
 import random
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -51,12 +54,16 @@ from songbot.db import (
     ChallengeUserRow,
     Database,
     GuildSettingsRow,
+    PingRoleRow,
     SongRow,
     UserStatsRow,
 )
 from songbot.matching import match_guess
+from songbot.snippets import SnippetError
 
 __all__ = [
+    "MAX_AUTO_SKIPS",
+    "POST_LIMIT_SOLVE_POINTS",
     "CatalogEmptyError",
     "Challenge",
     "EngineError",
@@ -79,6 +86,16 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+MAX_AUTO_SKIPS = 3
+"""Automatic song replacements per `ensure_today_challenge` call (issue #11).
+
+When snippet generation fails for a FRESHLY created challenge (e.g. a
+googlevideo 403 on the day's pick), the next deterministic pick is tried
+instead of retrying the identical song+offset on every scheduler tick until
+a manual skip. The bound caps the songs one call burns through; if all fail,
+the last error propagates and the caller's normal retry cadence applies.
+"""
+
 SkipRefusedReason = Literal["no_challenge", "revealed", "solved"]
 """Why `skip_today_song` refused (pinned decision #5)."""
 
@@ -89,16 +106,25 @@ UnlockRefusedReason = Literal["solved", "max_level", "closed"]
 """Why `unlock_snippet` refused: the challenge is closed (no longer active),
 the user already solved, or the user is at max level."""
 
+POST_LIMIT_SOLVE_POINTS = 10
+"""What a correct guess past the daily guess limit banks (flat, no bonus,
+no win/streak) — the player keeps playing after ``max_guesses_per_day``."""
+
 GuessOutcome = Literal[
-    "correct", "wrong", "already_solved", "limit_reached", "empty", "challenge_closed"
+    "correct", "correct_after_limit", "wrong", "already_solved", "empty",
+    "challenge_closed",
 ]
 """The result of a `submit_guess` submission.
 
 ``challenge_closed`` is the revealed-challenge lockout (VAL-GUESS-019): the
 challenge is no longer ``active``, so the submission is refused with zero
 mutation. ``empty`` is the pinned-#15 validation rejection (empty after
-stripping): never counted, never logged. ``already_solved``/``limit_reached``
-rejections are likewise not logged and do not consume a guess (pinned #13).
+stripping): never counted, never logged. The ``already_solved`` rejection is
+likewise not logged and does not consume a guess (pinned #13). Guesses past
+the daily limit are processed like normal ones: a wrong one is counted and
+logged as ``wrong``, and a correct one is ``correct_after_limit`` — it still
+marks the user solved (reveal winner, public announcement) but banks a flat
+``POST_LIMIT_SOLVE_POINTS`` with no win/streak.
 """
 
 
@@ -268,11 +294,16 @@ class GuessResult:
     """The outcome of one ``submit_guess`` submission.
 
     ``guesses_used``/``guesses_left`` reflect the state AFTER the submission
-    (unchanged for the ``already_solved``/``limit_reached``/``empty``
-    rejections). ``points_awarded`` is non-zero only for ``correct``.
-    ``announce`` is True exactly for the solving guess — per-user solves are
-    singular, so every correct guess is the user's first (pinned: one public
-    announcement per solve).
+    (unchanged for the ``already_solved``/``empty`` rejections);
+    ``guesses_left`` clamps at 0 once the daily limit is exhausted.
+    ``points_awarded`` is non-zero only for ``correct`` and
+    ``correct_after_limit`` (the flat ``POST_LIMIT_SOLVE_POINTS``).
+    ``snippet_level`` is the user's snippet level when the submission was
+    processed — for ``correct``, the level the solver was actually hearing at
+    solve time (the ladder rung that scored), which the public solve
+    announcement reports as a snippet length. ``announce`` is True exactly
+    for the solving guess — per-user solves are singular, so every correct
+    guess is the user's first (pinned: one public announcement per solve).
     """
 
     outcome: GuessOutcome
@@ -282,6 +313,7 @@ class GuessResult:
     guesses_used: int
     guesses_left: int
     points_awarded: int
+    snippet_level: int
     announce: bool
 
 
@@ -453,9 +485,69 @@ class GameEngine:
         """Drop a guild's configuration (the bot left the guild).
 
         Challenge/score history is KEPT — re-adding the bot and re-running
-        /songbot-setup resumes the guild's game where it left off.
+        /songbot-setup resumes the guild's game where it left off. The
+        guild's `ping_role_settings` row (if any) cascades away with the
+        `guild_settings` row.
         """
         self._db.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
+
+    # -- ping-role configuration (reaction-role opt-in) -----------------------
+
+    def set_ping_role(
+        self,
+        guild_id: str,
+        channel_id: str,
+        message_id: str,
+        role_id: str,
+        emoji: str,
+        *,
+        set_by: str,
+        now: datetime,
+    ) -> PingRoleRow:
+        """Upsert a guild's reaction-role opt-in config; return the stored row.
+
+        Used by /songbot-pingrole after the announcement message is posted
+        (``message_id`` is the announcement the reaction listeners watch). A
+        re-configuration keeps the original ``created_at``, refreshes
+        ``updated_at``, and supersedes the previous announcement (reactions
+        on the old message no longer match any watched message id).
+        """
+        iso_now = self._utc_iso(now)
+        with self._db.transaction():
+            self._db.execute(
+                "INSERT INTO ping_role_settings"
+                " (guild_id, channel_id, message_id, role_id, emoji, set_by,"
+                " created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(guild_id) DO UPDATE SET"
+                " channel_id = excluded.channel_id, message_id = excluded.message_id,"
+                " role_id = excluded.role_id, emoji = excluded.emoji,"
+                " set_by = excluded.set_by, updated_at = excluded.updated_at",
+                (guild_id, channel_id, message_id, role_id, emoji, set_by, iso_now, iso_now),
+            )
+        row = self.ping_role_settings(guild_id)
+        if row is None:  # pragma: no cover - the upsert just wrote it
+            raise EngineError(f"ping_role_settings upsert lost guild {guild_id}")
+        return row
+
+    def ping_role_settings(self, guild_id: str) -> PingRoleRow | None:
+        """A guild's reaction-role opt-in config, or None when not set up."""
+        row = self._db.query_one(
+            "SELECT * FROM ping_role_settings WHERE guild_id = ?", (guild_id,)
+        )
+        return PingRoleRow.from_row(row) if row is not None else None
+
+    def ping_role_for_message(self, message_id: str) -> PingRoleRow | None:
+        """The opt-in config watching ``message_id``, or None.
+
+        The reaction listeners dispatch on the reacted message's id: only
+        reactions on a configured announcement (and only with the configured
+        emoji) grant or revoke the role.
+        """
+        row = self._db.query_one(
+            "SELECT * FROM ping_role_settings WHERE message_id = ?", (message_id,)
+        )
+        return PingRoleRow.from_row(row) if row is not None else None
 
     def latest_challenge_id(self, guild_id: str) -> int | None:
         """The id of the guild's most recent challenge (persistent-view binding)."""
@@ -473,13 +565,13 @@ class GameEngine:
         guild_id: str,
         rng: random.Random,
         *,
-        exclude_song_id: int | None = None,
+        exclude_song_ids: Collection[int] = (),
     ) -> SongRow | None:
         """Pick a song for `guild_id`: no repeats until exhausted, then reset.
 
         Eligible = catalog songs never used by this guild; when empty, the
-        history resets and all songs are eligible again. ``exclude_song_id``
-        (skip-song) additionally bars the just-skipped song from the re-pick
+        history resets and all songs are eligible again. ``exclude_song_ids``
+        (skip-song / auto-skip) additionally bars those songs from the pick
         whenever any alternative exists. Returns None iff the catalog is empty.
         """
         songs = [
@@ -497,8 +589,8 @@ class GameEngine:
         eligible = [song for song in songs if song.id not in used]
         if not eligible:
             eligible = songs  # catalog exhausted for this guild: history resets
-        if exclude_song_id is not None:
-            narrowed = [song for song in eligible if song.id != exclude_song_id]
+        if exclude_song_ids:
+            narrowed = [song for song in eligible if song.id not in exclude_song_ids]
             if narrowed:
                 eligible = narrowed
         return eligible[rng.randrange(len(eligible))]
@@ -540,6 +632,19 @@ class GameEngine:
         (pinned #11 bootstrap); a still-empty catalog raises
         ``CatalogEmptyError`` without inserting any row. A snippet-generation
         failure likewise leaves no row behind.
+
+        Auto-skip (issue #11): when snippet generation fails for a FRESHLY
+        created row (``SnippetError`` — e.g. a googlevideo 403 on the day's
+        pick), the row is deleted and the next deterministic pick
+        (``skip_count`` + 1, failed songs excluded) is tried instead, up to
+        ``MAX_AUTO_SKIPS`` times per call — the scheduler otherwise retries
+        the identical song+offset every 60s until a manual skip. The
+        surviving row carries the ``skip_count`` it took, so a later manual
+        skip continues the same deterministic chain. Only fresh rows are
+        auto-skipped: a pre-existing row's re-heal failure propagates
+        untouched (that challenge may already be posted; ``skip_today_song``
+        is the remedy there). If every attempt fails, the last
+        ``SnippetError`` propagates.
         """
         date_str = self._local_date(now).isoformat()
 
@@ -560,39 +665,77 @@ class GameEngine:
                 else:
                     logger.warning("catalog bootstrap (%s) failed: %s", source.source, source.error)
 
-        rng = random.Random(_seed(date_str, guild_id, skip_count=0))
-        song = self._select_song(guild_id, rng)
-        if song is None:
-            raise CatalogEmptyError(
-                "catalog_empty: no songs in the catalog (auto-refresh found none)"
-            )
-        offset = self._draw_offset(rng, song)
+        last_error: SnippetError | None = None
+        tried: set[int] = set()
+        for skip_count in range(MAX_AUTO_SKIPS + 1):
+            rng = random.Random(_seed(date_str, guild_id, skip_count))
+            song = self._select_song(guild_id, rng, exclude_song_ids=tried)
+            if song is None:
+                if last_error is None:
+                    raise CatalogEmptyError(
+                        "catalog_empty: no songs in the catalog (auto-refresh found none)"
+                    )
+                break  # catalog exhausted by failures; raise the last snippet error
+            if song.id in tried:
+                # Exclusion is best-effort — a tiny catalog may offer no
+                # untried alternative; re-trying a just-failed song in the
+                # same call cannot succeed.
+                break
+            offset = self._draw_offset(rng, song)
 
-        try:
-            cursor = self._db.execute(
-                "INSERT INTO challenges"
-                " (guild_id, channel_id, song_id, date, snippet_offset_sec, status,"
-                " created_at, skip_count) VALUES (?, ?, ?, ?, ?, 'active', ?, 0)",
-                (guild_id, channel_id, song.id, date_str, offset, self._utc_iso(now)),
-            )
-        except sqlite3.IntegrityError:
-            # Lost a race with a concurrent ensure for the same (guild, date):
-            # the UNIQUE constraint held; reuse the winner's row.
-            logger.info("challenge for (%s, %s) created concurrently; reusing", guild_id, date_str)
-            winner = self._challenge_row(guild_id, date_str)
-            if winner is None:  # pragma: no cover - defensive
-                raise EngineError("concurrent challenge insert vanished") from None
-            return self._build_challenge(winner, created=False)
+            try:
+                cursor = self._db.execute(
+                    "INSERT INTO challenges"
+                    " (guild_id, channel_id, song_id, date, snippet_offset_sec, status,"
+                    " created_at, skip_count) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                    (
+                        guild_id,
+                        channel_id,
+                        song.id,
+                        date_str,
+                        offset,
+                        self._utc_iso(now),
+                        skip_count,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Lost a race with a concurrent ensure for the same (guild, date):
+                # the UNIQUE constraint held; reuse the winner's row.
+                logger.info(
+                    "challenge for (%s, %s) created concurrently; reusing", guild_id, date_str
+                )
+                winner = self._challenge_row(guild_id, date_str)
+                if winner is None:  # pragma: no cover - defensive
+                    raise EngineError("concurrent challenge insert vanished") from None
+                return self._build_challenge(winner, created=False)
 
-        assert cursor.lastrowid is not None
-        row = self._challenge_row(guild_id, date_str)
-        assert row is not None
-        try:
-            return self._build_challenge(row, created=True)
-        except BaseException:
-            # Never leave a snippet-less challenge row behind.
-            self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
-            raise
+            assert cursor.lastrowid is not None
+            row = self._challenge_row(guild_id, date_str)
+            assert row is not None
+            try:
+                return self._build_challenge(row, created=True)
+            except SnippetError as exc:
+                # Auto-skip: this song cannot be snippeted right now; delete
+                # the fresh row and try the next deterministic pick.
+                self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
+                tried.add(song.id)
+                last_error = exc
+                logger.warning(
+                    "auto-skip %d/%d for guild %s on %s: snippet generation failed "
+                    "for song %r; trying the next deterministic pick (%s)",
+                    skip_count + 1,
+                    MAX_AUTO_SKIPS,
+                    guild_id,
+                    date_str,
+                    song.title,
+                    exc,
+                )
+            except BaseException:
+                # Never leave a snippet-less challenge row behind.
+                self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
+                raise
+        assert last_error is not None  # every break/loop-exit path sets it
+        raise last_error
 
     def _stale_active_rows(self, guild_id: str, today: str) -> list[ChallengeRow]:
         """Active challenges dated before ``today`` (ISO), most recent first."""
@@ -701,7 +844,7 @@ class GameEngine:
 
         skip_count = old.skip_count + 1
         rng = random.Random(_seed(date_str, guild_id, skip_count))
-        song = self._select_song(guild_id, rng, exclude_song_id=old.song_id)
+        song = self._select_song(guild_id, rng, exclude_song_ids={old.song_id})
         if song is None:  # pragma: no cover - a posted challenge implies songs exist
             raise CatalogEmptyError("catalog_empty: no songs in the catalog")
         offset = self._draw_offset(rng, song, exclude_offset=old.snippet_offset_sec)
@@ -901,17 +1044,22 @@ class GameEngine:
         with zero mutation (VAL-GUESS-019) — this lockout dominates every
         other refusal, including ``empty`` and ``already_solved``. An
         empty-after-strip guess is a validation rejection — not counted, not
-        logged, never matching (pinned #15). Post-solve and post-limit
-        submissions are rejected without state change or log rows
-        (pinned #13). Any other submission consumes one of the day's guesses
-        (the winning guess included) and is logged verbatim; as a first
-        interaction it also registers a zero-valued ``user_stats`` row
-        (VAL-SCORE-005). What counts as correct is governed by the configured
-        ``guess_match_mode`` (title only, artist only, or either). A correct
-        guess banks ``SNIPPET_POINTS[level]`` — round-half-up x1.5 when one
-        guess matches BOTH title and artist (pinned #6; ``either`` mode only)
-        — and updates ``user_stats`` (points, wins, streaks). All writes
-        happen in one transaction.
+        logged, never matching (pinned #15). Post-solve submissions are
+        rejected without state change or log rows (pinned #13). Any other
+        submission consumes one of the day's guesses (the winning guess
+        included) and is logged verbatim — submissions PAST the daily limit
+        are no longer refused: they count and log like normal guesses, and a
+        correct one (``correct_after_limit``) still marks the user solved
+        and fires the public announcement, but banks a flat
+        ``POST_LIMIT_SOLVE_POINTS`` and adds no win/streak. As a first
+        interaction a submission also registers a zero-valued ``user_stats``
+        row (VAL-SCORE-005). What counts as correct is governed by the
+        configured ``guess_match_mode`` (title only, artist only, or either).
+        A correct guess within the limit
+        banks ``SNIPPET_POINTS[level]`` — round-half-up x1.5 when one guess
+        matches BOTH title and artist (pinned #6; ``either`` mode only) — and
+        updates ``user_stats`` (points, wins, streaks). All writes happen in
+        one transaction.
         """
         challenge = self._challenge_row_by_id(challenge_id)
         max_guesses = self._settings.max_guesses_per_day
@@ -929,6 +1077,7 @@ class GameEngine:
                 guesses_used=used,
                 guesses_left=max_guesses - used,
                 points_awarded=0,
+                snippet_level=state.snippet_level if state is not None else 0,
                 announce=False,
             )
 
@@ -944,6 +1093,7 @@ class GameEngine:
                 guesses_used=used,
                 guesses_left=max_guesses - used,
                 points_awarded=0,
+                snippet_level=state.snippet_level if state is not None else 0,
                 announce=False,
             )
 
@@ -958,20 +1108,11 @@ class GameEngine:
                     guesses_used=state.guesses_used,
                     guesses_left=max_guesses - state.guesses_used,
                     points_awarded=0,
+                    snippet_level=state.snippet_level,
                     announce=False,
                 )
             used = state.guesses_used if state is not None else 0
-            if used >= max_guesses:
-                return GuessResult(
-                    outcome="limit_reached",
-                    matched_title=False,
-                    matched_artist=False,
-                    is_both=False,
-                    guesses_used=used,
-                    guesses_left=0,
-                    points_awarded=0,
-                    announce=False,
-                )
+            over_limit = used >= max_guesses
 
             song = self._song_row(challenge.song_id)
             match = match_guess(stripped, song, mode=self._settings.guess_match_mode)
@@ -979,9 +1120,15 @@ class GameEngine:
             created_at = self._utc_iso(now)
             level = state.snippet_level if state is not None else 0
             solved = match.is_correct
-            points = self._points_for_level(level) if solved else 0
-            if solved and match.is_both:
-                points = self._apply_bonus(points)
+            if solved and over_limit:
+                # Post-limit solve: flat award, no both-bonus, no win/streak.
+                points = POST_LIMIT_SOLVE_POINTS
+            elif solved:
+                points = self._points_for_level(level)
+                if match.is_both:
+                    points = self._apply_bonus(points)
+            else:
+                points = 0
             solved_at = created_at if solved else None
 
             self._ensure_user_stats_row(challenge.guild_id, user_id)
@@ -1008,19 +1155,28 @@ class GameEngine:
                     created_at,
                 ),
             )
-            if solved:
+            if solved and over_limit:
+                self._apply_points(challenge.guild_id, user_id, points)
+            elif solved:
                 self._apply_win(
                     challenge.guild_id, user_id, points, date.fromisoformat(challenge.date)
                 )
 
             return GuessResult(
-                outcome="correct" if solved else "wrong",
+                outcome=(
+                    "correct_after_limit"
+                    if solved and over_limit
+                    else "correct"
+                    if solved
+                    else "wrong"
+                ),
                 matched_title=match.matched_title,
                 matched_artist=match.matched_artist,
                 is_both=match.is_both,
                 guesses_used=new_used,
-                guesses_left=max_guesses - new_used,
+                guesses_left=max(0, max_guesses - new_used),
                 points_awarded=points,
+                snippet_level=level,
                 announce=solved,
             )
 
@@ -1123,6 +1279,21 @@ class GameEngine:
                 points_awarded,
                 solved_at,
             ),
+        )
+
+    def _apply_points(self, guild_id: str, user_id: str, points: int) -> None:
+        """Bank points into ``user_stats`` WITHOUT a win/streak.
+
+        The post-limit solve counterpart to ``_apply_win``: a correct guess
+        past the daily limit still counts as solved (reveal winner, public
+        announcement) but only adds ``total_points`` — wins, streaks, and
+        ``last_win_date`` are untouched. The row is guaranteed to exist
+        (``_ensure_user_stats_row`` runs earlier in the same transaction).
+        """
+        self._db.execute(
+            "UPDATE user_stats SET total_points = total_points + ?"
+            " WHERE guild_id = ? AND user_id = ?",
+            (points, guild_id, user_id),
         )
 
     def _apply_win(

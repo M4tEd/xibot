@@ -22,8 +22,8 @@ from typing import Protocol, cast
 import discord
 
 from songbot.bot.embeds import announcement_content, guess_feedback_content
+from songbot.config import Settings
 from songbot.engine import GameEngine
-from songbot.matching import GuessMatchMode
 
 __all__ = ["Clock", "GuessModal", "utc_now"]
 
@@ -70,13 +70,13 @@ class GuessModal(discord.ui.Modal):
         engine: GameEngine,
         challenge_id: int,
         *,
-        mode: GuessMatchMode = "either",
+        settings: Settings,
         clock: Clock | None = None,
     ) -> None:
         super().__init__(title="Guess the song")
         self._engine = engine
         self._challenge_id = challenge_id
-        self._mode = mode
+        self._settings = settings
         self._clock: Clock = clock if clock is not None else utc_now
 
     async def on_submit(self, interaction: discord.Interaction[discord.Client], /) -> None:
@@ -91,14 +91,12 @@ class GuessModal(discord.ui.Modal):
             self._challenge_id, user_id, self.guess.value, self._clock()
         )
         await interaction.response.send_message(
-            guess_feedback_content(result, self._mode), ephemeral=True
+            guess_feedback_content(result, self._settings.guess_match_mode), ephemeral=True
         )
         if result.announce:
             await self._announce(
                 interaction,
-                announcement_content(
-                    user_id, result.guesses_used, result.points_awarded
-                ),
+                announcement_content(user_id, result, self._settings),
             )
 
     async def _announce(

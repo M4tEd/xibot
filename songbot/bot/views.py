@@ -13,6 +13,7 @@ the modal) ``interaction.channel``. Buttons are pressed by custom_id:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import cast
 
@@ -136,7 +137,12 @@ class DailyChallengeView(discord.ui.View):
         challenge_id, _ = target
         user_id = str(interaction.user.id)
         try:
-            result = self._engine.unlock_snippet(challenge_id, user_id)
+            # Snippet generation can run ffmpeg/yt-dlp for seconds or minutes
+            # (pinned #14 re-heal on every unlock); keep it off the event loop
+            # so the bot can still ack interactions within Discord's 3s window.
+            result = await asyncio.to_thread(
+                self._engine.unlock_snippet, challenge_id, user_id
+            )
         except UnlockRefusedError as exc:
             await interaction.response.send_message(
                 hear_more_refusal_content(exc.reason, self._settings), ephemeral=True
@@ -168,12 +174,7 @@ class DailyChallengeView(discord.ui.View):
             return
         challenge_id, _ = target
         await interaction.response.send_modal(
-            GuessModal(
-                self._engine,
-                challenge_id,
-                mode=self._settings.guess_match_mode,
-                clock=self._clock,
-            )
+            GuessModal(self._engine, challenge_id, settings=self._settings, clock=self._clock)
         )
 
     @discord.ui.button(

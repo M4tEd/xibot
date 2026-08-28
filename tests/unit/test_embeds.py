@@ -21,6 +21,7 @@ from songbot.bot.embeds import (
     CHALLENGE_CLOSED_MESSAGE,
     announcement_content,
     daily_challenge_embed,
+    format_seconds,
     guess_feedback_content,
     hear_more_content,
     hear_more_refusal_content,
@@ -216,21 +217,56 @@ class TestLeaderboardEmbed:
             assert f"{rank}." in text
 
 
+def _solve_result(**overrides: object) -> GuessResult:
+    """A correct-guess `GuessResult` for announcement tests (level 0 by default)."""
+    base: dict[str, object] = {
+        "outcome": "correct",
+        "matched_title": True,
+        "matched_artist": False,
+        "is_both": False,
+        "guesses_used": 1,
+        "guesses_left": 5,
+        "points_awarded": 100,
+        "snippet_level": 0,
+        "announce": True,
+    }
+    base.update(overrides)
+    return GuessResult(**base)  # type: ignore[arg-type]
+
+
 class TestAnnouncementContent:
-    def test_mention_format_and_singular_guess(self) -> None:
-        content = announcement_content("1001", guesses_used=1, points_awarded=100)
+    def test_mention_format_and_singular_guess(self, tmp_path: Path) -> None:
+        content = announcement_content("1001", _solve_result(), _settings(tmp_path))
         assert "<@1001>" in content
         assert "1 guess" in content
         assert "100" in content
         assert content.startswith("🎉")
 
-    def test_plural_guesses(self) -> None:
-        content = announcement_content("1002", guesses_used=3, points_awarded=75)
+    def test_plural_guesses(self, tmp_path: Path) -> None:
+        content = announcement_content(
+            "1002", _solve_result(guesses_used=3, points_awarded=75), _settings(tmp_path)
+        )
         assert "3 guesses" in content
         assert "75" in content
 
-    def test_never_contains_song_identity(self) -> None:
-        content = announcement_content("1001", guesses_used=2, points_awarded=100).lower()
+    def test_includes_snippet_length_heard_at_solve(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        content = announcement_content("1001", _solve_result(snippet_level=2), settings)
+        # Level 2 of the configured ladder is 4s, formatted with format_seconds.
+        assert format_seconds(settings.snippet_lengths[2]) in content
+        assert "**4s** of audio" in content
+
+    def test_snippet_length_tracks_the_solve_level(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path)
+        level_zero = announcement_content("1001", _solve_result(snippet_level=0), settings)
+        level_four = announcement_content("1001", _solve_result(snippet_level=4), settings)
+        assert "1s" in level_zero
+        assert "16s" in level_four
+
+    def test_never_contains_song_identity(self, tmp_path: Path) -> None:
+        content = announcement_content(
+            "1001", _solve_result(guesses_used=2), _settings(tmp_path)
+        ).lower()
         assert "neon skyline" not in content
         assert "midnight circuit" not in content
 
@@ -245,6 +281,7 @@ class TestGuessFeedbackContent:
             "guesses_used": 1,
             "guesses_left": 5,
             "points_awarded": 0,
+            "snippet_level": 0,
             "announce": False,
         }
         base.update(overrides)
@@ -287,22 +324,32 @@ class TestGuessFeedbackContent:
         assert "❌" in content
         assert "5" in content
 
-    def test_wrong_last_guess_says_limit_reached(self) -> None:
+    def test_wrong_past_the_limit_offers_10_point_mode(self) -> None:
         content = guess_feedback_content(
             self._result(outcome="wrong", guesses_used=6, guesses_left=0)
         )
         assert "❌" in content
-        assert "0" in content or "last" in content.lower() or "no guesses" in content.lower()
+        assert "keep" in content.lower()  # not locked out
+        assert "10" in content  # the post-limit flat award
 
     def test_already_solved(self) -> None:
         content = guess_feedback_content(self._result(outcome="already_solved"))
         assert "already" in content.lower()
 
-    def test_limit_reached(self) -> None:
+    def test_correct_after_limit(self) -> None:
         content = guess_feedback_content(
-            self._result(outcome="limit_reached", guesses_used=6, guesses_left=0)
+            self._result(
+                outcome="correct_after_limit",
+                matched_title=True,
+                guesses_used=7,
+                guesses_left=0,
+                points_awarded=10,
+                announce=True,
+            )
         )
-        assert "6" in content or "limit" in content.lower()
+        assert "✅" in content
+        assert "10" in content
+        assert "Neon Skyline" not in content  # secrecy: never name the song
 
     def test_empty_guess_asks_for_input(self) -> None:
         content = guess_feedback_content(self._result(outcome="empty", guesses_used=0))
@@ -404,7 +451,7 @@ def test_no_pre_reveal_copy_contains_song_identity(secret: str, tmp_path: Path) 
     settings = _settings(tmp_path)
     pre_reveal_texts = [
         _embed_text(daily_challenge_embed(CHALLENGE, settings)),
-        announcement_content("1001", guesses_used=1, points_awarded=100),
+        announcement_content("1001", _solve_result(), settings),
         guess_feedback_content(
             GuessResult(
                 outcome="correct",
@@ -414,6 +461,7 @@ def test_no_pre_reveal_copy_contains_song_identity(secret: str, tmp_path: Path) 
                 guesses_used=1,
                 guesses_left=5,
                 points_awarded=150,
+                snippet_level=0,
                 announce=True,
             )
         ),
