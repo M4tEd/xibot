@@ -781,7 +781,7 @@ class TestAdminSkip:
 
 
 class TestAdminFixsong:
-    """The admin-fixsong scenario drives the REAL /songbot-fixsong body."""
+    """The admin-fixsong scenario drives the REAL show -> edit -> submit flow."""
 
     async def test_admin_fixsong_corrects_metadata_and_acks_old_new(
         self, ctx: HarnessContext, db: Database
@@ -793,16 +793,26 @@ class TestAdminFixsong:
             await scenario_admin_fixsong(ctx, ADMIN, "Fixed Title", "Fixed Artist", None, DAY1)
         )
 
-        assert kinds(out) == ["ephemeral"]
-        assert out["payloads"][0]["recipient"] == "admin"
+        # Show ephemeral (current metadata + Edit button), modal, ack ephemeral.
+        assert kinds(out) == ["ephemeral", "modal", "ephemeral"]
+        shown = out["payloads"][0]
+        assert shown["recipient"] == "admin"
+        for text in (TITLE, ARTIST):
+            assert text in shown["content"]
+        assert shown["components"][0]["custom_id"] == "songbot:fixsong_edit"
+        # The modal is pre-filled with the current values.
+        modal_inputs = {c["custom_id"]: c for c in out["payloads"][1]["components"]}
+        assert modal_inputs["songbot:fixsong_title"]["default"] == TITLE
+        assert modal_inputs["songbot:fixsong_artist"]["default"] == ARTIST
         assert out["state"]["outcome"] == "fixed"
         assert out["state"]["reason"] is None
+        assert out["state"]["target"]["title"] == TITLE
         fix = out["state"]["fix"]
         assert fix["challenge_date"] == "2026-08-13"
         assert (fix["old_title"], fix["old_artist"]) == (TITLE, ARTIST)
         assert (fix["new_title"], fix["new_artist"]) == ("Fixed Title", "Fixed Artist")
         # The ack shows old -> new (the admin-only ephemeral secrecy exception).
-        ack = out["payloads"][0]["content"]
+        ack = out["payloads"][-1]["content"]
         for text in (TITLE, ARTIST, "Fixed Title", "Fixed Artist"):
             assert text in ack
         # The songs row and the durable override row both carry the fix.
@@ -812,6 +822,22 @@ class TestAdminFixsong:
         override = db.query_one("SELECT title, artist FROM song_overrides")
         assert override is not None
         assert (override["title"], override["artist"]) == ("Fixed Title", "Fixed Artist")
+
+    async def test_admin_fixsong_omitted_flags_keep_current_values(
+        self, ctx: HarnessContext, db: Database
+    ) -> None:
+        _add_song(db)
+        await scenario_post(ctx, DAY1)
+
+        out = json_roundtrip(await scenario_admin_fixsong(ctx, ADMIN, None, None, None, DAY1))
+
+        # Submitting the untouched form re-applies the pre-filled values.
+        assert out["state"]["outcome"] == "fixed"
+        fix = out["state"]["fix"]
+        assert (fix["new_title"], fix["new_artist"]) == (TITLE, ARTIST)
+        song = db.query_one("SELECT title, artist FROM songs")
+        assert song is not None
+        assert (song["title"], song["artist"]) == (TITLE, ARTIST)
 
     async def test_admin_fixsong_then_guess_uses_corrected_metadata(
         self, ctx: HarnessContext, db: Database
@@ -840,6 +866,7 @@ class TestAdminFixsong:
         assert kinds(out) == ["ephemeral"]
         assert "manage server" in out["payloads"][0]["content"].lower()
         assert out["state"]["outcome"] == "denied"
+        assert out["state"]["target"] is None
         assert out["state"]["fix"] is None
         song = db.query_one("SELECT title, artist FROM songs")
         assert song is not None
@@ -860,6 +887,7 @@ class TestAdminFixsong:
         assert kinds(out) == ["ephemeral"]
         assert out["state"]["outcome"] == "refused"
         assert out["state"]["reason"] == "no_challenge"
+        assert out["state"]["target"] is None
         assert out["state"]["fix"] is None
 
 

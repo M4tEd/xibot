@@ -11,9 +11,11 @@ harness-specific differences:
 
 Recorded payload taxonomy (pinned decision #3): ``channel`` = the daily post,
 ``announcement`` = solve announcements and reveals, ``ephemeral`` = per-user
-replies (always carrying ``recipient``). A fourth kind, ``modal``, records the
-GuessModal handed over via ``response.send_modal`` so validators can inspect
-its inputs (VAL-GUESS-001).
+replies (always carrying ``recipient``). A fourth kind, ``modal``, records
+modal handovers via ``response.send_modal`` (the GuessModal, the fixsong edit
+form) so validators can inspect their inputs (VAL-GUESS-001). Messages
+carrying a view keep the runtime view on the payload (never serialized) so
+scenarios can press their buttons.
 
 Drivability contract (see library/discord-adapter.md): buttons are pressed by
 custom_id via ``await button.callback(interaction)``; modal text is injected
@@ -59,7 +61,9 @@ class RecordedPayload:
     """One outgoing message/modal captured by the recorder.
 
     ``modal`` is the runtime handle for ``kind="modal"`` payloads (used by the
-    scenario driver to submit the form); it is never serialized.
+    scenario driver to submit the form); ``view`` is the runtime handle for
+    messages carrying one (used to press their buttons). Neither is
+    serialized.
     """
 
     kind: str  # "channel" | "ephemeral" | "announcement" | "modal"
@@ -69,6 +73,7 @@ class RecordedPayload:
     components: list[dict[str, Any]] = field(default_factory=list)
     recipient: str | None = None
     modal: discord.ui.Modal | None = None
+    view: discord.ui.View | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """The JSON transcript shape: kind/content/embed/attachments/components/recipient."""
@@ -108,6 +113,7 @@ class Recorder:
             attachments=_capture_file(file),
             components=view_components(view) if view is not None else [],
             recipient=recipient,
+            view=view,
         )
         self.payloads.append(payload)
         return payload
@@ -179,6 +185,7 @@ class FakeResponse:
         *,
         embed: discord.Embed | None = None,
         file: discord.File | None = None,
+        view: discord.ui.View | None = None,
         ephemeral: bool = False,
         **kwargs: object,
     ) -> None:
@@ -187,6 +194,7 @@ class FakeResponse:
             content=content,
             embed=embed,
             file=file,
+            view=view,
             recipient=str(self._user.id) if ephemeral else None,
         )
 
@@ -321,6 +329,7 @@ def modal_components(modal: discord.ui.Modal) -> list[dict[str, Any]]:
                     "custom_id": child.custom_id,
                     "label": underlying.label,
                     "placeholder": child.placeholder,
+                    "default": underlying.default,
                     "required": child.required,
                     "max_length": child.max_length,
                 }

@@ -27,6 +27,7 @@ from songbot.engine import (
     Reveal,
     SkipRefusedReason,
     SongFix,
+    SongFixTarget,
     UnlockRefusedReason,
     UnlockResult,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "daily_challenge_embed",
     "fixsong_ack_content",
     "fixsong_refusal_content",
+    "fixsong_show_content",
     "format_seconds",
     "guess_feedback_content",
     "hear_more_content",
@@ -300,6 +302,28 @@ def skip_refusal_content(reason: SkipRefusedReason) -> str:
     if reason == "revealed":
         return "Today's challenge has already been revealed — it can't be skipped."
     return "Today's challenge already has a solver — it can't be skipped."
+
+
+def fixsong_show_content(target: SongFixTarget) -> str:
+    """The ephemeral show-first step of /songbot-fixsong: the current metadata.
+
+    Names the song — the same scoped pinned-#9 secrecy exception as the ack
+    (ephemeral, admin-gated). Title/artist are the editable fields (the Edit
+    button opens a modal pre-filled with them); source/source_id/raw
+    title/duration are display-only context for identifying a bad parse.
+    Nothing mutates until the modal is submitted.
+    """
+    artist = target.artist or "—"
+    return (
+        f"🛠️ Song from the {target.challenge_date} challenge:\n"
+        f"Title: **{target.title}**\n"
+        f"Artist: **{artist}**\n"
+        f"Source: {target.source} (`{target.source_id}`)\n"
+        f"Original title: {target.raw_title}\n"
+        f"Duration: {format_seconds(target.duration_sec)}\n"
+        'Click "Edit metadata" to change the title/artist — nothing changes '
+        "until you submit."
+    )
 
 
 def fixsong_ack_content(fix: SongFix) -> str:

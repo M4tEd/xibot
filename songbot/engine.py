@@ -71,6 +71,7 @@ __all__ = [
     "SkipRefusedReason",
     "SnippetService",
     "SongFix",
+    "SongFixTarget",
     "UnlockRefusedError",
     "UnlockRefusedReason",
     "UnlockResult",
@@ -218,6 +219,30 @@ class SongFix:
     old_artist: str | None
     new_title: str
     new_artist: str | None
+
+
+@dataclass(frozen=True)
+class SongFixTarget:
+    """The read-only view of the song /songbot-fixsong would act on.
+
+    Backs the command's show-current-parameters step: the admin sees the
+    exact title/artist (plus the read-only context — source, source_id,
+    original raw title, duration) before editing anything. ``guild_id`` and
+    ``challenge_date`` are carried so the edit modal can submit a
+    `fix_song_metadata` call that targets exactly the challenge that was
+    displayed.
+    """
+
+    guild_id: str
+    song_id: int
+    challenge_id: int
+    challenge_date: str
+    title: str
+    artist: str | None
+    source: str
+    source_id: str
+    raw_title: str
+    duration_sec: float
 
 
 @dataclass(frozen=True)
@@ -725,6 +750,61 @@ class GameEngine:
             self._db.execute("DELETE FROM challenges WHERE id = ?", (row.id,))
             raise
 
+    def _resolve_fix_challenge(self, guild_id: str, date_str: str | None) -> ChallengeRow:
+        """The challenge whose song /songbot-fixsong acts on (shared resolver).
+
+        The date validation and latest-challenge fallback live here so the
+        read-only `song_fix_target` and the mutating `fix_song_metadata`
+        resolve the SAME target with the SAME refusals (``invalid_date`` /
+        ``no_challenge``, both zero-mutation).
+        """
+        if date_str is not None:
+            try:
+                date.fromisoformat(date_str)
+            except ValueError:
+                raise FixSongRefusedError(
+                    "invalid_date", f"invalid date {date_str!r}: expected YYYY-MM-DD"
+                ) from None
+            challenge = self._challenge_row(guild_id, date_str)
+        else:
+            row = self._db.query_one(
+                "SELECT * FROM challenges WHERE guild_id = ?"
+                " ORDER BY date DESC, id DESC LIMIT 1",
+                (guild_id,),
+            )
+            challenge = ChallengeRow.from_row(row) if row is not None else None
+        if challenge is None:
+            raise FixSongRefusedError(
+                "no_challenge",
+                f"no challenge to fix in guild {guild_id}"
+                + (f" on {date_str}" if date_str is not None else ""),
+            )
+        return challenge
+
+    def song_fix_target(self, guild_id: str, *, date_str: str | None = None) -> SongFixTarget:
+        """The current metadata of the song /songbot-fixsong would act on.
+
+        Pure lookup (zero mutation) backing the command's show-first step:
+        the admin sees the exact current values before editing. Targets the
+        guild's MOST RECENT challenge, or the ``date_str``-selected one (ISO
+        ``YYYY-MM-DD``, the challenge's local date), with the same refusals
+        as `fix_song_metadata`.
+        """
+        challenge = self._resolve_fix_challenge(guild_id, date_str)
+        song = self._song_row(challenge.song_id)
+        return SongFixTarget(
+            guild_id=guild_id,
+            song_id=song.id,
+            challenge_id=challenge.id,
+            challenge_date=challenge.date,
+            title=song.title,
+            artist=song.artist,
+            source=song.source,
+            source_id=song.source_id,
+            raw_title=song.raw_title,
+            duration_sec=song.duration_sec,
+        )
+
     def fix_song_metadata(
         self,
         guild_id: str,
@@ -758,28 +838,7 @@ class GameEngine:
         # artist omitted -> keep the current one; blank-after-strip -> clear.
         stripped_artist = artist.strip() if artist is not None else None
 
-        if date_str is not None:
-            try:
-                date.fromisoformat(date_str)
-            except ValueError:
-                raise FixSongRefusedError(
-                    "invalid_date", f"invalid date {date_str!r}: expected YYYY-MM-DD"
-                ) from None
-            challenge = self._challenge_row(guild_id, date_str)
-        else:
-            row = self._db.query_one(
-                "SELECT * FROM challenges WHERE guild_id = ?"
-                " ORDER BY date DESC, id DESC LIMIT 1",
-                (guild_id,),
-            )
-            challenge = ChallengeRow.from_row(row) if row is not None else None
-        if challenge is None:
-            raise FixSongRefusedError(
-                "no_challenge",
-                f"no challenge to fix in guild {guild_id}"
-                + (f" on {date_str}" if date_str is not None else ""),
-            )
-
+        challenge = self._resolve_fix_challenge(guild_id, date_str)
         song = self._song_row(challenge.song_id)
         new_artist = song.artist if stripped_artist is None else stripped_artist or None
         iso_now = self._utc_iso(now)
