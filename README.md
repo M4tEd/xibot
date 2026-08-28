@@ -41,7 +41,16 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   - `/songbot-post` — post today's challenge now (idempotent)
   - `/songbot-skip` — replace today's song with a different one (refused once
     the challenge is revealed or anyone has solved it)
-  - `/songbot-reload` — refresh the song catalog from its sources
+  - `/songbot-reload` — refresh the song catalog from its sources (the
+    server's custom playlist when one is set, else the global sources)
+  - `/songbot-playlist url:` — point the server's catalog at a custom YouTube
+    playlist: daily challenges then draw **only** from that playlist. The
+    catalog is refreshed immediately and the ephemeral ack reports the
+    per-source counts (a broken URL surfaces there; fix it and re-run, or
+    `/songbot-reload` to retry)
+  - `/songbot-playlist-clear` — remove the custom playlist; the server draws
+    from the global env-configured catalog (`YOUTUBE_PLAYLIST_URL` /
+    `LOCAL_MUSIC_DIR`) again
   - `/songbot-fixsong` — correct the title/artist of a challenge's song when
     the catalog parsed it badly (user-uploaded video titles are messy).
     Targets the latest challenge's song by default, or a specific challenge
@@ -141,7 +150,7 @@ error listing every problem.
 | `DISCORD_BOT_TOKEN` | *(required)* | Bot token from the Discord Developer Portal. Only used by the live bot; the harness and tests never use it. |
 | `DISCORD_GUILD_ID` | `""` (unset) | Optional bootstrap: ID of one server (guild) to configure at startup. Must be set together with `DISCORD_CHANNEL_ID` — both or neither. Right-click the server name → *Copy Server ID* (Developer Mode). |
 | `DISCORD_CHANNEL_ID` | `""` (unset) | Optional bootstrap: ID of the channel the daily challenge is posted to in the bootstrap guild. Right-click the channel → *Copy Channel ID*. |
-| `YOUTUBE_PLAYLIST_URL` | `""` (disabled) | Public/unlisted YouTube playlist used as a song catalog. Empty disables the YouTube provider. |
+| `YOUTUBE_PLAYLIST_URL` | `""` (disabled) | Public/unlisted YouTube playlist used as a song catalog. Empty disables the YouTube provider. Individual servers can override this with `/songbot-playlist` (see *Multiple servers*). |
 | `LOCAL_MUSIC_DIR` | `""` (disabled) | Directory of local audio files (mp3/m4a/flac/ogg) used as a song catalog; artist/title come from tags with an `Artist - Title.ext` filename fallback. Empty disables the local provider. For a self-contained demo point it at `./data/fixture-music` (a generated library of 8 synthetic 30s songs, gitignored — fresh clones recreate it with `.venv/bin/python scripts/generate_fixture_music.py`); for real use point it at your own music folder. |
 | `DAILY_POST_TIME` | `12:00` | Daily post time, strict zero-padded `HH:MM` (00:00–23:59) in `TIMEZONE`. |
 | `TIMEZONE` | `America/Halifax` | IANA timezone name governing post time, challenge dates, and streaks. |
@@ -203,6 +212,13 @@ and set up again.
 The `DISCORD_GUILD_ID`/`DISCORD_CHANNEL_ID` pair is a bootstrap for **one**
 server (typically your own): it is upserted on every startup, so for that
 server the env wins over `/songbot-setup` — edit `.env` to change it.
+
+Each server can also override its **song catalog**: `/songbot-playlist`
+points one server at its own YouTube playlist (stored per guild in
+`guild_settings.playlist_url`), so different servers can play from different
+playlists simultaneously. Servers without an override keep using the global
+`YOUTUBE_PLAYLIST_URL`/`LOCAL_MUSIC_DIR` sources, and
+`/songbot-playlist-clear` reverts a server to them.
 
 The post schedule (`DAILY_POST_TIME`/`TIMEZONE`) is global: every server
 posts at the same wall-clock time.

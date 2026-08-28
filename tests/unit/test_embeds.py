@@ -40,6 +40,7 @@ from tests.unit.test_engine_daily import _settings
 
 SONG = SongRow(
     id=7,
+    guild_id="",
     source="local",
     source_id="song-7",
     title="Neon Skyline",

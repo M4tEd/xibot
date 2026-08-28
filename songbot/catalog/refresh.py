@@ -25,6 +25,13 @@ Behavior (binding per architecture.md):
   (admin metadata corrections via /songbot-fixsong) are re-applied inside the
   same transaction, so a refresh never clobbers an admin correction.
 
+Per-guild catalogs: a guild whose ``guild_settings.playlist_url`` is set
+(/songbot-playlist) refreshes from THAT YouTube playlist only, into its own
+``songs.guild_id`` scope; every other guild refreshes the global env-configured
+sources into the shared ``''`` scope. Scopes never touch each other's rows:
+upserts key on ``(guild_id, source, source_id)`` and the removal pass only
+deletes within the refreshed scope.
+
 The return value is a `RefreshResult` with one `SourceRefresh` per enabled
 provider (added/updated/removed/retained counts, or the error).
 """
@@ -48,9 +55,10 @@ logger = logging.getLogger(__name__)
 
 _UPSERT_SQL = """
 INSERT INTO songs
-    (source, source_id, title, artist, duration_sec, audio_ref, raw_title, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT (source, source_id) DO UPDATE SET
+    (guild_id, source, source_id, title, artist, duration_sec, audio_ref, raw_title,
+     created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (guild_id, source, source_id) DO UPDATE SET
     title = excluded.title,
     artist = excluded.artist,
     duration_sec = excluded.duration_sec,
@@ -118,25 +126,47 @@ def refresh_catalog(
     db: Database,
     settings: Settings,
     *,
+    guild_id: str | None = None,
     providers: Mapping[str, CatalogProvider] | None = None,
 ) -> RefreshResult:
-    """Refresh the ``songs`` table from all enabled catalog providers.
+    """Refresh the ``songs`` table from a guild's effective catalog providers.
 
-    Providers are built from ``settings`` (local directory and/or YouTube
-    playlist, per pinned decision #10); tests may inject stub providers keyed
-    by source name via ``providers``. Every provider is attempted even when
-    others fail; per-source outcomes are reported in the returned
-    `RefreshResult` (failures are returned, not raised).
+    When ``guild_id`` names a guild with a custom ``playlist_url``
+    (/songbot-playlist), ONLY that YouTube playlist is refreshed, into the
+    guild's own ``songs.guild_id`` scope. Otherwise the providers are built
+    from ``settings`` (local directory and/or YouTube playlist, per pinned
+    decision #10) and refresh the shared global scope (``''``). Tests may
+    inject stub providers keyed by source name via ``providers``. Every
+    provider is attempted even when others fail; per-source outcomes are
+    reported in the returned `RefreshResult` (failures are returned, not
+    raised).
     """
-    active: Mapping[str, CatalogProvider] = (
-        providers if providers is not None else _build_providers(settings)
-    )
+    playlist_url = _guild_playlist_url(db, guild_id)
+    scope = guild_id if playlist_url is not None and guild_id is not None else ""
+    if providers is not None:
+        active = providers
+    elif playlist_url is not None:
+        active = {"youtube": YouTubePlaylistProvider(playlist_url)}
+    else:
+        active = _build_providers(settings)
     if not active:
         logger.warning("refresh_catalog: no catalog providers enabled")
     results = tuple(
-        _refresh_source(db, source, provider) for source, provider in active.items()
+        _refresh_source(db, source, provider, scope) for source, provider in active.items()
     )
     return RefreshResult(sources=results)
+
+
+def _guild_playlist_url(db: Database, guild_id: str | None) -> str | None:
+    """A guild's custom playlist URL, or None when it uses the global catalog."""
+    if guild_id is None:
+        return None
+    row = db.query_one(
+        "SELECT playlist_url FROM guild_settings WHERE guild_id = ?", (guild_id,)
+    )
+    if row is None or row["playlist_url"] is None or not str(row["playlist_url"]).strip():
+        return None
+    return str(row["playlist_url"])
 
 
 def _build_providers(settings: Settings) -> dict[str, CatalogProvider]:
@@ -149,7 +179,9 @@ def _build_providers(settings: Settings) -> dict[str, CatalogProvider]:
     return providers
 
 
-def _refresh_source(db: Database, source: str, provider: CatalogProvider) -> SourceRefresh:
+def _refresh_source(
+    db: Database, source: str, provider: CatalogProvider, scope: str
+) -> SourceRefresh:
     """Fetch one provider and store its songs; failures become a named error."""
     try:
         songs = provider.fetch()
@@ -157,7 +189,7 @@ def _refresh_source(db: Database, source: str, provider: CatalogProvider) -> Sou
         return _source_error(source, exc)
     try:
         with db.transaction():
-            return _upsert_source(db, source, songs)
+            return _upsert_source(db, source, songs, scope)
     except Exception as exc:
         return _source_error(source, exc)
 
@@ -168,16 +200,24 @@ def _source_error(source: str, exc: Exception) -> SourceRefresh:
     return SourceRefresh(source=source, error=error)
 
 
-def _upsert_source(db: Database, source: str, songs: Sequence[Song]) -> SourceRefresh:
+def _upsert_source(
+    db: Database, source: str, songs: Sequence[Song], scope: str
+) -> SourceRefresh:
     """Upsert `songs` and delete vanished unreferenced rows for `source`.
 
-    Must run inside a transaction so a source's changes commit or roll back
-    as a unit (failure isolation, pinned #12).
+    Only rows in the catalog ``scope`` (``''`` = the global pool, otherwise a
+    guild id) are touched: another scope's rows for the same source are
+    invisible to both the upsert and the removal pass. Must run inside a
+    transaction so a source's changes commit or roll back as a unit (failure
+    isolation, pinned #12).
     """
     now = datetime.now(UTC).isoformat()
     existing: dict[str, int] = {
         str(row["source_id"]): int(row["id"])
-        for row in db.query("SELECT id, source_id FROM songs WHERE source = ?", (source,))
+        for row in db.query(
+            "SELECT id, source_id FROM songs WHERE source = ? AND guild_id = ?",
+            (source, scope),
+        )
     }
 
     fetched: set[str] = set()
@@ -193,6 +233,7 @@ def _upsert_source(db: Database, source: str, songs: Sequence[Song]) -> SourceRe
         db.execute(
             _UPSERT_SQL,
             (
+                scope,
                 song.source,
                 song.source_id,
                 song.title,
@@ -227,9 +268,12 @@ def _apply_overrides(db: Database, source: str) -> None:
     """Re-apply admin metadata overrides (/songbot-fixsong) for `source`.
 
     Runs inside the source's refresh transaction, after the upsert pass, so
-    the provider's metadata never clobbers an admin correction. Overrides for
-    songs absent from the table (deleted, or not yet re-added) match zero
-    rows and simply wait for the song to re-enter the catalog.
+    the provider's metadata never clobbers an admin correction. Overrides are
+    keyed by ``(source, source_id)`` with no catalog scope: a correction is
+    provider-truth, so it applies to the matching row in EVERY scope (global
+    and per-guild) at once. Overrides for songs absent from the table
+    (deleted, or not yet re-added) match zero rows and simply wait for the
+    song to re-enter the catalog.
     """
     for row in db.query(_OVERRIDES_FOR_SOURCE_SQL, (source,)):
         cursor = db.execute(

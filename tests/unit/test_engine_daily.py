@@ -319,7 +319,7 @@ class TestEnsureTodayChallenge:
         """Pinned #11: an empty songs table triggers a catalog refresh first."""
         refresh_calls = 0
 
-        def refresher() -> RefreshResult:
+        def refresher(guild_id: str) -> RefreshResult:
             nonlocal refresh_calls
             refresh_calls += 1
             _add_songs(db, 2)
@@ -339,7 +339,7 @@ class TestEnsureTodayChallenge:
     ) -> None:
         """Pinned #11: still-empty catalog after refresh -> catalog_empty, no row."""
         engine, _ = _make_engine(
-            tmp_path, db, catalog_refresher=lambda: RefreshResult(sources=())
+            tmp_path, db, catalog_refresher=lambda _guild_id: RefreshResult(sources=())
         )
 
         with pytest.raises(CatalogEmptyError, match="catalog_empty"):

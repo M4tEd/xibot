@@ -41,7 +41,8 @@ posts the local date of ``--now`` (or the real clock) with no reveal
 (VAL-CROSS-018).
 
 Admin scenarios — ``admin-setup`` / ``admin-post`` / ``admin-skip`` /
-``admin-reload`` / ``admin-fixsong`` — drive the REAL ``AdminCommands``
+``admin-reload`` / ``admin-fixsong`` / ``admin-playlist`` /
+``admin-playlist-clear`` — drive the REAL ``AdminCommands``
 bodies (songbot/bot/admin.py) with the invoking user's Manage-Guild
 permission simulated by ``--as-admin``/``--as-non-admin`` (exactly one
 required). A denied invocation records exactly one ephemeral
@@ -122,6 +123,8 @@ __all__ = [
     "parse_now",
     "parse_user",
     "scenario_admin_fixsong",
+    "scenario_admin_playlist",
+    "scenario_admin_playlist_clear",
     "scenario_admin_post",
     "scenario_admin_reload",
     "scenario_admin_setup",
@@ -346,6 +349,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="The channel id to configure (default: the harness channel).",
     )
+
+    admin_playlist = sub.add_parser(
+        "admin-playlist",
+        help="Run /songbot-playlist (set the guild's custom catalog playlist).",
+    )
+    add_admin_flags(admin_playlist)
+    admin_playlist.add_argument(
+        "--url", required=True, help="The custom YouTube playlist URL."
+    )
+
+    admin_playlist_clear = sub.add_parser(
+        "admin-playlist-clear",
+        help="Run /songbot-playlist-clear (revert to the global catalog).",
+    )
+    add_admin_flags(admin_playlist_clear)
 
     reset = sub.add_parser("reset", help="Wipe all DB tables and the snippet cache.")
     add_now(reset)
@@ -925,6 +943,76 @@ async def scenario_admin_fixsong(
     )
 
 
+async def scenario_admin_playlist(
+    ctx: HarnessContext, user: FakeUser, url: str, now: datetime
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-playlist body (per-guild custom catalog).
+
+    Success: exactly one ephemeral ack (the playlist URL plus the per-source
+    refresh summary — never song identity) after the guild's
+    ``guild_settings.playlist_url`` is set and the catalog refreshed from it;
+    ``state.playlist_url`` carries the stored value. A blank URL or a guild
+    that never ran admin-setup records one ephemeral refusal with zero
+    mutation; a non-admin invocation records exactly one ephemeral denial
+    (VAL-ADMIN-009).
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
+    result = await commands.set_playlist(interaction, url)
+    row = ctx.engine.guild_settings(ctx.guild_id)
+    sources = [
+        {
+            "source": source.source,
+            "added": source.added,
+            "updated": source.updated,
+            "removed": source.removed,
+            "retained": source.retained,
+            "error": source.error,
+        }
+        for source in (result.refresh.sources if result.refresh is not None else ())
+    ]
+    return _transcript(
+        "admin-playlist",
+        recorder,
+        {
+            "outcome": result.outcome,
+            "playlist_url": row.playlist_url if row is not None else None,
+            "sources": sources,
+        },
+    )
+
+
+async def scenario_admin_playlist_clear(
+    ctx: HarnessContext, user: FakeUser, now: datetime
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-playlist-clear body (revert to the global catalog).
+
+    Success: exactly one ephemeral ack after the guild's ``playlist_url`` is
+    cleared; ``state.playlist_url`` is then None. A non-admin invocation
+    records exactly one ephemeral denial and mutates nothing (VAL-ADMIN-009).
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
+    result = await commands.clear_playlist(interaction)
+    row = ctx.engine.guild_settings(ctx.guild_id)
+    return _transcript(
+        "admin-playlist-clear",
+        recorder,
+        {
+            "outcome": result.outcome,
+            "playlist_url": row.playlist_url if row is not None else None,
+        },
+    )
+
+
 def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
     """Wipe every data table and the snippet cache (schema/migrations survive).
 
@@ -1058,6 +1146,14 @@ async def _dispatch(
             _admin_user(args.user, as_admin=args.as_admin),
             args.channel if args.channel is not None else ctx.channel_id,
             now,
+        )
+    if args.scenario == "admin-playlist":
+        return await scenario_admin_playlist(
+            ctx, _admin_user(args.user, as_admin=args.as_admin), args.url, now
+        )
+    if args.scenario == "admin-playlist-clear":
+        return await scenario_admin_playlist_clear(
+            ctx, _admin_user(args.user, as_admin=args.as_admin), now
         )
     if args.scenario == "reset":
         return scenario_reset(ctx)

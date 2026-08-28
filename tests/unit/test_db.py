@@ -46,6 +46,8 @@ EXPECTED_COLUMNS: dict[str, list[tuple[str, str, int, str | None, int]]] = {
     ],
     "songs": [
         ("id", "INTEGER", 0, None, 1),
+        # migration 5: catalog scope — '' is the global pool
+        ("guild_id", "TEXT", 1, "''", 0),
         ("source", "TEXT", 1, None, 0),
         ("source_id", "TEXT", 1, None, 0),
         ("title", "TEXT", 1, None, 0),
@@ -102,6 +104,8 @@ EXPECTED_COLUMNS: dict[str, list[tuple[str, str, int, str | None, int]]] = {
         ("set_by", "TEXT", 1, None, 0),
         ("created_at", "TEXT", 1, None, 0),
         ("updated_at", "TEXT", 1, None, 0),
+        # migration 5: per-guild custom catalog (/songbot-playlist)
+        ("playlist_url", "TEXT", 0, None, 0),
     ],
     # migration 4: admin-corrected song metadata (the /songbot-fixsong store,
     # re-applied by every catalog refresh)
@@ -209,7 +213,7 @@ class TestMigration:
     def test_migrate_returns_applied_versions_then_nothing(self, tmp_path: Path) -> None:
         database = Database(tmp_path / "songbot.db")
         try:
-            assert database.migrate() == [1, 2, 3, 4]
+            assert database.migrate() == [1, 2, 3, 4, 5]
             assert database.migrate() == []
         finally:
             database.close()
@@ -222,13 +226,13 @@ class TestMigration:
         try:
             assert second.migrate() == []
             assert second.schema_version() == SCHEMA_VERSION
-            assert count(second, "schema_migrations") == 4
+            assert count(second, "schema_migrations") == 5
         finally:
             second.close()
 
     def test_schema_migrations_records_version_and_timestamp(self, db: Database) -> None:
         rows = db.query("SELECT version, applied_at FROM schema_migrations ORDER BY version")
-        assert [int(row["version"]) for row in rows] == [1, 2, 3, 4]
+        assert [int(row["version"]) for row in rows] == [1, 2, 3, 4, 5]
         for row in rows:
             # applied_at must be a parseable ISO-8601 timestamp
             parsed = datetime.fromisoformat(str(row["applied_at"]))
@@ -254,8 +258,8 @@ class TestMigration:
             song_id = insert_song(database)
             challenge_id = insert_challenge(database, song_id)
 
-            assert database.migrate() == [2, 3, 4]
-            assert database.schema_version() == 4
+            assert database.migrate() == [2, 3, 4, 5]
+            assert database.schema_version() == 5
             row = database.query_one(
                 "SELECT skip_count FROM challenges WHERE id = ?", (challenge_id,)
             )
@@ -290,8 +294,8 @@ class TestMigration:
             song_id = insert_song(database)
             challenge_id = insert_challenge(database, song_id)
 
-            assert database.migrate() == [3, 4]
-            assert database.schema_version() == 4
+            assert database.migrate() == [3, 4, 5]
+            assert database.schema_version() == 5
 
             table = database.query_one(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -305,6 +309,92 @@ class TestMigration:
             )
             assert row is not None
             assert row["skip_count"] == 0
+        finally:
+            database.close()
+
+    def test_migration_5_adds_guild_catalogs_to_a_v4_database(
+        self, tmp_path: Path
+    ) -> None:
+        """Upgrading a v4 database: songs gain guild_id, guild_settings playlist_url.
+
+        The songs rebuild must preserve row ids verbatim (challenges keep
+        referencing them) and keep foreign keys enforced afterwards.
+        """
+        path = tmp_path / "songbot.db"
+        database = Database(path)
+        try:
+            # Simulate a v4 database: migrations 1-4 applied by hand.
+            from songbot.db import MIGRATIONS
+
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            for version, statements in MIGRATIONS:
+                if version > 4:
+                    continue
+                for statement in statements:
+                    database.execute(statement)
+                database.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, NOW),
+                )
+            song_id = insert_song(database)
+            challenge_id = insert_challenge(database, song_id)
+            database.execute(
+                "INSERT INTO guild_settings"
+                " (guild_id, channel_id, set_by, created_at, updated_at)"
+                " VALUES ('g1', 'c1', 'test', ?, ?)",
+                (NOW, NOW),
+            )
+
+            assert database.migrate() == [5]
+            assert database.schema_version() == SCHEMA_VERSION
+
+            # Data survives the rebuild: same row id, global ('') scope.
+            row = database.query_one("SELECT * FROM songs WHERE id = ?", (song_id,))
+            assert row is not None
+            assert row["guild_id"] == ""
+            assert row["title"] == "Neon Skyline"
+            settings_row = database.query_one(
+                "SELECT playlist_url FROM guild_settings WHERE guild_id = 'g1'"
+            )
+            assert settings_row is not None
+            assert settings_row["playlist_url"] is None
+
+            # The FK still binds after the rebuild: the old reference is intact
+            # and a dangling reference is rejected (foreign_keys back ON).
+            assert count(database, "challenges") == 1
+            assert database.query_one(
+                "SELECT song_id FROM challenges WHERE id = ?", (challenge_id,)
+            )["song_id"] == song_id  # type: ignore[index]
+            with pytest.raises(sqlite3.IntegrityError):
+                database.execute(
+                    "INSERT INTO challenges"
+                    " (guild_id, channel_id, song_id, date, snippet_offset_sec,"
+                    " status, created_at)"
+                    " VALUES ('g1', 'c1', 999999, '2026-08-14', 0.0, 'active', ?)",
+                    (NOW,),
+                )
+
+            # The new uniqueness key scopes by guild: the same (source,
+            # source_id) pair may live in the global pool AND a guild scope…
+            database.execute(
+                "INSERT INTO songs (guild_id, source, source_id, title, artist,"
+                " duration_sec, audio_ref, raw_title, created_at)"
+                " VALUES ('g1', 'local', 'song-1', 'T2', 'A2', 30.0, 'ref2', 'raw2', ?)",
+                (NOW,),
+            )
+            assert count(database, "songs") == 2
+            # …but a duplicate within one scope is still rejected.
+            with pytest.raises(sqlite3.IntegrityError):
+                database.execute(
+                    "INSERT INTO songs (guild_id, source, source_id, title, artist,"
+                    " duration_sec, audio_ref, raw_title, created_at)"
+                    " VALUES ('g1', 'local', 'song-1', 'T3', 'A3', 30.0, 'ref3',"
+                    " 'raw3', ?)",
+                    (NOW,),
+                )
         finally:
             database.close()
 
@@ -585,6 +675,7 @@ class TestRowHelpers:
         song = SongRow.from_row(row)
         assert song == SongRow(
             id=song_id,
+            guild_id="",
             source="local",
             source_id="song-1",
             title="Neon Skyline",
