@@ -533,6 +533,79 @@ class TestGuildSettings:
         assert reveal.channel_id == "c1"
 
 
+class TestPingRoleSettings:
+    """The per-guild reaction-role opt-in store backing /songbot-pingrole."""
+
+    def _configure(self, engine: GameEngine, guild_id: str) -> None:
+        # The FK requires a guild_settings row (the opt-in rides on setup).
+        engine.set_guild_channel(guild_id, "c1", set_by="t", now=NOW)
+
+    def test_set_then_get_round_trip(self, db: Database, tmp_path: Path) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        self._configure(engine, "g1")
+
+        row = engine.set_ping_role(
+            "g1", "c1", "m1", "r1", "🎵", set_by="user-1", now=NOW
+        )
+
+        assert row.guild_id == "g1"
+        assert row.channel_id == "c1"
+        assert row.message_id == "m1"
+        assert row.role_id == "r1"
+        assert row.emoji == "🎵"
+        assert row.set_by == "user-1"
+        assert row.created_at == row.updated_at
+        assert engine.ping_role_settings("g1") == row
+
+    def test_upsert_replaces_and_keeps_created_at(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        self._configure(engine, "g1")
+        first = engine.set_ping_role("g1", "c1", "m1", "r1", "🎵", set_by="u1", now=NOW)
+        later = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
+
+        second = engine.set_ping_role(
+            "g1", "c1", "m2", "r2", "🔔", set_by="u2", now=later
+        )
+
+        assert second.message_id == "m2"
+        assert second.role_id == "r2"
+        assert second.emoji == "🔔"
+        assert second.created_at == first.created_at
+        assert second.updated_at != first.updated_at
+
+    def test_unknown_guild_and_message_are_none(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        assert engine.ping_role_settings("nope") is None
+        assert engine.ping_role_for_message("nope") is None
+
+    def test_ping_role_for_message_dispatches_to_the_right_guild(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        for guild, message in (("g1", "m1"), ("g2", "m2")):
+            self._configure(engine, guild)
+            engine.set_ping_role(guild, "c1", message, f"role-{guild}", "🎵", set_by="t", now=NOW)
+
+        assert engine.ping_role_for_message("m2").guild_id == "g2"  # type: ignore[union-attr]
+        assert engine.ping_role_for_message("m1").role_id == "role-g1"  # type: ignore[union-attr]
+
+    def test_remove_guild_settings_cascades_the_ping_role(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        engine, _ = _make_engine(tmp_path, db)
+        self._configure(engine, "g1")
+        engine.set_ping_role("g1", "c1", "m1", "r1", "🎵", set_by="t", now=NOW)
+
+        engine.remove_guild_settings("g1")
+
+        assert engine.ping_role_settings("g1") is None
+        assert engine.ping_role_for_message("m1") is None
+
+
 class TestPeekReveal:
     """The read-only half of the delivery-coupled reveal (pinned #17).
 

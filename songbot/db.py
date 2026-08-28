@@ -8,8 +8,10 @@ Schema (migration 1) implements the architecture.md data model exactly:
 `schema_migrations` bookkeeping table. `challenge_users` and `guesses` carry
 `ON DELETE CASCADE` so skip-song can delete + recreate a challenge row
 (pinned design decision #5). Later migrations add `challenges.skip_count`
-(2), `guild_settings` (3), and `song_overrides` (4 — admin-corrected song
-metadata that catalog refreshes re-apply).
+(2), `guild_settings` (3), `song_overrides` (4 — admin-corrected song
+metadata that catalog refreshes re-apply), and `ping_role_settings` (5 —
+the /songbot-pingrole reaction-role opt-in store, cascading with the guild's
+configuration row).
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ __all__ = [
     "Database",
     "GuessRow",
     "GuildSettingsRow",
+    "PingRoleRow",
     "SongRow",
     "UserStatsRow",
 ]
@@ -39,7 +42,7 @@ __all__ = [
 ChallengeStatus = Literal["active", "revealed"]
 """Valid values for `challenges.status`."""
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """Latest schema version; bump when appending to `MIGRATIONS`."""
 
 _BUSY_TIMEOUT_MS = 5000
@@ -160,6 +163,30 @@ _MIGRATION_004_SONG_OVERRIDES: tuple[str, ...] = (
     """,
 )
 
+_MIGRATION_005_PING_ROLE_SETTINGS: tuple[str, ...] = (
+    # Reaction-role opt-in (/songbot-pingrole): one row per guild, recording
+    # the announcement message to watch, the emoji that opts in, and the role
+    # granted/revoked by reactions on that message. The daily post mentions
+    # `role_id` so opted-in users are pinged. Keyed by guild_id with an
+    # ON DELETE CASCADE reference to guild_settings: removing the bot from a
+    # guild drops this configuration together with the post target. Re-running
+    # /songbot-pingrole upserts the row (the new announcement supersedes the
+    # old one, whose reactions then no longer match any watched message).
+    """
+    CREATE TABLE ping_role_settings (
+        guild_id TEXT NOT NULL PRIMARY KEY
+            REFERENCES guild_settings(guild_id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        set_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+)
+
 # Versioned migrations, applied in ascending order. Never edit an applied
 # migration; append a new (version, statements) entry instead.
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -167,6 +194,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (2, _MIGRATION_002_CHALLENGE_SKIP_COUNT),
     (3, _MIGRATION_003_GUILD_SETTINGS),
     (4, _MIGRATION_004_SONG_OVERRIDES),
+    (5, _MIGRATION_005_PING_ROLE_SETTINGS),
 )
 
 
@@ -318,6 +346,41 @@ class GuildSettingsRow:
         return cls(
             guild_id=row["guild_id"],
             channel_id=row["channel_id"],
+            set_by=row["set_by"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass(frozen=True)
+class PingRoleRow:
+    """A row of `ping_role_settings`: one guild's reaction-role opt-in config.
+
+    ``message_id`` is the announcement message the reaction listeners watch;
+    ``emoji`` is the opt-in reaction (compared against the reaction's string
+    form); ``role_id`` is granted on react, revoked on un-react, and mentioned
+    in the daily post. ``channel_id`` records where the announcement was
+    posted (the guild's configured channel at setup time).
+    """
+
+    guild_id: str
+    channel_id: str
+    message_id: str
+    role_id: str
+    emoji: str
+    set_by: str
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> PingRoleRow:
+        """Build a typed `PingRoleRow` from a `SELECT * FROM ping_role_settings` row."""
+        return cls(
+            guild_id=row["guild_id"],
+            channel_id=row["channel_id"],
+            message_id=row["message_id"],
+            role_id=row["role_id"],
+            emoji=row["emoji"],
             set_by=row["set_by"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],

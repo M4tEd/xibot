@@ -75,6 +75,11 @@ def _kinds(out: dict[str, Any]) -> list[str]:
     return [p["kind"] for p in out["payloads"]]
 
 
+async def _unused_announcement_poster(channel_id: str, content: str, emoji: str) -> str:
+    """AnnouncementPoster stub: these tests never invoke /songbot-pingrole."""
+    raise AssertionError("announcement poster must not be called here")
+
+
 class _FlakyPoster:
     """Admin DailyPostSender double: fails until switched off, records attempts."""
 
@@ -261,7 +266,11 @@ class TestAdminPath:
         _seed_guild(engine)
         poster = _FlakyPoster()
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_unused_announcement_poster,
         )
 
         interaction = _interaction()
@@ -288,7 +297,11 @@ class TestAdminPath:
         _seed_guild(engine)
         poster = _FlakyPoster()
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_unused_announcement_poster,
         )
 
         failed = await commands.post_now(_interaction())
@@ -315,7 +328,11 @@ class TestAdminPath:
         poster = _FlakyPoster()
         poster.fail = False
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_unused_announcement_poster,
         )
         await commands.post_now(_interaction())
         assert _challenge_count(db) == 1
@@ -340,7 +357,11 @@ class TestAdminPath:
         _seed_guild(engine)
         poster = _FlakyPoster()
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_unused_announcement_poster,
         )
 
         interaction = _interaction()

@@ -400,6 +400,41 @@ class TestAdminFlow:
         assert db_rows(tmp_path, "SELECT COUNT(*) FROM songs") == [(0,)]
         assert list((tmp_path / "snippets").rglob("*.mp3")) == []
 
+    def test_admin_pingrole_then_daily_posts_mention_the_role(self, tmp_path: Path) -> None:
+        """Reaction-role opt-in end to end: announce, persist, ping on posts."""
+        run_json(tmp_path, "reset")
+        out = run_json(
+            tmp_path, "admin-pingrole", "--as-admin", "--role", "role-9", "--now", DAY1_NOW
+        )
+
+        assert kinds(out) == ["announcement", "ephemeral"]
+        announcement = out["payloads"][0]
+        assert "🎵" in announcement["content"]
+        assert "<@&role-9>" in announcement["content"]
+        assert out["state"]["outcome"] == "ping_configured"
+        assert db_rows(
+            tmp_path,
+            "SELECT role_id, emoji FROM ping_role_settings"
+            " WHERE guild_id = 'harness-guild'",
+        ) == [("role-9", "🎵")]
+
+        # The next daily post (scheduled path AND admin path) pings the role.
+        post = run_json(tmp_path, "post", "--now", DAY1_NOW)
+        assert kinds(post) == ["channel"]
+        assert post["payloads"][0]["content"] == "<@&role-9>"
+        admin_post = run_json(tmp_path, "admin-post", "--as-admin", "--now", DAY2_NOW)
+        assert admin_post["payloads"][0]["content"] == "<@&role-9>"
+
+    def test_admin_pingrole_non_admin_denied_with_zero_mutation(self, tmp_path: Path) -> None:
+        """VAL-ADMIN-009 (pingrole): one ephemeral denial, nothing persisted."""
+        run_json(tmp_path, "reset")
+        out = run_json(tmp_path, "admin-pingrole", "--as-non-admin", "--now", DAY1_NOW)
+
+        assert kinds(out) == ["ephemeral"]
+        assert "manage server" in out["payloads"][0]["content"].lower()
+        assert out["state"]["outcome"] == "denied"
+        assert db_rows(tmp_path, "SELECT COUNT(*) FROM ping_role_settings") == [(0,)]
+
     def test_admin_skip_replaces_song_and_resets_players(self, tmp_path: Path) -> None:
         """VAL-ADMIN-003/004 + VAL-CROSS-006: new song/offset, state reset."""
         run_json(tmp_path, "reset")

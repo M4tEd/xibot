@@ -50,8 +50,17 @@ from aiohttp import web
 from discord import app_commands
 from discord.http import Route
 
-from songbot.bot.admin import AdminCommands, DailyPostSender, register_admin_commands
-from songbot.bot.embeds import daily_challenge_embed, reveal_embed, snippet_attachment
+from songbot.bot.admin import (
+    AdminCommands,
+    DailyPostSender,
+    register_admin_commands,
+)
+from songbot.bot.embeds import (
+    daily_challenge_embed,
+    ping_mention_content,
+    reveal_embed,
+    snippet_attachment,
+)
 from songbot.bot.health import build_health_app
 from songbot.bot.modals import Clock, utc_now
 from songbot.bot.views import DailyChallengeView
@@ -119,6 +128,7 @@ class _MessageableChannel(Protocol):
         embed: discord.Embed | None = ...,
         view: discord.ui.View | None = ...,
         file: discord.File | None = ...,
+        allowed_mentions: discord.AllowedMentions | None = ...,
     ) -> object: ...
 
 
@@ -155,8 +165,10 @@ class SongBotClient(discord.Client):
     """The live discord.py client: minimal intents, thin adapter wiring only.
 
     NEVER connected in-mission — construction and `setup_hook` are the tested
-    surface. Connects with guilds-only intents (interactions need no
-    privileged intents); owns no game rules (every decision is the engine's).
+    surface. Connects with guilds+reactions intents (neither is privileged:
+    interactions need no privileged intents, and the raw reaction events
+    behind the /songbot-pingrole opt-in need ``reactions``); owns no game
+    rules (every decision is the engine's).
 
     Args:
         settings: validated configuration. When the ``guild_id``/
@@ -193,7 +205,9 @@ class SongBotClient(discord.Client):
         health_starter: HealthStarter | None = None,
         command_syncer: CommandSyncer | None = None,
     ) -> None:
-        super().__init__(intents=discord.Intents(guilds=True))
+        # Intents: guilds (interactions/posts) + reactions (the raw reaction
+        # events behind the /songbot-pingrole opt-in). Neither is privileged.
+        super().__init__(intents=discord.Intents(guilds=True, reactions=True))
         # Plain discord.Client has no command tree; constructing one here also
         # wires it into the connection state for interaction dispatch.
         self.tree: app_commands.CommandTree[SongBotClient] = app_commands.CommandTree(self)
@@ -222,7 +236,11 @@ class SongBotClient(discord.Client):
             command_syncer if command_syncer is not None else self._sync_commands
         )
         self._admin_commands = AdminCommands(
-            engine, settings, post_sender=self._post_sender, clock=self._clock
+            engine,
+            settings,
+            post_sender=self._post_sender,
+            announcement_poster=self._post_announcement,
+            clock=self._clock,
         )
         self._health_handle: HealthServerHandle | None = None
         self._scheduler_task: asyncio.Task[None] | None = None
@@ -333,6 +351,90 @@ class SongBotClient(discord.Client):
         self._command_guilds.discard(guild.id)
         self._engine.remove_guild_settings(str(guild.id))
         logger.info("removed from guild %s; configuration dropped", guild.id)
+
+    # -- reaction-role opt-in (/songbot-pingrole) ------------------------------
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """Grant the ping role when a user reacts with the configured emoji.
+
+        Raw events (not the cached-message variants) so reactions on an
+        announcement posted before a restart keep working.
+        """
+        await self._sync_ping_role(payload, grant=True)
+
+    async def on_raw_reaction_remove(
+        self, payload: discord.RawReactionActionEvent
+    ) -> None:
+        """Revoke the ping role when the opt-in reaction is removed."""
+        await self._sync_ping_role(payload, grant=False)
+
+    async def _sync_ping_role(
+        self, payload: discord.RawReactionActionEvent, *, grant: bool
+    ) -> None:
+        """Grant/revoke the ping role for one raw reaction event.
+
+        Only reactions on a configured announcement message with the
+        configured emoji act; everything else (other messages, other emoji,
+        the bot's own seed reaction, other bots) is ignored. Role/member
+        lookups degrade gracefully: a deleted role or a departed member is a
+        no-op, and a missing Manage-Roles permission or role-hierarchy
+        problem is logged, never raised (event handlers must not crash the
+        dispatch loop).
+        """
+        config = self._engine.ping_role_for_message(str(payload.message_id))
+        if config is None or str(payload.emoji) != config.emoji:
+            return
+        if payload.guild_id is None:  # pragma: no cover - announcements are guild posts
+            return
+        if self.user is not None and payload.user_id == self.user.id:
+            return  # the bot's own seed reaction on the announcement
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            return  # guild not in cache (bot removed; config cascades away anyway)
+        role = guild.get_role(int(config.role_id))
+        if role is None:
+            logger.warning(
+                "ping role %s not found in guild %s — was it deleted?",
+                config.role_id,
+                config.guild_id,
+            )
+            return
+        # payload.member is only populated on ADD when the member happens to
+        # be cached (no members intent here), so fetch over REST as needed;
+        # REMOVE events never carry a member.
+        member = payload.member
+        if member is None:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except discord.NotFound:
+                return  # the reacting user left the guild
+        if member.bot:
+            return
+        action = "opt-in" if grant else "opt-out"
+        try:
+            if grant:
+                await member.add_roles(role, reason="SongBot daily-song ping opt-in")
+            else:
+                await member.remove_roles(role, reason="SongBot daily-song ping opt-out")
+        except discord.Forbidden:
+            logger.warning(
+                "ping %s failed in guild %s: missing Manage Roles or the role "
+                "outranks the bot",
+                action,
+                config.guild_id,
+            )
+            return
+        except discord.HTTPException:
+            logger.exception("ping %s failed in guild %s", action, config.guild_id)
+            return
+        logger.info(
+            "ping %s: user %s %s role %s in guild %s",
+            action,
+            payload.user_id,
+            "granted" if grant else "revoked",
+            config.role_id,
+            config.guild_id,
+        )
 
     async def _ensure_guild_commands(self, guild: discord.abc.Snowflake) -> None:
         """Register + sync the /songbot-* commands for one guild, once."""
@@ -508,13 +610,42 @@ class SongBotClient(discord.Client):
         return cast("_MessageableChannel", channel)
 
     async def _send_daily_post(self, challenge: Challenge) -> None:
-        """Post the daily challenge: real embed + real view + level-0 snippet."""
+        """Post the daily challenge: real embed + real view + level-0 snippet.
+
+        When the guild configured /songbot-pingrole, the message content
+        mentions the opt-in role (pinging its members) — role mentions are
+        explicitly allowed so a client-level allowed_mentions override can't
+        silently drop the ping.
+        """
         channel = await self._challenge_channel(challenge.channel_id)
+        config = self._engine.ping_role_settings(challenge.guild_id)
         await channel.send(
+            content=ping_mention_content(config.role_id) if config is not None else None,
             embed=daily_challenge_embed(challenge, self._settings),
             view=self._build_view(challenge),
             file=snippet_attachment(challenge.snippet_paths[0]),
+            allowed_mentions=(
+                discord.AllowedMentions(roles=True) if config is not None else None
+            ),
         )
+
+    async def _post_announcement(self, channel_id: str, content: str, emoji: str) -> str:
+        """The live /songbot-pingrole transport: post + seed-reaction; return id.
+
+        The bot adds its own ``emoji`` reaction so users can opt in with one
+        tap. A seed-reaction failure (e.g. an invalid emoji string) deletes
+        the just-posted announcement and raises — the caller persists
+        nothing, so a retry starts clean.
+        """
+        channel = await self._challenge_channel(channel_id)
+        message = cast("discord.Message", await channel.send(content=content))
+        try:
+            await message.add_reaction(emoji)
+        except Exception:
+            with suppress(discord.HTTPException):
+                await message.delete()
+            raise
+        return str(message.id)
 
     async def _send_reveal(self, reveal: Reveal) -> None:
         """Post a previous challenge's reveal (song + winners) to its channel."""
