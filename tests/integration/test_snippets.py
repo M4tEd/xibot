@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 import yt_dlp
 
+from songbot import snippets as snippets_module
 from songbot.catalog import Song
 from songbot.catalog.youtube import YouTubePlaylistProvider
 from songbot.snippets import (
@@ -28,6 +29,7 @@ from songbot.snippets import (
     SnippetGenerationError,
     SnippetGenerator,
     SnippetSourceError,
+    download_section_with_timeout,
 )
 
 FIXTURE_DIR = Path(__file__).resolve().parents[2] / "data" / "fixture-music"
@@ -667,6 +669,94 @@ class TestFullAudioDownloadRetry:
         with pytest.raises(AssertionError, match="after 3 attempts"):
             _download_full_audio("https://www.youtube.com/watch?v=x", tmp_path / "full")
         assert calls == 3
+
+
+class TestSectionDownloadClientRotation:
+    """Issue #11: section downloads rotate YouTube player clients per attempt.
+
+    googlevideo 403s a URL flavor tied to the EXTRACTING client (observed
+    2026-08-27: every ANDROID_VR URL 403ed for hours), so each attempt
+    re-extracts with a DIFFERENT player client: attempt 1 uses yt-dlp's
+    defaults (no extractor_args), the following attempts pin player_client
+    from `_PLAYER_CLIENT_SETS`. Fully local: yt-dlp is stubbed out.
+    """
+
+    @staticmethod
+    def _fake_ytdl(tmp_path: Path, seen_clients: list[object], fail_attempts: int) -> type:
+        """A YoutubeDL stub recording player_client per construction."""
+
+        class FakeYoutubeDL:
+            def __init__(self, options: dict[str, object]) -> None:
+                extractor_args = options.get("extractor_args")
+                clients = (
+                    extractor_args.get("youtube", {}).get("player_client")
+                    if isinstance(extractor_args, dict)
+                    and isinstance(extractor_args.get("youtube"), dict)
+                    else None
+                )
+                seen_clients.append(None if clients is None else tuple(clients))
+
+            def __enter__(self) -> FakeYoutubeDL:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def download(self, urls: list[str]) -> None:
+                if len(seen_clients) <= fail_attempts:
+                    # A failed attempt leaves a .part file the retry must clean up.
+                    (tmp_path / "section.webm.part").write_bytes(b"partial")
+                    raise RuntimeError("HTTP Error 403: Forbidden")
+                (tmp_path / "section.webm").write_bytes(b"audio")
+
+        return FakeYoutubeDL
+
+    def test_rotates_player_clients_until_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen_clients: list[object] = []
+        monkeypatch.setattr(
+            yt_dlp, "YoutubeDL", self._fake_ytdl(tmp_path, seen_clients, fail_attempts=2)
+        )
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        result = download_section_with_timeout(
+            "https://www.youtube.com/watch?v=x", 1.0, 5.0, tmp_path / "section", 30.0
+        )
+
+        assert result == tmp_path / "section.webm"
+        expected = [
+            None if clients is None else tuple(clients)
+            for clients in snippets_module._PLAYER_CLIENT_SETS
+        ]
+        assert seen_clients == expected[:3], (
+            "attempt 1 must use yt-dlp defaults, then rotate through the client sets"
+        )
+        assert list(tmp_path.glob("*.part")) == [], "stale .part file survived the retries"
+
+    def test_exhausts_all_player_clients_then_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen_clients: list[object] = []
+        monkeypatch.setattr(
+            yt_dlp,
+            "YoutubeDL",
+            self._fake_ytdl(tmp_path, seen_clients, fail_attempts=10**9),
+        )
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        attempts = len(snippets_module._PLAYER_CLIENT_SETS)
+        with pytest.raises(SnippetGenerationError, match=f"after {attempts} attempts"):
+            download_section_with_timeout(
+                "https://www.youtube.com/watch?v=x", 1.0, 5.0, tmp_path / "section", 30.0
+            )
+
+        expected = [
+            None if clients is None else tuple(clients)
+            for clients in snippets_module._PLAYER_CLIENT_SETS
+        ]
+        assert seen_clients == expected
+        assert list(tmp_path.glob("*")) == [], "no artifacts survive a fully failed download"
 
 
 @pytest.mark.flaky(reruns=3, reruns_delay=30, reruns_delay_backoff_factor=2.0)

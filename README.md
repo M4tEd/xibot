@@ -15,7 +15,11 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
 - **Daily post** — a new challenge every day at `DAILY_POST_TIME` in the
   configured `TIMEZONE`: an embed, a 1-second snippet attachment, and three
   buttons. Posting is idempotent (a restart never double-posts), and songs are
-  never repeated until the whole catalog has been used.
+  never repeated until the whole catalog has been used. If the day's pick
+  cannot be snippeted (e.g. YouTube refuses the download), the bot
+  automatically replaces it with the next deterministic pick (bounded) before
+  falling back to its 60s retry cadence; YouTube section downloads also
+  rotate player clients across attempts to clear client-specific 403s.
 - **Hear-more ladder** — each player starts at the 1s snippet (worth 100
   points) and can press **Hear more** up to 4 times to unlock 2s / 4s / 8s /
   16s snippets, worth 75 / 50 / 30 / 15 points. Unlocks are per-user and
@@ -34,7 +38,7 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   current snippet level. Naming **both** artist and title in a single guess
   earns a 1.5× bonus (rounded half-up: 75 → 113, 15 → 23). The first correct
   guess triggers a public "🎉 @user guessed today's song…" announcement that
-  never reveals the song.
+  reports the snippet length they were hearing and never reveals the song.
 - **Streaks** — consecutive calendar days (configured timezone) with at least
   one solve. Missing a day resets the current streak; your best streak is kept.
 - **Leaderboard** — **Leaderboard** shows an ephemeral top 10 by total points
@@ -346,9 +350,10 @@ maps 1:1 to the core game loop.
    notice that doesn't consume a guess.
 5. **Correct guess + announcement** — submit the right title or artist →
    ephemeral ✅ with your points, plus a public "🎉 @you guessed today's song
-   in N guesses for P points!" message that does **not** name the song. A
-   guess naming both artist and title shows the 1.5× bonus. Further guesses
-   and Hear-more presses from you are refused afterwards.
+   in N guesses for P points while hearing Xs of audio!" message that does
+   **not** name the song (X is the snippet length you had unlocked when you
+   solved). A guess naming both artist and title shows the 1.5× bonus.
+   Further guesses and Hear-more presses from you are refused afterwards.
 6. **Leaderboard** — press **Leaderboard**: an ephemeral top-10 embed shows
    points, wins, and 🔥 streaks, and includes your new score.
 7. **Next-day reveal** — the following day at post time, the bot first posts

@@ -535,6 +535,36 @@ class TestSchedulerTick:
         finally:
             failing.db.close()
 
+    async def test_snippet_failure_auto_skips_within_the_tick(
+        self,
+        tmp_path: Path,
+        sender: _RecordingSender,
+    ) -> None:
+        """Issue #11: an unsnippable pick is replaced in the SAME tick.
+
+        The pre-fix behavior retried the identical song+offset every 60s
+        until a manual skip; now the tick posts the next deterministic pick
+        and settles on the normal cadence.
+        """
+        stack = _make_stack(tmp_path)
+        try:
+            _add_song(stack.db, "song-1")
+            _add_song(stack.db, "song-2")
+            client = _make_client(stack, sender=sender)
+            probe = stack.engine.ensure_today_challenge(GUILD_ID, CHANNEL_ID, DAY1_PM)
+            stack.db.execute("DELETE FROM challenges WHERE id = ?", (probe.id,))
+            stack.snippets.fail_ids = {probe.song.source_id}
+
+            delay = await client._scheduler_tick(DAY1_PM)
+
+            assert [kind for kind, _ in sender.events] == ["post"]
+            _, challenge = sender.events[0]
+            assert challenge.skip_count == 1
+            assert challenge.song.id != probe.song.id
+            assert delay == client_module.MAX_SLEEP_SEC  # settled, not retry backoff
+        finally:
+            stack.db.close()
+
     def test_seconds_until_next_check_uses_next_post_datetime(self, stack: _Stack) -> None:
         client = _make_client(stack)
 

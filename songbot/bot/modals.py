@@ -22,6 +22,7 @@ from typing import Protocol, cast
 import discord
 
 from songbot.bot.embeds import announcement_content, guess_feedback_content
+from songbot.config import Settings
 from songbot.engine import GameEngine
 
 __all__ = ["Clock", "GuessModal", "utc_now"]
@@ -69,11 +70,13 @@ class GuessModal(discord.ui.Modal):
         engine: GameEngine,
         challenge_id: int,
         *,
+        settings: Settings,
         clock: Clock | None = None,
     ) -> None:
         super().__init__(title="Guess the song")
         self._engine = engine
         self._challenge_id = challenge_id
+        self._settings = settings
         self._clock: Clock = clock if clock is not None else utc_now
 
     async def on_submit(self, interaction: discord.Interaction[discord.Client], /) -> None:
@@ -93,9 +96,7 @@ class GuessModal(discord.ui.Modal):
         if result.announce:
             await self._announce(
                 interaction,
-                announcement_content(
-                    user_id, result.guesses_used, result.points_awarded
-                ),
+                announcement_content(user_id, result, self._settings),
             )
 
     async def _announce(
