@@ -17,10 +17,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, overload
+from typing import Literal, cast, overload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import dotenv_values
+
+from songbot.matching import GuessMatchMode
 
 __all__ = ["ConfigError", "Settings", "load_settings"]
 
@@ -32,6 +34,7 @@ DEFAULT_MAX_GUESSES_PER_DAY = 6
 DEFAULT_SNIPPET_LENGTHS = (1.0, 2.0, 4.0, 8.0, 16.0)
 DEFAULT_SNIPPET_POINTS = (100, 75, 50, 30, 15)
 DEFAULT_BOTH_CORRECT_MULTIPLIER = 1.5
+DEFAULT_GUESS_MATCH_MODE: GuessMatchMode = "either"
 DEFAULT_DATABASE_PATH = Path("./data/songbot.db")
 DEFAULT_SNIPPET_CACHE_DIR = Path("./data/snippets")
 DEFAULT_HEALTH_PORT = 3108
@@ -39,6 +42,7 @@ DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_DISCORD_API_BASE = "https://discord.com/api/v10"
 
 _VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_VALID_GUESS_MATCH_MODES = ("title", "artist", "either")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
@@ -65,6 +69,7 @@ class Settings:
     snippet_lengths: tuple[float, ...]  # seconds, parallel to snippet_points
     snippet_points: tuple[int, ...]
     both_correct_multiplier: float
+    guess_match_mode: GuessMatchMode  # what counts as a correct guess
     database_path: Path
     snippet_cache_dir: Path
     health_port: int
@@ -185,6 +190,13 @@ def load_settings(
         minimum_exclusive=0.0,
     )
 
+    guess_match_mode = optional("GUESS_MATCH_MODE", DEFAULT_GUESS_MATCH_MODE).lower()
+    if guess_match_mode not in _VALID_GUESS_MATCH_MODES:
+        problems.append(
+            f"GUESS_MATCH_MODE '{guess_match_mode}' is invalid; "
+            f"expected one of {', '.join(_VALID_GUESS_MATCH_MODES)}"
+        )
+
     database_path = Path(optional("DATABASE_PATH", str(DEFAULT_DATABASE_PATH)))
     if database_path.exists() and database_path.is_dir():
         problems.append(f"DATABASE_PATH '{database_path}' exists but is a directory")
@@ -233,6 +245,7 @@ def load_settings(
         snippet_lengths=_assert_present(snippet_lengths),
         snippet_points=_assert_present(snippet_points),
         both_correct_multiplier=_assert_present(both_correct_multiplier),
+        guess_match_mode=cast("GuessMatchMode", guess_match_mode),
         database_path=database_path,
         snippet_cache_dir=snippet_cache_dir,
         health_port=_assert_present(health_port),

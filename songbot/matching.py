@@ -22,6 +22,13 @@ only rewards exact-token subsets, so without this fallback a single typo in
 one token ("Bohemian Rhapsody Quen", "Halp") collapses the score below the
 threshold — which used to cost players the both-fields bonus on combined
 title+artist guesses and made short titles/artists tolerate zero typos.
+
+``match_guess``'s ``mode`` narrows what counts as correct: ``"either"``
+(default) accepts the title OR the artist, ``"title"`` only the title, and
+``"artist"`` only the artist. The field-level flags
+(``matched_title``/``matched_artist``) always report the raw outcomes; the
+mode only re-derives ``is_correct`` and forces ``is_both`` off, so the 1.5x
+both-fields bonus exists only in ``"either"`` mode.
 """
 
 from __future__ import annotations
@@ -29,12 +36,22 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
 
-__all__ = ["MATCH_THRESHOLD", "MatchResult", "SongLike", "match_guess", "normalize"]
+__all__ = [
+    "MATCH_THRESHOLD",
+    "GuessMatchMode",
+    "MatchResult",
+    "SongLike",
+    "match_guess",
+    "normalize",
+]
+
+GuessMatchMode = Literal["title", "artist", "either"]
+"""What counts as a correct guess (configured via ``GUESS_MATCH_MODE``)."""
 
 MATCH_THRESHOLD = 85
 """Minimum post-normalization ``token_set_ratio`` for a guess to match."""
@@ -72,8 +89,11 @@ class SongLike(Protocol):
 class MatchResult:
     """How a guess scored against a song.
 
-    ``is_correct`` is title OR artist; ``is_both`` (both in one guess) gates
-    the 1.5x bonus. A ``raw_title`` fallback rescue is credited as
+    ``matched_title``/``matched_artist`` always report the raw field-level
+    outcomes. ``is_correct`` applies the match mode on top (``"either"``:
+    title OR artist; ``"title"``: title only; ``"artist"``: artist only).
+    ``is_both`` (both fields in one guess, ``"either"`` mode only) gates the
+    1.5x bonus. A ``raw_title`` fallback rescue is credited as
     ``matched_title`` only — it never fabricates a both-match bonus.
     """
 
@@ -129,7 +149,11 @@ def _tokens_cover(guess_tokens: list[str], candidate_tokens: list[str], threshol
 
 
 def match_guess(
-    guess: str, song: SongLike, *, threshold: int = MATCH_THRESHOLD
+    guess: str,
+    song: SongLike,
+    *,
+    threshold: int = MATCH_THRESHOLD,
+    mode: GuessMatchMode = "either",
 ) -> MatchResult:
     """Score ``guess`` against ``song``'s title, artist, and raw_title.
 
@@ -139,6 +163,12 @@ def match_guess(
     can still match via the per-token fallback (`_tokens_cover`). The
     ``raw_title`` fallback is consulted only when neither the parsed title
     nor the parsed artist matched.
+
+    ``mode`` narrows the verdict without touching the field-level flags:
+    ``"either"`` (default) counts the title OR the artist as correct and
+    allows the both-fields bonus; ``"title"`` counts only the title and
+    ``"artist"`` only the artist, and in both restricted modes ``is_both``
+    is always False (no 1.5x bonus).
     """
     normalized = normalize(guess)
     if not normalized:
@@ -157,10 +187,16 @@ def match_guess(
     matched_artist = matches(normalize(song.artist or ""))
     if not (matched_title or matched_artist) and matches(normalize(song.raw_title)):
         matched_title = True  # raw_title rescue: credited as a title match
-    is_correct = matched_title or matched_artist
+    if mode == "title":
+        is_correct = matched_title
+    elif mode == "artist":
+        is_correct = matched_artist
+    else:
+        is_correct = matched_title or matched_artist
+    is_both = mode == "either" and matched_title and matched_artist
     return MatchResult(
         matched_title=matched_title,
         matched_artist=matched_artist,
         is_correct=is_correct,
-        is_both=matched_title and matched_artist,
+        is_both=is_both,
     )

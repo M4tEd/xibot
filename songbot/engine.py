@@ -906,11 +906,12 @@ class GameEngine:
         (pinned #13). Any other submission consumes one of the day's guesses
         (the winning guess included) and is logged verbatim; as a first
         interaction it also registers a zero-valued ``user_stats`` row
-        (VAL-SCORE-005). A correct guess
-        banks ``SNIPPET_POINTS[level]`` — round-half-up x1.5 when one guess
-        matches BOTH title and artist (pinned #6) — and updates
-        ``user_stats`` (points, wins, streaks). All writes happen in one
-        transaction.
+        (VAL-SCORE-005). What counts as correct is governed by the configured
+        ``guess_match_mode`` (title only, artist only, or either). A correct
+        guess banks ``SNIPPET_POINTS[level]`` — round-half-up x1.5 when one
+        guess matches BOTH title and artist (pinned #6; ``either`` mode only)
+        — and updates ``user_stats`` (points, wins, streaks). All writes
+        happen in one transaction.
         """
         challenge = self._challenge_row_by_id(challenge_id)
         max_guesses = self._settings.max_guesses_per_day
@@ -973,7 +974,7 @@ class GameEngine:
                 )
 
             song = self._song_row(challenge.song_id)
-            match = match_guess(stripped, song)
+            match = match_guess(stripped, song, mode=self._settings.guess_match_mode)
             new_used = used + 1
             created_at = self._utc_iso(now)
             level = state.snippet_level if state is not None else 0
