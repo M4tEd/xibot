@@ -20,10 +20,11 @@ import discord
 import pytest
 
 from songbot.bot.modals import GuessModal
+from songbot.config import Settings
 from songbot.db import Database
 from songbot.engine import Challenge, GameEngine
 from tests.unit.interaction_fakes import FakeInteraction
-from tests.unit.test_engine_daily import NOW, _make_engine, _reveal_previous
+from tests.unit.test_engine_daily import NOW, _make_engine, _reveal_previous, _settings
 from tests.unit.test_engine_gameplay import _add_song
 
 NEXT_DAY = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
@@ -48,13 +49,18 @@ def engine(db: Database, tmp_path: Path) -> GameEngine:
 
 
 @pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return _settings(tmp_path)
+
+
+@pytest.fixture
 def challenge(engine: GameEngine, db: Database) -> Challenge:
     _add_song(db)
     return engine.ensure_today_challenge("g1", "c1", NOW)
 
 
-def _modal(engine: GameEngine, challenge: Challenge) -> GuessModal:
-    return GuessModal(engine, challenge.id, clock=lambda: NOW)
+def _modal(engine: GameEngine, challenge: Challenge, settings: Settings) -> GuessModal:
+    return GuessModal(engine, challenge.id, settings=settings, clock=lambda: NOW)
 
 
 async def _submit(
@@ -68,24 +74,26 @@ async def _submit(
 
 class TestModalShape:
     def test_exactly_one_required_text_input(
-        self, engine: GameEngine, challenge: Challenge
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
-        modal = _modal(engine, challenge)
+        modal = _modal(engine, challenge, settings)
         text_inputs = [c for c in modal.children if isinstance(c, discord.ui.TextInput)]
         assert len(text_inputs) == 1
         (text_input,) = text_inputs
         assert text_input.required is True
         assert text_input.placeholder == "Artist or title..."
 
-    def test_modal_has_a_title(self, engine: GameEngine, challenge: Challenge) -> None:
-        assert _modal(engine, challenge).title
+    def test_modal_has_a_title(
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
+    ) -> None:
+        assert _modal(engine, challenge, settings).title
 
 
 class TestSubmitGuess:
     async def test_correct_title_banks_points_and_announces(
-        self, engine: GameEngine, challenge: Challenge, db: Database
+        self, engine: GameEngine, challenge: Challenge, db: Database, settings: Settings
     ) -> None:
-        interaction = await _submit(_modal(engine, challenge), TITLE)
+        interaction = await _submit(_modal(engine, challenge, settings), TITLE)
 
         kinds = [p.kind for p in interaction.payloads]
         assert kinds == ["ephemeral", "announcement"]
@@ -102,6 +110,7 @@ class TestSubmitGuess:
         assert "<@1001>" in announcement.content  # mention format
         assert "1 guess" in announcement.content
         assert "100" in announcement.content
+        assert "1s" in announcement.content  # solved at level 0 -> hearing 1s of audio
 
         row = db.query_one(
             "SELECT solved, points_awarded, guesses_used FROM challenge_users"
@@ -111,9 +120,11 @@ class TestSubmitGuess:
         assert dict(row) == {"solved": 1, "points_awarded": 100, "guesses_used": 1}
 
     async def test_artist_only_guess_solves(
-        self, engine: GameEngine, challenge: Challenge
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
-        interaction = await _submit(_modal(engine, challenge), ARTIST, user_id=1002, name="bob")
+        interaction = await _submit(
+            _modal(engine, challenge, settings), ARTIST, user_id=1002, name="bob"
+        )
         reply = interaction.payloads[0]
         assert reply.kind == "ephemeral"
         assert reply.content is not None
@@ -121,9 +132,11 @@ class TestSubmitGuess:
         assert "artist" in reply.content.lower()
 
     async def test_both_match_reports_bonus(
-        self, engine: GameEngine, challenge: Challenge, db: Database
+        self, engine: GameEngine, challenge: Challenge, db: Database, settings: Settings
     ) -> None:
-        interaction = await _submit(_modal(engine, challenge), BOTH, user_id=1003, name="carol")
+        interaction = await _submit(
+            _modal(engine, challenge, settings), BOTH, user_id=1003, name="carol"
+        )
         reply = interaction.payloads[0]
         assert reply.content is not None
         assert "bonus" in reply.content.lower()
@@ -136,10 +149,24 @@ class TestSubmitGuess:
         assert row is not None
         assert row["points_awarded"] == 150
 
-    async def test_wrong_guess_reports_remaining_without_announcement(
-        self, engine: GameEngine, challenge: Challenge
+    async def test_announcement_reports_snippet_length_at_solve_level(
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
-        interaction = await _submit(_modal(engine, challenge), WRONG)
+        # Two Hear-more presses put the solver at level 2 (4s, worth 50 points).
+        engine.unlock_snippet(challenge.id, "1001")
+        engine.unlock_snippet(challenge.id, "1001")
+        interaction = await _submit(_modal(engine, challenge, settings), TITLE)
+
+        announcement = interaction.payloads[1]
+        assert announcement.kind == "announcement"
+        assert announcement.content is not None
+        assert "**4s** of audio" in announcement.content
+        assert "50" in announcement.content
+
+    async def test_wrong_guess_reports_remaining_without_announcement(
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
+    ) -> None:
+        interaction = await _submit(_modal(engine, challenge, settings), WRONG)
         assert [p.kind for p in interaction.payloads] == ["ephemeral"]
         reply = interaction.payloads[0]
         assert reply.content is not None
@@ -147,9 +174,9 @@ class TestSubmitGuess:
         assert "5" in reply.content  # guesses left
 
     async def test_empty_guess_is_rejected_without_counting(
-        self, engine: GameEngine, challenge: Challenge, db: Database
+        self, engine: GameEngine, challenge: Challenge, db: Database, settings: Settings
     ) -> None:
-        interaction = await _submit(_modal(engine, challenge), "   ")
+        interaction = await _submit(_modal(engine, challenge, settings), "   ")
         assert [p.kind for p in interaction.payloads] == ["ephemeral"]
         reply = interaction.payloads[0]
         assert reply.content is not None
@@ -166,32 +193,32 @@ class TestSubmitGuess:
         )
 
     async def test_guess_after_solve_rejected_without_second_announcement(
-        self, engine: GameEngine, challenge: Challenge
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
         engine.submit_guess(challenge.id, "1001", TITLE, NOW)
-        interaction = await _submit(_modal(engine, challenge), "anything else")
+        interaction = await _submit(_modal(engine, challenge, settings), "anything else")
         assert [p.kind for p in interaction.payloads] == ["ephemeral"]
         reply = interaction.payloads[0]
         assert reply.content is not None
         assert "already" in reply.content.lower()
 
     async def test_guess_at_limit_rejected(
-        self, engine: GameEngine, challenge: Challenge
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
         for i in range(6):
             engine.submit_guess(challenge.id, "1001", f"{WRONG} {i}", NOW)
-        interaction = await _submit(_modal(engine, challenge), TITLE)
+        interaction = await _submit(_modal(engine, challenge, settings), TITLE)
         assert [p.kind for p in interaction.payloads] == ["ephemeral"]
         reply = interaction.payloads[0]
         assert reply.content is not None
         assert "❌" in reply.content
 
     async def test_revealed_challenge_yields_single_closed_notice(
-        self, engine: GameEngine, challenge: Challenge, db: Database
+        self, engine: GameEngine, challenge: Challenge, db: Database, settings: Settings
     ) -> None:
         # VAL-GUESS-019 adapter half: one ephemeral closed notice, nothing else.
         _reveal_previous(engine, "g1", NEXT_DAY)
-        interaction = await _submit(_modal(engine, challenge), TITLE)
+        interaction = await _submit(_modal(engine, challenge, settings), TITLE)
 
         assert len(interaction.payloads) == 1
         payload = interaction.payloads[0]
@@ -217,19 +244,19 @@ class TestSubmitGuess:
 
 class TestSecrecy:
     async def test_no_payload_contains_song_identity(
-        self, engine: GameEngine, challenge: Challenge
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
         """VAL-GUESS-013/VAL-CROSS-010: title/artist never appear pre-reveal."""
-        interaction = await _submit(_modal(engine, challenge), TITLE)
+        interaction = await _submit(_modal(engine, challenge, settings), TITLE)
         for payload in interaction.payloads:
             text = payload.content or ""
             assert TITLE.lower() not in text.lower()
             assert ARTIST.lower() not in text.lower()
 
     async def test_announcement_uses_mention_not_plain_name(
-        self, engine: GameEngine, challenge: Challenge
+        self, engine: GameEngine, challenge: Challenge, settings: Settings
     ) -> None:
-        interaction = await _submit(_modal(engine, challenge), TITLE)
+        interaction = await _submit(_modal(engine, challenge, settings), TITLE)
         announcement = interaction.payloads[1]
         assert announcement.content is not None
         assert "<@1001>" in announcement.content

@@ -283,9 +283,12 @@ class GuessResult:
     ``guesses_used``/``guesses_left`` reflect the state AFTER the submission
     (unchanged for the ``already_solved``/``limit_reached``/``empty``
     rejections). ``points_awarded`` is non-zero only for ``correct``.
-    ``announce`` is True exactly for the solving guess — per-user solves are
-    singular, so every correct guess is the user's first (pinned: one public
-    announcement per solve).
+    ``snippet_level`` is the user's snippet level when the submission was
+    processed — for ``correct``, the level the solver was actually hearing at
+    solve time (the ladder rung that scored), which the public solve
+    announcement reports as a snippet length. ``announce`` is True exactly
+    for the solving guess — per-user solves are singular, so every correct
+    guess is the user's first (pinned: one public announcement per solve).
     """
 
     outcome: GuessOutcome
@@ -295,6 +298,7 @@ class GuessResult:
     guesses_used: int
     guesses_left: int
     points_awarded: int
+    snippet_level: int
     announce: bool
 
 
@@ -992,6 +996,7 @@ class GameEngine:
                 guesses_used=used,
                 guesses_left=max_guesses - used,
                 points_awarded=0,
+                snippet_level=state.snippet_level if state is not None else 0,
                 announce=False,
             )
 
@@ -1007,6 +1012,7 @@ class GameEngine:
                 guesses_used=used,
                 guesses_left=max_guesses - used,
                 points_awarded=0,
+                snippet_level=state.snippet_level if state is not None else 0,
                 announce=False,
             )
 
@@ -1021,6 +1027,7 @@ class GameEngine:
                     guesses_used=state.guesses_used,
                     guesses_left=max_guesses - state.guesses_used,
                     points_awarded=0,
+                    snippet_level=state.snippet_level,
                     announce=False,
                 )
             used = state.guesses_used if state is not None else 0
@@ -1033,6 +1040,7 @@ class GameEngine:
                     guesses_used=used,
                     guesses_left=0,
                     points_awarded=0,
+                    snippet_level=state.snippet_level if state is not None else 0,
                     announce=False,
                 )
 
@@ -1084,6 +1092,7 @@ class GameEngine:
                 guesses_used=new_used,
                 guesses_left=max_guesses - new_used,
                 points_awarded=points,
+                snippet_level=level,
                 announce=solved,
             )
 
