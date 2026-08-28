@@ -265,7 +265,15 @@ class TestGameplayFlow:
         assert feedback["recipient"] == "alice"
         assert "✅" in feedback["content"]
         assert "15" in feedback["content"]
+        # Issue #7: the solver's ephemeral feedback attaches the FULL song
+        # from the neutral cache path, under the pinned-#9 filename.
+        assert len(feedback["attachments"]) == 1
+        full = feedback["attachments"][0]
+        assert full["filename"] == "songbot-full.mp3"
+        assert Path(full["path"]) == tmp_path / "snippets" / str(challenge_id) / "full.mp3"
+        assert full["size"] > 0
         announcement = guess["payloads"][2]
+        assert announcement["attachments"] == []
         assert "<@alice>" in announcement["content"]
         assert "1 guess" in announcement["content"]
         assert "15" in announcement["content"]
@@ -277,10 +285,15 @@ class TestGameplayFlow:
         assert kinds(wrong) == ["modal", "ephemeral"]
         assert "❌" in wrong["payloads"][1]["content"]
         assert "5" in wrong["payloads"][1]["content"]
+        assert wrong["payloads"][1]["attachments"] == []
         solved = run_json(tmp_path, "guess", "--user", "bob", "--text", artist,
                           "--now", DAY1_NOW)
         assert kinds(solved) == ["modal", "ephemeral", "announcement"]
         assert "100" in solved["payloads"][1]["content"]
+        # The full audio is cached per challenge: bob's solve reuses it.
+        solved_full = solved["payloads"][1]["attachments"][0]
+        assert solved_full["filename"] == "songbot-full.mp3"
+        assert solved_full["path"] == full["path"]
         transcript += wrong["payloads"] + solved["payloads"]
 
         # Leaderboard: ephemeral to the requester, alice+bob listed.

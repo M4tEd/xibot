@@ -17,7 +17,18 @@ ffmpeg-based section fetches are absorbed by retrying with fresh URLs.
 Cache layout (rooted at ``Settings.snippet_cache_dir``)::
 
     <cache_dir>/<challenge_id>/<level>.mp3      # one file per snippet level
+    <cache_dir>/<challenge_id>/full.mp3         # the full song (solver reward)
     <cache_dir>/sections/<challenge_id>.<ext>   # YouTube section intermediate
+
+``ensure_full_audio`` serves the FULL-length track a correct guess earns
+(issue #7): YouTube songs are fetched once per challenge as a full mp3 (no
+section cut, same fresh-URL retry pattern as the section download); local
+songs are staged from the catalog file — copied byte-identically when it is
+already mp3, re-encoded with the same libmp3lame pipeline otherwise, so the
+pinned ``songbot-full.mp3`` attachment name always matches the content.
+Everything players receive lives under the challenge's neutral cache dir, so
+no served path ever carries the song's file name (pinned #9) and
+`purge_challenge` removes the full audio along with the snippet levels.
 
 Idempotency: existing non-empty level files are skipped untouched (a 0-byte
 file is a partial artifact and is regenerated). Every generated file is
@@ -54,11 +65,13 @@ __all__ = [
     "DEFAULT_FFMPEG_TIMEOUT_SEC",
     "DURATION_TOLERANCE_SEC",
     "SECTION_PADDING_SEC",
+    "FullDownloader",
     "SectionDownloader",
     "SnippetError",
     "SnippetGenerationError",
     "SnippetGenerator",
     "SnippetSourceError",
+    "download_full_with_timeout",
     "download_section_with_timeout",
 ]
 
@@ -88,6 +101,14 @@ path returned. The production default is `download_section_with_timeout`;
 tests inject a stub.
 """
 
+FullDownloader = Callable[[str, Path, float], Path]
+"""Fetches ALL of ``url``'s audio (no section cut) into a file.
+
+Arguments: ``(url, dest_base, timeout_sec)``. The file is written as
+``<dest_base>.mp3`` (the downloader re-encodes to mp3) and its path returned.
+The production default is `download_full_with_timeout`; tests inject a stub.
+"""
+
 
 class SnippetError(Exception):
     """Base class for snippet generation failures."""
@@ -104,8 +125,9 @@ class SnippetGenerationError(SnippetError):
 class SnippetGenerator:
     """Generates and caches exact-duration mp3 snippets for daily challenges.
 
-    ``section_downloader`` is injectable for tests; the default performs the
-    real yt-dlp section download bounded by ``download_timeout_sec``.
+    ``section_downloader``/``full_downloader`` are injectable for tests; the
+    defaults perform the real yt-dlp downloads bounded by
+    ``download_timeout_sec``.
     """
 
     def __init__(
@@ -115,6 +137,7 @@ class SnippetGenerator:
         ffmpeg_timeout_sec: float = DEFAULT_FFMPEG_TIMEOUT_SEC,
         download_timeout_sec: float = DEFAULT_DOWNLOAD_TIMEOUT_SEC,
         section_downloader: SectionDownloader | None = None,
+        full_downloader: FullDownloader | None = None,
     ) -> None:
         if ffmpeg_timeout_sec <= 0:
             raise ValueError(f"ffmpeg_timeout_sec must be positive, got {ffmpeg_timeout_sec}")
@@ -132,6 +155,9 @@ class SnippetGenerator:
             )
         self._section_downloader: SectionDownloader = (
             section_downloader if section_downloader is not None else download_section_with_timeout
+        )
+        self._full_downloader: FullDownloader = (
+            full_downloader if full_downloader is not None else download_full_with_timeout
         )
 
     @property
@@ -204,9 +230,63 @@ class SnippetGenerator:
         )
         return targets
 
+    def ensure_full_audio(self, song: Song, challenge_id: int | str) -> Path:
+        """Ensure the challenge's FULL-length audio is cached; return its path.
+
+        The solver reward (issue #7): the complete track behind the snippets,
+        served from the challenge's cache dir as ``full.mp3`` — a neutral
+        path, so nothing the bot attaches ever carries the song's file name
+        (pinned #9). YouTube songs are downloaded once per challenge (no
+        section cut); local songs are staged from the catalog file (an mp3 is
+        copied byte-identically, other containers are re-encoded to mp3). A
+        cached non-empty file is reused untouched — cache hits never touch
+        the source again.
+
+        Raises:
+            ValueError: on an unsafe challenge_id.
+            SnippetSourceError: the local source file is missing/empty/corrupt.
+            SnippetGenerationError: ffmpeg/yt-dlp/verification failure.
+        """
+        cid = self._validate_challenge_id(challenge_id)
+        target = self._full_path(cid)
+        if self._is_complete(target):
+            logger.debug("challenge %s: full audio already cached", cid)
+            return target
+        if song.source == "youtube":
+            try:
+                return self._download_full_audio(song, cid, target)
+            except BaseException:
+                # rmdir only succeeds if the failed call left the dir empty.
+                with contextlib.suppress(OSError):
+                    self._challenge_dir(cid).rmdir()
+                raise
+
+        source = Path(song.audio_ref)
+        if not source.is_file() or source.stat().st_size == 0:
+            raise SnippetSourceError(
+                f"Source audio file does not exist or is empty: {source} "
+                f"(song {song.title!r}, source_id {song.source_id!r})"
+            )
+        self._challenge_dir(cid).mkdir(parents=True, exist_ok=True)
+        try:
+            self._stage_local_full(source, target)
+        except BaseException:
+            # No partial artifact survives: the target (a 0-byte partial from
+            # an earlier crashed run this call intended to replace) plus the
+            # challenge dir itself when this call left it empty. A completed
+            # stage never reaches here — the atomic rename is its last step.
+            target.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                self._challenge_dir(cid).rmdir()
+            raise
+        logger.info("challenge %s: staged full audio from %s -> %s", cid, source, target)
+        return target
+
     def purge_challenge(self, challenge_id: int | str) -> None:
         """Delete a challenge's snippet cache dir and any section intermediate.
 
+        The challenge dir holds the snippet levels AND the staged full audio
+        (``full.mp3``), so one rmtree clears everything the challenge cached.
         Used by skip-song (pinned decision #5). Missing entries are ignored.
         """
         cid = self._validate_challenge_id(challenge_id)
@@ -302,6 +382,85 @@ class SnippetGenerator:
         except SnippetGenerationError:
             return False
         return duration >= required - DURATION_TOLERANCE_SEC
+
+    def _stage_local_full(self, source: Path, target: Path) -> None:
+        """Stage a local song's full audio at ``target`` (copy or re-encode).
+
+        An mp3 source is copied byte-identically; the other supported
+        containers (.m4a/.flac/.ogg) are re-encoded with the same libmp3lame
+        pipeline as the snippets, so the pinned ``songbot-full.mp3``
+        attachment name always matches the served content. The staged file is
+        ffprobe-verified readable before the atomic rename.
+        """
+        fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".tmp-", suffix=".mp3")
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            if source.suffix.lower() == ".mp3":
+                shutil.copyfile(source, tmp)
+            else:
+                self._run(
+                    [
+                        self._ffmpeg_or_raise(),
+                        "-nostdin",
+                        "-v",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(source),
+                        "-vn",
+                        "-c:a",
+                        "libmp3lame",
+                        str(tmp),
+                    ],
+                    what=f"ffmpeg full-audio re-encode of {source} for {target.name}",
+                )
+            try:
+                self._probe_duration(tmp)
+            except SnippetGenerationError as exc:
+                raise SnippetSourceError(
+                    f"Source audio file is unreadable or corrupt: {source} ({exc})"
+                ) from exc
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _download_full_audio(self, song: Song, cid: str, target: Path) -> Path:
+        """Fetch a YouTube song's WHOLE track once (no section cut) to ``target``.
+
+        Mirrors `_ensure_intermediate`: the injected downloader writes to a
+        unique temp base, the result is verified (non-empty, ffprobe-readable)
+        and atomically renamed into place; a failed attempt removes its own
+        partials so no stray artifacts survive.
+        """
+        self._challenge_dir(cid).mkdir(parents=True, exist_ok=True)
+        dest_base = self._challenge_dir(cid) / f".tmp-full-{os.getpid()}-{secrets.token_hex(4)}"
+        try:
+            downloaded = self._full_downloader(
+                song.audio_ref, dest_base, self._download_timeout_sec
+            )
+        except SnippetError:
+            raise
+        except Exception as exc:
+            raise SnippetGenerationError(
+                f"Full-audio download failed for {song.audio_ref!r}: {exc}"
+            ) from exc
+        downloaded = Path(downloaded)
+        try:
+            if not downloaded.is_file() or downloaded.stat().st_size == 0:
+                raise SnippetGenerationError(
+                    f"Full-audio download for {song.audio_ref!r} produced no file "
+                    f"(expected {dest_base}.*)"
+                )
+            self._probe_duration(downloaded)
+        except BaseException:
+            downloaded.unlink(missing_ok=True)
+            raise
+        os.replace(downloaded, target)
+        logger.info(
+            "challenge %s: downloaded full audio of %r -> %s", cid, song.audio_ref, target
+        )
+        return target
 
     def _check_length(
         self, source: Path, song: Song, duration: float, offset: float, max_len: float
@@ -432,6 +591,9 @@ class SnippetGenerator:
 
     def _level_path(self, cid: str, level: int) -> Path:
         return self._challenge_dir(cid) / f"{level}.mp3"
+
+    def _full_path(self, cid: str) -> Path:
+        return self._challenge_dir(cid) / "full.mp3"
 
     @property
     def _sections_dir(self) -> Path:
@@ -572,6 +734,103 @@ def _download_section_once(
     except Exception as exc:
         raise SnippetGenerationError(
             f"yt-dlp could not download section {start_sec:.3f}-{end_sec:.3f}s of {url!r}: {exc}"
+        ) from exc
+    matches = [
+        path
+        for path in dest_base.parent.glob(f"{dest_base.name}.*")
+        if path.suffix != ".part" and path.is_file() and path.stat().st_size > 0
+    ]
+    if not matches:
+        raise SnippetGenerationError(
+            f"yt-dlp produced no output file for {url!r} (expected {dest_base}.*)"
+        )
+    return sorted(matches)[0]
+
+
+def download_full_with_timeout(url: str, dest_base: Path, timeout_sec: float) -> Path:
+    """Download ALL of ``url``'s audio as mp3 via yt-dlp (no section cut).
+
+    Runs yt-dlp on a worker thread with a wall-clock bound (same pattern as
+    `download_section_with_timeout`). The output file is ``<dest_base>.mp3``:
+    the FFmpegExtractAudio postprocessor re-encodes whatever container
+    YouTube served, so the pinned ``songbot-full.mp3`` attachment filename
+    always matches the content.
+
+    Raises:
+        SnippetGenerationError: on timeout, download failure, or missing output.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(_download_full, url, dest_base, timeout_sec)
+    try:
+        return future.result(timeout=timeout_sec)
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise SnippetGenerationError(
+            f"Timed out after {timeout_sec:.0f}s downloading full audio from {url!r}"
+        ) from exc
+    except SnippetGenerationError:
+        raise
+    except Exception as exc:
+        raise SnippetGenerationError(
+            f"Failed to download full audio from {url!r}: {exc}"
+        ) from exc
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _download_full(url: str, dest_base: Path, timeout_sec: float) -> Path:
+    """Fetch the full audio with the yt-dlp Python API (network: YouTube).
+
+    The same fresh-extraction retry pattern as `_download_section`: a
+    transient googlevideo 403 clears with a fresh URL. Partial output of
+    failed attempts is removed so no stray artifacts survive.
+    """
+    last_error: SnippetGenerationError | None = None
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        try:
+            return _download_full_once(url, dest_base, timeout_sec)
+        except SnippetGenerationError as exc:
+            last_error = exc
+            logger.warning(
+                "full-audio download attempt %d/%d for %r failed: %s",
+                attempt,
+                _DOWNLOAD_ATTEMPTS,
+                url,
+                exc,
+            )
+            for leftover in dest_base.parent.glob(f"{dest_base.name}.*"):
+                leftover.unlink(missing_ok=True)
+            if attempt < _DOWNLOAD_ATTEMPTS:
+                time.sleep(min(2.0 ** (attempt - 1), 4.0))
+    raise SnippetGenerationError(
+        f"Failed to download full audio from {url!r} after "
+        f"{_DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
+
+
+def _download_full_once(url: str, dest_base: Path, timeout_sec: float) -> Path:
+    """Single yt-dlp full-audio download attempt (network: YouTube)."""
+    options: dict[str, Any] = {
+        "format": "bestaudio/best",
+        "outtmpl": f"{dest_base}.%(ext)s",
+        # No download_ranges: the WHOLE track. Re-encode to mp3 so the pinned
+        # songbot-full.mp3 attachment filename always matches the content.
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3"},
+        ],
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        # Keep stdout pristine: the harness CLI prints machine-readable JSON.
+        "noprogress": True,
+        "socket_timeout": min(timeout_sec, 30.0),
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        raise SnippetGenerationError(
+            f"yt-dlp could not download the full audio of {url!r}: {exc}"
         ) from exc
     matches = [
         path

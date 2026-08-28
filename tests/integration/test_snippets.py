@@ -164,6 +164,25 @@ class StubSectionDownloader:
         return dest
 
 
+class StubFullDownloader:
+    """Test double for the yt-dlp full-audio download: re-encodes locally.
+
+    Mimics the real downloader contract: writes the WHOLE ``source`` as
+    ``<dest_base>.mp3`` (the production downloader's FFmpegExtractAudio
+    postprocessor shape) and returns its path.
+    """
+
+    def __init__(self, source: Path) -> None:
+        self.source = source
+        self.calls: list[str] = []
+
+    def __call__(self, url: str, dest_base: Path, timeout: float) -> Path:
+        self.calls.append(url)
+        dest = dest_base.parent / f"{dest_base.name}.mp3"
+        _ffmpeg("-i", str(self.source), "-c:a", "libmp3lame", str(dest))
+        return dest
+
+
 class TestLocalGeneration:
     """Expected behavior: full ladder at the documented cache path, exact durations."""
 
@@ -517,6 +536,107 @@ class TestYouTubeFlow:
         with pytest.raises(SnippetSourceError, match="too short"):
             gen.ensure_snippets(song, challenge_id=17, offset=20.0, lengths=LENGTHS)
         assert stub.calls == [], "no download may happen for an impossible offset"
+
+
+class TestFullAudio:
+    """ensure_full_audio (issue #7): the solver's whole track at full.mp3."""
+
+    def test_local_mp3_is_copied_byte_identical(self, tmp_path: Path) -> None:
+        gen = SnippetGenerator(tmp_path)
+        song = _local_song()
+
+        path = gen.ensure_full_audio(song, challenge_id=21)
+
+        assert path == tmp_path / "21" / "full.mp3"
+        assert path.read_bytes() == MP3_FIXTURE.read_bytes()
+
+    def test_local_m4a_reencodes_to_mp3(self, tmp_path: Path) -> None:
+        """Non-mp3 containers re-encode so songbot-full.mp3 is truthful."""
+        gen = SnippetGenerator(tmp_path)
+        song = _local_song(M4A_FIXTURE)
+
+        path = gen.ensure_full_audio(song, challenge_id=22)
+
+        assert path == tmp_path / "22" / "full.mp3"
+        assert _probe_codec(path) == "mp3"
+        duration = _probe_duration(path)
+        print(f"m4a -> mp3 full audio: {duration:.4f}s")
+        assert abs(duration - 30.0) <= 0.5  # whole track, no section cut
+
+    def test_local_cache_hit_survives_source_removal(self, tmp_path: Path) -> None:
+        source = tmp_path / "source.mp3"
+        source.write_bytes(MP3_FIXTURE.read_bytes())
+        gen = SnippetGenerator(tmp_path / "cache")
+        song = _local_song(source)
+        first = gen.ensure_full_audio(song, challenge_id=23)
+
+        source.unlink()  # a cache hit never touches the source again
+        again = gen.ensure_full_audio(song, challenge_id=23)
+
+        assert again == first
+        assert _file_state(again) == _file_state(first)
+
+    def test_zero_byte_full_file_is_regenerated(self, tmp_path: Path) -> None:
+        target = tmp_path / "24" / "full.mp3"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"")  # a partial artifact from a crashed run
+
+        gen = SnippetGenerator(tmp_path)
+        path = gen.ensure_full_audio(_local_song(), challenge_id=24)
+
+        assert path == target
+        assert path.read_bytes() == MP3_FIXTURE.read_bytes()
+
+    def test_youtube_downloads_once_into_the_challenge_dir(self, tmp_path: Path) -> None:
+        stub = StubFullDownloader(MP3_FIXTURE)
+        gen = SnippetGenerator(tmp_path, full_downloader=stub)
+        song = _youtube_song()
+
+        path = gen.ensure_full_audio(song, challenge_id=25)
+
+        assert stub.calls == [song.audio_ref]
+        assert path == tmp_path / "25" / "full.mp3"
+        assert _probe_codec(path) == "mp3"
+
+        def boom(url: str, dest_base: Path, timeout: float) -> Path:
+            raise AssertionError("cache hit must not re-download")
+
+        again = SnippetGenerator(tmp_path, full_downloader=boom).ensure_full_audio(
+            song, challenge_id=25
+        )
+        assert again == path
+
+    def test_youtube_download_failure_leaves_no_partials(self, tmp_path: Path) -> None:
+        def failing_downloader(url: str, dest_base: Path, timeout: float) -> Path:
+            raise RuntimeError("network boom")
+
+        gen = SnippetGenerator(tmp_path, full_downloader=failing_downloader)
+        with pytest.raises(SnippetGenerationError, match="network boom"):
+            gen.ensure_full_audio(_youtube_song(), challenge_id=26)
+
+        assert _leftover_files(tmp_path) == []
+
+    def test_unreadable_download_is_removed(self, tmp_path: Path) -> None:
+        def corrupt_downloader(url: str, dest_base: Path, timeout: float) -> Path:
+            dest = dest_base.parent / f"{dest_base.name}.mp3"
+            dest.write_bytes(b"not actually audio")
+            return dest
+
+        gen = SnippetGenerator(tmp_path, full_downloader=corrupt_downloader)
+        with pytest.raises(SnippetGenerationError):
+            gen.ensure_full_audio(_youtube_song(), challenge_id=27)
+
+        assert _leftover_files(tmp_path) == []
+
+    def test_purge_removes_the_full_audio_too(self, tmp_path: Path) -> None:
+        gen = SnippetGenerator(tmp_path)
+        full = gen.ensure_full_audio(_local_song(), challenge_id=28)
+        assert full.is_file()
+
+        gen.purge_challenge(28)
+
+        assert not full.exists()
+        assert not (tmp_path / "28").exists()
 
 
 @pytest.fixture(scope="module")

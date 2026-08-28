@@ -21,8 +21,12 @@ from typing import Protocol, cast
 
 import discord
 
-from songbot.bot.embeds import announcement_content, guess_feedback_content
-from songbot.engine import GameEngine
+from songbot.bot.embeds import (
+    announcement_content,
+    full_song_attachment,
+    guess_feedback_content,
+)
+from songbot.engine import GameEngine, GuessResult
 
 __all__ = ["Clock", "GuessModal", "utc_now"]
 
@@ -79,6 +83,11 @@ class GuessModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction[discord.Client], /) -> None:
         """Submit the guess to the engine; reply ephemeral; announce a solve.
 
+        A correct guess's ephemeral feedback carries the FULL song audio as
+        an attachment (issue #7) — the solver proved they know it; the reward
+        is hearing the whole track. The public announcement is unchanged and
+        still never names the song.
+
         A revealed challenge comes back as ``challenge_closed`` and maps to
         exactly one ephemeral "This challenge has closed." notice — no
         announcement, no error leak (VAL-GUESS-019 adapter half).
@@ -87,9 +96,15 @@ class GuessModal(discord.ui.Modal):
         result = self._engine.submit_guess(
             self._challenge_id, user_id, self.guess.value, self._clock()
         )
-        await interaction.response.send_message(
-            guess_feedback_content(result), ephemeral=True
-        )
+        full_song = self._full_song_file(result)
+        if full_song is not None:
+            await interaction.response.send_message(
+                guess_feedback_content(result), file=full_song, ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                guess_feedback_content(result), ephemeral=True
+            )
         if result.announce:
             await self._announce(
                 interaction,
@@ -97,6 +112,26 @@ class GuessModal(discord.ui.Modal):
                     user_id, result.guesses_used, result.points_awarded
                 ),
             )
+
+    def _full_song_file(self, result: GuessResult) -> discord.File | None:
+        """The full-song attachment for a CORRECT guess; None otherwise.
+
+        Best-effort (issue #7): the guess is already committed when this
+        runs, so an audio failure (a local file gone missing, a failed
+        YouTube download) must never sink the feedback reply — it is logged
+        and the reply simply goes out without the attachment.
+        """
+        if result.outcome != "correct":
+            return None
+        try:
+            return full_song_attachment(self._engine.full_audio_path(self._challenge_id))
+        except Exception:
+            logger.exception(
+                "full-song audio unavailable for challenge %s; "
+                "sending solve feedback without it",
+                self._challenge_id,
+            )
+            return None
 
     async def _announce(
         self, interaction: discord.Interaction[discord.Client], content: str

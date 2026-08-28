@@ -301,9 +301,14 @@ class TestGuess:
         assert "✅" in feedback["content"]
         assert "100" in feedback["content"]
         assert "title" in feedback["content"].lower()
+        # Issue #7: the solve feedback carries the full song, pinned-#9 filename.
+        assert len(feedback["attachments"]) == 1
+        assert feedback["attachments"][0]["filename"] == "songbot-full.mp3"
+        assert feedback["attachments"][0]["path"].endswith("full.mp3")
 
         announcement = out["payloads"][2]
         assert announcement["recipient"] is None
+        assert announcement["attachments"] == []  # nothing public changes
         assert "<@alice>" in announcement["content"]
         assert "1 guess" in announcement["content"]
         assert "100" in announcement["content"]
@@ -326,6 +331,7 @@ class TestGuess:
         feedback = out["payloads"][1]
         assert "❌" in feedback["content"]
         assert "5" in feedback["content"]
+        assert feedback["attachments"] == []  # the full song is a SOLVER reward
         assert out["state"]["user"]["guesses_used"] == 1
         assert out["state"]["user"]["solved"] == 0
 

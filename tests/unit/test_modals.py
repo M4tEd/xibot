@@ -145,6 +145,7 @@ class TestSubmitGuess:
         assert reply.content is not None
         assert "❌" in reply.content
         assert "5" in reply.content  # guesses left
+        assert reply.attachment is None  # the full song is a SOLVER reward
 
     async def test_empty_guess_is_rejected_without_counting(
         self, engine: GameEngine, challenge: Challenge, db: Database
@@ -213,6 +214,71 @@ class TestSubmitGuess:
             )
             is None
         )
+
+
+class TestFullSongAttachment:
+    """Issue #7: a correct guess attaches the FULL song to the ephemeral reply.
+
+    The attachment always uses the pinned-#9 neutral filename
+    (``songbot-full.mp3``); the public announcement and every non-correct
+    outcome carry no attachment.
+    """
+
+    async def test_correct_guess_attaches_full_song_ephemerally(
+        self, engine: GameEngine, challenge: Challenge
+    ) -> None:
+        interaction = await _submit(_modal(engine, challenge), TITLE)
+
+        reply = interaction.payloads[0]
+        assert reply.kind == "ephemeral"
+        assert reply.recipient == "1001"
+        assert reply.attachment is not None
+        assert reply.attachment.filename == "songbot-full.mp3"
+        assert reply.attachment.path.endswith("full.mp3")
+        for secret in (TITLE, ARTIST):
+            assert secret.lower() not in reply.attachment.filename.lower()
+
+    async def test_announcement_carries_no_attachment(
+        self, engine: GameEngine, challenge: Challenge
+    ) -> None:
+        interaction = await _submit(_modal(engine, challenge), TITLE)
+        announcement = interaction.payloads[1]
+        assert announcement.kind == "announcement"
+        assert announcement.attachment is None  # nothing public changes
+
+    async def test_already_solved_rejection_has_no_attachment(
+        self, engine: GameEngine, challenge: Challenge
+    ) -> None:
+        engine.submit_guess(challenge.id, "1001", TITLE, NOW)
+        interaction = await _submit(_modal(engine, challenge), "anything else")
+        reply = interaction.payloads[0]
+        assert reply.content is not None
+        assert "already" in reply.content.lower()
+        assert reply.attachment is None
+
+    async def test_full_audio_failure_still_delivers_solve_feedback(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """Best-effort reward: the recorded solve is never sunk by the attachment."""
+        engine, fake = _make_engine(tmp_path, db)
+        _add_song(db)
+        challenge = engine.ensure_today_challenge("g1", "c1", NOW)
+        fake.fail_full = True
+
+        interaction = await _submit(_modal(engine, challenge), TITLE)
+
+        assert [p.kind for p in interaction.payloads] == ["ephemeral", "announcement"]
+        reply = interaction.payloads[0]
+        assert reply.content is not None
+        assert "✅" in reply.content
+        assert reply.attachment is None
+        row = db.query_one(
+            "SELECT solved, points_awarded FROM challenge_users"
+            " WHERE challenge_id = ? AND user_id = '1001'",
+            (challenge.id,),
+        )
+        assert row is not None
+        assert (row["solved"], row["points_awarded"]) == (1, 100)
 
 
 class TestSecrecy:

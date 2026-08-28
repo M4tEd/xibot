@@ -61,10 +61,12 @@ def _settings(tmp_path: Path) -> Settings:
 class FakeSnippets:
     """SnippetService test double: creates empty level files, records calls."""
 
-    def __init__(self, cache_dir: Path, *, fail: bool = False) -> None:
+    def __init__(self, cache_dir: Path, *, fail: bool = False, fail_full: bool = False) -> None:
         self.cache_dir = cache_dir
         self.fail = fail
+        self.fail_full = fail_full
         self.ensure_calls: list[tuple[str, int | str, float, tuple[float, ...]]] = []
+        self.full_calls: list[tuple[str, int | str]] = []
         self.purged: list[int | str] = []
 
     def ensure_snippets(
@@ -85,6 +87,17 @@ class FakeSnippets:
             path.touch(exist_ok=True)
             paths[level] = path
         return paths
+
+    def ensure_full_audio(self, song: Song, challenge_id: int | str) -> Path:
+        """Stage an empty ``full.mp3`` beside the fake levels (real file to attach)."""
+        self.full_calls.append((song.source_id, challenge_id))
+        if self.fail_full:
+            raise RuntimeError("fake full-audio failure")
+        base = self.cache_dir / str(challenge_id)
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "full.mp3"
+        path.touch(exist_ok=True)
+        return path
 
     def purge_challenge(self, challenge_id: int | str) -> None:
         self.purged.append(challenge_id)
