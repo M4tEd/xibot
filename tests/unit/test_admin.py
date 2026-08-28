@@ -130,7 +130,7 @@ class TestPermissionGate:
     ) -> None:
         refresh_calls = 0
 
-        def _spy_refresher() -> RefreshResult:
+        def _spy_refresher(guild_id: str) -> RefreshResult:
             nonlocal refresh_calls
             refresh_calls += 1
             return RefreshResult(sources=())
@@ -146,12 +146,17 @@ class TestPermissionGate:
         async def fixsong_via(interaction: FakeInteraction) -> Any:
             return await spied.fix_song(interaction, title="Whatever")
 
+        async def playlist_via(interaction: FakeInteraction) -> Any:
+            return await spied.set_playlist(interaction, "https://example.test/pl")
+
         for method in (
             spied.post_now,
             spied.skip_song,
             spied.reload_catalog,
+            spied.clear_playlist,
             setup_via,
             fixsong_via,
+            playlist_via,
         ):
             interaction = _interaction(manage_guild=False)
             result = await method(interaction)
@@ -394,7 +399,7 @@ class TestReloadCatalog:
                 SourceRefresh(source="youtube", added=200),
             )
         )
-        engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda: refresh)
+        engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda _guild_id: refresh)
         commands = AdminCommands(
             engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
         )
@@ -425,7 +430,7 @@ class TestReloadCatalog:
                 ),
             )
         )
-        engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda: refresh)
+        engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda _guild_id: refresh)
         commands = AdminCommands(
             engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
         )
@@ -450,7 +455,7 @@ class TestReloadCatalog:
 
 
 class TestRegistration:
-    def test_registers_five_guild_commands_with_manage_guild_default(
+    def test_registers_seven_guild_commands_with_manage_guild_default(
         self, commands: AdminCommands
     ) -> None:
         client = discord.Client(intents=discord.Intents.default())
@@ -467,6 +472,8 @@ class TestRegistration:
             "songbot-skip",
             "songbot-reload",
             "songbot-fixsong",
+            "songbot-playlist",
+            "songbot-playlist-clear",
         }
         for command in registered:
             assert isinstance(command, app_commands.Command)
@@ -501,8 +508,8 @@ class TestRegistration:
         register_admin_commands(tree, commands, guild=guild_a)
         register_admin_commands(tree, commands, guild=guild_b)
 
-        assert len(tree.get_commands(guild=guild_a)) == 5
-        assert len(tree.get_commands(guild=guild_b)) == 5
+        assert len(tree.get_commands(guild=guild_a)) == 7
+        assert len(tree.get_commands(guild=guild_b)) == 7
         assert tree.get_commands() == []  # nothing global
 
 

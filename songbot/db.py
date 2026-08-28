@@ -8,8 +8,9 @@ Schema (migration 1) implements the architecture.md data model exactly:
 `schema_migrations` bookkeeping table. `challenge_users` and `guesses` carry
 `ON DELETE CASCADE` so skip-song can delete + recreate a challenge row
 (pinned design decision #5). Later migrations add `challenges.skip_count`
-(2), `guild_settings` (3), and `song_overrides` (4 — admin-corrected song
-metadata that catalog refreshes re-apply).
+(2), `guild_settings` (3), `song_overrides` (4 — admin-corrected song
+metadata that catalog refreshes re-apply), and per-guild catalogs (5 —
+`songs.guild_id` scoping plus `guild_settings.playlist_url`).
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ __all__ = [
 ChallengeStatus = Literal["active", "revealed"]
 """Valid values for `challenges.status`."""
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """Latest schema version; bump when appending to `MIGRATIONS`."""
 
 _BUSY_TIMEOUT_MS = 5000
@@ -160,6 +161,47 @@ _MIGRATION_004_SONG_OVERRIDES: tuple[str, ...] = (
     """,
 )
 
+_MIGRATION_005_GUILD_CATALOGS: tuple[str, ...] = (
+    # Per-guild custom playlists: guild_settings.playlist_url is the guild's
+    # catalog override (NULL = the guild draws from the global env-configured
+    # catalog), and songs gains a guild_id scope column ('' = the global
+    # pool shared by every guild without an override). The scope joins the
+    # uniqueness key so the same video can live in the global pool AND in a
+    # guild's custom catalog at once — that requires rebuilding the table,
+    # since SQLite cannot alter a table-level UNIQUE constraint. The rebuild
+    # preserves row ids verbatim (challenges.song_id keeps pointing at the
+    # same song) and runs with foreign_keys OFF (see migrate()) so the
+    # DROP TABLE does not trip challenges' FK enforcement.
+    """
+    CREATE TABLE songs_new (
+        id INTEGER PRIMARY KEY,
+        guild_id TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        artist TEXT,
+        duration_sec REAL NOT NULL,
+        audio_ref TEXT NOT NULL,
+        raw_title TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (guild_id, source, source_id)
+    )
+    """,
+    """
+    INSERT INTO songs_new
+        (id, guild_id, source, source_id, title, artist, duration_sec, audio_ref,
+         raw_title, created_at)
+    SELECT id, '', source, source_id, title, artist, duration_sec, audio_ref,
+           raw_title, created_at
+    FROM songs
+    """,
+    "DROP TABLE songs",
+    "ALTER TABLE songs_new RENAME TO songs",
+    """
+    ALTER TABLE guild_settings ADD COLUMN playlist_url TEXT
+    """,
+)
+
 # Versioned migrations, applied in ascending order. Never edit an applied
 # migration; append a new (version, statements) entry instead.
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -167,19 +209,32 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (2, _MIGRATION_002_CHALLENGE_SKIP_COUNT),
     (3, _MIGRATION_003_GUILD_SETTINGS),
     (4, _MIGRATION_004_SONG_OVERRIDES),
+    (5, _MIGRATION_005_GUILD_CATALOGS),
 )
+
+_TABLE_REBUILD_MIGRATIONS: frozenset[int] = frozenset({5})
+"""Migrations that DROP/RENAME a table referenced by a foreign key.
+
+sqlite3 evaluates ``PRAGMA foreign_keys`` changes only OUTSIDE a transaction,
+so `migrate()` toggles the pragma in autocommit mode around these migrations'
+managed transaction and verifies referential integrity with an explicit
+``PRAGMA foreign_key_check`` before recording the version.
+"""
 
 
 @dataclass(frozen=True)
 class SongRow:
     """A row of `songs`: one catalog entry.
 
-    `artist` is nullable: unparseable (bare) YouTube titles may yield no
-    artist. `audio_ref` is an absolute file path (local) or watch URL
+    `guild_id` (migration 5) scopes the row to one guild's custom catalog;
+    ``""`` is the global pool every guild without a custom playlist draws
+    from. `artist` is nullable: unparseable (bare) YouTube titles may yield
+    no artist. `audio_ref` is an absolute file path (local) or watch URL
     (youtube); `raw_title` preserves the original filename/video title.
     """
 
     id: int
+    guild_id: str  # "" = global catalog pool; otherwise the owning guild's id
     source: str  # "local" | "youtube"
     source_id: str
     title: str
@@ -194,6 +249,7 @@ class SongRow:
         """Build a typed `SongRow` from a `SELECT * FROM songs` row."""
         return cls(
             id=row["id"],
+            guild_id=row["guild_id"],
             source=row["source"],
             source_id=row["source_id"],
             title=row["title"],
@@ -301,6 +357,9 @@ class GuessRow:
 class GuildSettingsRow:
     """A row of `guild_settings`: one configured guild's post target.
 
+    ``playlist_url`` (migration 5) is the guild's custom catalog override:
+    when set, the guild's challenges draw ONLY from that YouTube playlist;
+    when NULL, the guild draws from the global env-configured catalog.
     ``set_by`` records the row's provenance (a user id, ``"env"``, or
     ``"harness"``); ``created_at`` is the first-configuration timestamp and
     ``updated_at`` the most recent re-configuration.
@@ -311,6 +370,7 @@ class GuildSettingsRow:
     set_by: str
     created_at: str
     updated_at: str
+    playlist_url: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> GuildSettingsRow:
@@ -321,6 +381,7 @@ class GuildSettingsRow:
             set_by=row["set_by"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            playlist_url=row["playlist_url"],
         )
 
 
@@ -418,13 +479,30 @@ class Database:
             for version, statements in MIGRATIONS:
                 if version <= current:
                     continue
-                with self.transaction():
-                    for statement in statements:
-                        self._conn.execute(statement)
-                    self._conn.execute(
-                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                        (version, datetime.now(UTC).isoformat()),
-                    )
+                rebuilds = version in _TABLE_REBUILD_MIGRATIONS
+                if rebuilds:
+                    self._conn.execute("PRAGMA foreign_keys = OFF")
+                try:
+                    with self.transaction():
+                        for statement in statements:
+                            self._conn.execute(statement)
+                        if rebuilds:
+                            violations = self._conn.execute(
+                                "PRAGMA foreign_key_check"
+                            ).fetchall()
+                            if violations:
+                                raise sqlite3.IntegrityError(
+                                    f"migration {version} left foreign key"
+                                    f" violations: {violations!r}"
+                                )
+                        self._conn.execute(
+                            "INSERT INTO schema_migrations (version, applied_at)"
+                            " VALUES (?, ?)",
+                            (version, datetime.now(UTC).isoformat()),
+                        )
+                finally:
+                    if rebuilds:
+                        self._conn.execute("PRAGMA foreign_keys = ON")
                 applied.append(version)
         return applied
 

@@ -34,6 +34,7 @@ from songbot.engine import (
 __all__ = [
     "ADMIN_CATALOG_EMPTY_MESSAGE",
     "ADMIN_NOT_CONFIGURED_MESSAGE",
+    "ADMIN_PLAYLIST_BLANK_MESSAGE",
     "ADMIN_POST_ALREADY_MESSAGE",
     "ADMIN_POST_FAILED_MESSAGE",
     "ADMIN_POST_SUCCESS_MESSAGE",
@@ -54,6 +55,8 @@ __all__ = [
     "hear_more_content",
     "hear_more_refusal_content",
     "leaderboard_embed",
+    "playlist_ack_content",
+    "playlist_cleared_content",
     "reload_ack_content",
     "reveal_embed",
     "setup_ack_content",
@@ -120,6 +123,12 @@ ADMIN_NOT_CONFIGURED_MESSAGE = (
     "the daily-challenge channel."
 )
 """Ephemeral ack when an admin command needs a channel the guild never configured."""
+
+ADMIN_PLAYLIST_BLANK_MESSAGE = (
+    "⚠️ Please provide a playlist URL — or run /songbot-playlist-clear to "
+    "remove the custom playlist."
+)
+"""Ephemeral refusal when /songbot-playlist gets a blank URL (zero mutation)."""
 
 
 def format_seconds(seconds: float) -> str:
@@ -332,6 +341,24 @@ def fixsong_refusal_content(reason: FixSongRefusedReason) -> str:
     )
 
 
+def _refresh_source_lines(result: RefreshResult) -> list[str]:
+    """One summary line per refreshed source (counts or its error).
+
+    Shared by the reload and playlist acks. Never contains song identity
+    (counts only, pinned #9).
+    """
+    lines: list[str] = []
+    for source in result.sources:
+        if source.error is not None:
+            lines.append(f"**{source.source}**: ⚠️ failed — {source.error}")
+        else:
+            lines.append(
+                f"**{source.source}**: {source.added} added • {source.updated} updated "
+                f"• {source.removed} removed • {source.retained} retained"
+            )
+    return lines
+
+
 def reload_ack_content(result: RefreshResult) -> str:
     """The ephemeral ack for /songbot-reload: the per-source summary.
 
@@ -341,13 +368,29 @@ def reload_ack_content(result: RefreshResult) -> str:
     """
     if not result.sources:
         return "🔄 Catalog reload: no catalog sources are configured."
-    lines = ["🔄 Catalog reload complete."]
-    for source in result.sources:
-        if source.error is not None:
-            lines.append(f"**{source.source}**: ⚠️ failed — {source.error}")
-        else:
-            lines.append(
-                f"**{source.source}**: {source.added} added • {source.updated} updated "
-                f"• {source.removed} removed • {source.retained} retained"
-            )
+    return "\n".join(["🔄 Catalog reload complete.", *_refresh_source_lines(result)])
+
+
+def playlist_ack_content(playlist_url: str, result: RefreshResult) -> str:
+    """The ephemeral ack for /songbot-playlist: the new source + refresh outcome.
+
+    The refresh runs against the just-configured playlist, so a broken URL
+    surfaces here immediately (per-source failure isolation, pinned #12) —
+    the config is kept either way and /songbot-reload retries. Never contains
+    song identity (counts only, pinned #9).
+    """
+    lines = [
+        f"✅ This server's catalog now uses <{playlist_url}> — "
+        "daily challenges will draw only from that playlist.",
+        *_refresh_source_lines(result),
+        "Use /songbot-playlist-clear to revert to the default catalog.",
+    ]
     return "\n".join(lines)
+
+
+def playlist_cleared_content() -> str:
+    """The ephemeral ack for /songbot-playlist-clear: back to the global catalog."""
+    return (
+        "✅ Custom playlist removed — this server uses the default catalog again.\n"
+        "Future daily challenges draw from the globally configured sources."
+    )

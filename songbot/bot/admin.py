@@ -1,5 +1,5 @@
 """Admin slash commands: /songbot-setup, /songbot-post, /songbot-skip,
-/songbot-reload, /songbot-fixsong.
+/songbot-reload, /songbot-fixsong, /songbot-playlist, /songbot-playlist-clear.
 
 All three are gated on the Manage-Guild permission and ack EPHEMERALLY. The
 command bodies (`AdminCommands` methods) are plain coroutines that delegate
@@ -39,6 +39,7 @@ from discord import app_commands
 from songbot.bot.embeds import (
     ADMIN_CATALOG_EMPTY_MESSAGE,
     ADMIN_NOT_CONFIGURED_MESSAGE,
+    ADMIN_PLAYLIST_BLANK_MESSAGE,
     ADMIN_POST_ALREADY_MESSAGE,
     ADMIN_POST_FAILED_MESSAGE,
     ADMIN_POST_SUCCESS_MESSAGE,
@@ -46,6 +47,8 @@ from songbot.bot.embeds import (
     PERMISSION_DENIED_MESSAGE,
     fixsong_ack_content,
     fixsong_refusal_content,
+    playlist_ack_content,
+    playlist_cleared_content,
     reload_ack_content,
     setup_ack_content,
     skip_refusal_content,
@@ -83,6 +86,8 @@ AdminOutcome = Literal[
     "configured",
     "not_configured",
     "fixed",
+    "playlist_set",
+    "playlist_cleared",
     "error",
 ]
 """The machine-readable outcome of an admin command body.
@@ -92,7 +97,9 @@ a challenge the call just created, which was rolled back (row deleted,
 snippet cache purged) so a retry reposts the identical challenge.
 ``configured``/``not_configured`` are the /songbot-setup outcomes (and the
 ``not_configured`` refusal of the other commands in a guild that never ran
-setup).
+setup). ``playlist_set``/``playlist_cleared`` are the /songbot-playlist(-clear)
+outcomes; the per-source refresh summary rides on ``refresh`` for
+``playlist_set`` exactly as it does for ``reloaded``.
 """
 
 DailyPostSender = Callable[[Challenge], Awaitable[None]]
@@ -324,15 +331,76 @@ class AdminCommands:
     async def reload_catalog(self, interaction: discord.Interaction[Any]) -> AdminResult:
         """/songbot-reload: upsert the catalog from its sources.
 
-        The ephemeral ack reports the per-source summary (added / updated /
-        removed / retained, or the source's error — per-source failure
-        isolation, pinned #12).
+        Refreshes the invoking guild's effective sources: its custom playlist
+        when one is configured (/songbot-playlist), else the global env
+        sources. The ephemeral ack reports the per-source summary (added /
+        updated / removed / retained, or the source's error — per-source
+        failure isolation, pinned #12).
         """
         if not has_manage_guild(interaction):
             return await self._deny(interaction)
-        result = self._engine.refresh_catalog()
+        guild_id = self._guild_id_of(interaction)
+        result = self._engine.refresh_catalog(guild_id if guild_id is not None else "")
         await interaction.response.send_message(reload_ack_content(result), ephemeral=True)
         return AdminResult("reloaded", refresh=result)
+
+    async def set_playlist(
+        self, interaction: discord.Interaction[Any], url: str
+    ) -> AdminResult:
+        """/songbot-playlist: point the guild's catalog at a custom playlist.
+
+        Sets the guild's ``playlist_url`` override and immediately refreshes
+        from it, so the ack can report the per-source outcome (a broken URL
+        surfaces here; the config is kept and /songbot-reload retries). From
+        the next selection on, the guild's challenges draw ONLY from this
+        playlist. Requires a configured guild (/songbot-setup first); a
+        blank-after-strip URL is refused with zero mutation.
+        """
+        if not has_manage_guild(interaction):
+            return await self._deny(interaction)
+        guild_id = self._guild_id_of(interaction)
+        guild = self._engine.guild_settings(guild_id) if guild_id is not None else None
+        if guild is None:
+            await interaction.response.send_message(
+                ADMIN_NOT_CONFIGURED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("not_configured")
+        playlist_url = url.strip()
+        if not playlist_url:
+            await interaction.response.send_message(
+                ADMIN_PLAYLIST_BLANK_MESSAGE, ephemeral=True
+            )
+            return AdminResult("refused")
+        self._engine.set_guild_playlist(
+            guild.guild_id, playlist_url, set_by=str(interaction.user.id), now=self._clock()
+        )
+        refresh = self._engine.refresh_catalog(guild.guild_id)
+        await interaction.response.send_message(
+            playlist_ack_content(playlist_url, refresh), ephemeral=True
+        )
+        return AdminResult("playlist_set", refresh=refresh)
+
+    async def clear_playlist(self, interaction: discord.Interaction[Any]) -> AdminResult:
+        """/songbot-playlist-clear: revert the guild to the global env catalog.
+
+        Idempotent (clearing an unset playlist still acks). The guild's
+        custom-scoped song rows stay for its challenge history but no longer
+        participate in selection.
+        """
+        if not has_manage_guild(interaction):
+            return await self._deny(interaction)
+        guild_id = self._guild_id_of(interaction)
+        guild = self._engine.guild_settings(guild_id) if guild_id is not None else None
+        if guild is None:
+            await interaction.response.send_message(
+                ADMIN_NOT_CONFIGURED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("not_configured")
+        self._engine.clear_guild_playlist(
+            guild.guild_id, set_by=str(interaction.user.id), now=self._clock()
+        )
+        await interaction.response.send_message(playlist_cleared_content(), ephemeral=True)
+        return AdminResult("playlist_cleared")
 
 
 def register_admin_commands(
@@ -396,12 +464,33 @@ def register_admin_commands(
     ) -> None:
         await commands.fix_song(interaction, title=title, artist=artist, date=date)
 
+    @app_commands.command(
+        name="songbot-playlist",
+        description="Point this server's catalog at a custom YouTube playlist.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        url="The YouTube playlist URL this server's daily songs will draw from.",
+    )
+    async def playlist_command(interaction: discord.Interaction[Any], url: str) -> None:
+        await commands.set_playlist(interaction, url)
+
+    @app_commands.command(
+        name="songbot-playlist-clear",
+        description="Remove the custom playlist; use the default catalog again.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def playlist_clear_command(interaction: discord.Interaction[Any]) -> None:
+        await commands.clear_playlist(interaction)
+
     registered: tuple[app_commands.Command[Any, Any, Any], ...] = (
         setup_command,
         post_command,
         skip_command,
         reload_command,
         fixsong_command,
+        playlist_command,
+        playlist_clear_command,
     )
     for command in registered:
         tree.add_command(command, guild=guild)

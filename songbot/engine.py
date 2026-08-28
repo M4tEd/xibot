@@ -330,8 +330,9 @@ class GameEngine:
         db: the (migrated) database.
         settings: validated configuration (timezone, snippet ladder, ...).
         snippets: snippet generator (or a test fake satisfying the protocol).
-        catalog_refresher: test seam for the pinned-#11 bootstrap; defaults to
-            ``refresh_catalog(db, settings)``.
+        catalog_refresher: test seam for the pinned-#11 bootstrap; takes the
+            guild id whose catalog should refresh and defaults to
+            ``refresh_catalog(db, settings, guild_id=...)``.
     """
 
     def __init__(
@@ -340,15 +341,17 @@ class GameEngine:
         settings: Settings,
         snippets: SnippetService,
         *,
-        catalog_refresher: Callable[[], RefreshResult] | None = None,
+        catalog_refresher: Callable[[str], RefreshResult] | None = None,
     ) -> None:
         self._db = db
         self._settings = settings
         self._snippets = snippets
-        self._catalog_refresher: Callable[[], RefreshResult] = (
+        self._catalog_refresher: Callable[[str], RefreshResult] = (
             catalog_refresher
             if catalog_refresher is not None
-            else lambda: refresh_catalog(self._db, self._settings)
+            else lambda guild_id: refresh_catalog(
+                self._db, self._settings, guild_id=guild_id
+            )
         )
 
     # -- time helpers --------------------------------------------------------
@@ -401,9 +404,22 @@ class GameEngine:
             raise EngineError(f"challenge references missing song id {song_id}")
         return SongRow.from_row(row)
 
-    def _songs_empty(self) -> bool:
-        row = self._db.query_one("SELECT COUNT(*) AS c FROM songs")
+    def _songs_empty(self, scope: str) -> bool:
+        """True when the catalog ``scope`` (``""`` = global pool) has no songs."""
+        row = self._db.query_one(
+            "SELECT COUNT(*) AS c FROM songs WHERE guild_id = ?", (scope,)
+        )
         return row is None or int(row["c"]) == 0
+
+    def _catalog_scope(self, guild_id: str) -> str:
+        """The ``songs`` scope a guild draws from: its own id when a custom
+        playlist is configured (/songbot-playlist), else the global pool."""
+        row = self._db.query_one(
+            "SELECT playlist_url FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        )
+        if row is not None and row["playlist_url"]:
+            return guild_id
+        return ""
 
     # -- guild configuration (multi-guild post targets) ------------------------
 
@@ -457,6 +473,59 @@ class GameEngine:
         """
         self._db.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
 
+    def set_guild_playlist(
+        self, guild_id: str, playlist_url: str, *, set_by: str, now: datetime
+    ) -> GuildSettingsRow:
+        """Point a guild's catalog at a custom YouTube playlist; return the row.
+
+        From the next selection on, the guild's challenges draw ONLY from
+        this playlist (its own ``songs`` scope) — the global env-configured
+        catalog no longer applies to it. The guild must already be configured
+        (/songbot-setup): configuring a row-less guild raises ``EngineError``.
+        The catalog is NOT refreshed here — the admin command refreshes so
+        its ack can report the outcome, and the pinned-#11 bootstrap covers
+        the first post either way. The guild's prior scoped rows stay (its
+        challenge history may reference them) and are reconciled by the next
+        refresh's removal pass.
+        """
+        url = playlist_url.strip()
+        iso_now = self._utc_iso(now)
+        with self._db.transaction():
+            self._db.execute(
+                "UPDATE guild_settings"
+                " SET playlist_url = ?, set_by = ?, updated_at = ?"
+                " WHERE guild_id = ?",
+                (url, set_by, iso_now, guild_id),
+            )
+        row = self.guild_settings(guild_id)
+        if row is None:
+            raise EngineError(f"set_guild_playlist for unconfigured guild {guild_id}")
+        return row
+
+    def clear_guild_playlist(
+        self, guild_id: str, *, set_by: str, now: datetime
+    ) -> GuildSettingsRow:
+        """Remove a guild's custom playlist; return the row.
+
+        The guild's challenges draw from the global env-configured catalog
+        again (the pinned-#11 bootstrap refreshes it on the next post when
+        empty). The guild's custom-scoped song rows are KEPT — its challenge
+        history references them — but no longer participate in selection.
+        Idempotent: clearing an unset playlist is a no-op write.
+        """
+        iso_now = self._utc_iso(now)
+        with self._db.transaction():
+            self._db.execute(
+                "UPDATE guild_settings"
+                " SET playlist_url = NULL, set_by = ?, updated_at = ?"
+                " WHERE guild_id = ?",
+                (set_by, iso_now, guild_id),
+            )
+        row = self.guild_settings(guild_id)
+        if row is None:
+            raise EngineError(f"clear_guild_playlist for unconfigured guild {guild_id}")
+        return row
+
     def latest_challenge_id(self, guild_id: str) -> int | None:
         """The id of the guild's most recent challenge (persistent-view binding)."""
         row = self._db.query_one(
@@ -477,14 +546,20 @@ class GameEngine:
     ) -> SongRow | None:
         """Pick a song for `guild_id`: no repeats until exhausted, then reset.
 
-        Eligible = catalog songs never used by this guild; when empty, the
-        history resets and all songs are eligible again. ``exclude_song_id``
-        (skip-song) additionally bars the just-skipped song from the re-pick
-        whenever any alternative exists. Returns None iff the catalog is empty.
+        The pool is the guild's catalog scope: its custom playlist's rows
+        when one is configured, otherwise the shared global pool — never a
+        mix. Eligible = pool songs never used by this guild; when empty, the
+        history resets and all pool songs are eligible again.
+        ``exclude_song_id`` (skip-song) additionally bars the just-skipped
+        song from the re-pick whenever any alternative exists. Returns None
+        iff the guild's pool is empty.
         """
         songs = [
             SongRow.from_row(row)
-            for row in self._db.query("SELECT * FROM songs ORDER BY id")
+            for row in self._db.query(
+                "SELECT * FROM songs WHERE guild_id = ? ORDER BY id",
+                (self._catalog_scope(guild_id),),
+            )
         ]
         if not songs:
             return None
@@ -536,8 +611,9 @@ class GameEngine:
         timezone. Every call runs ``ensure_snippets`` (pinned #14), so a
         deleted snippet cache is regenerated even for an existing row.
 
-        When the ``songs`` table is empty the catalog is refreshed first
-        (pinned #11 bootstrap); a still-empty catalog raises
+        When the guild's catalog scope is empty the catalog is refreshed
+        first (pinned #11 bootstrap — the guild's custom playlist when
+        configured, else the global env sources); a still-empty scope raises
         ``CatalogEmptyError`` without inserting any row. A snippet-generation
         failure likewise leaves no row behind.
         """
@@ -547,8 +623,8 @@ class GameEngine:
         if existing is not None:
             return self._build_challenge(existing, created=False)
 
-        if self._songs_empty():
-            result = self._catalog_refresher()
+        if self._songs_empty(self._catalog_scope(guild_id)):
+            result = self._catalog_refresher(guild_id)
             for source in result.sources:
                 if source.ok:
                     logger.info(
@@ -823,9 +899,13 @@ class GameEngine:
         self._db.execute("DELETE FROM challenges WHERE id = ?", (challenge_id,))
         self._snippets.purge_challenge(challenge_id)
 
-    def refresh_catalog(self) -> RefreshResult:
-        """Passthrough for the admin reload-catalog command."""
-        return self._catalog_refresher()
+    def refresh_catalog(self, guild_id: str) -> RefreshResult:
+        """Passthrough for the admin reload-catalog command.
+
+        Refreshes the guild's effective sources: its custom playlist when one
+        is configured (/songbot-playlist), else the global env sources.
+        """
+        return self._catalog_refresher(guild_id)
 
     # -- gameplay ----------------------------------------------------------------
 

@@ -235,6 +235,8 @@ class TestSetupHook:
                 "songbot-skip",
                 "songbot-reload",
                 "songbot-fixsong",
+                "songbot-playlist",
+                "songbot-playlist-clear",
             }
             # Guild-scoped only: nothing lands on the global tree.
             assert client.tree.get_commands() == []
@@ -346,7 +348,7 @@ class TestSetupHook:
             await client.on_guild_join(new_guild)  # type: ignore[arg-type]  # idempotent
 
             assert syncer.syncs == [(client.tree, 424242)]
-            assert len(client.tree.get_commands(guild=new_guild)) == 5
+            assert len(client.tree.get_commands(guild=new_guild)) == 7
         finally:
             await client.close()
 

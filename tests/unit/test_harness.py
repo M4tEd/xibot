@@ -507,7 +507,7 @@ class TestReset:
         snippet_dir = tmp_path / "snippets"
         assert list(snippet_dir.rglob("*.mp3")) == []
         # Migrations survive a reset (the schema itself is not wiped).
-        assert ctx.db.schema_version() == 4
+        assert ctx.db.schema_version() == 5
 
     async def test_post_after_reset_works(self, ctx: HarnessContext, db: Database) -> None:
         _add_song(db)
@@ -875,7 +875,7 @@ class TestAdminReload:
                 SourceRefresh(source="youtube", error="YouTubeCatalogError: boom"),
             )
         )
-        engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda: refresh)
+        engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda _guild_id: refresh)
         ctx = HarnessContext(settings=_settings(tmp_path), db=db, engine=engine)
 
         out = json_roundtrip(await scenario_admin_reload(ctx, ADMIN, DAY1))
@@ -922,7 +922,7 @@ class TestAdminReload:
     ) -> None:
         calls = 0
 
-        def _spy() -> RefreshResult:
+        def _spy(guild_id: str) -> RefreshResult:
             nonlocal calls
             calls += 1
             return RefreshResult(sources=())
