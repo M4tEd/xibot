@@ -126,12 +126,19 @@ class Recorder:
     def record_channel_post(
         self,
         *,
+        content: str | None = None,
         embed: discord.Embed,
         view: discord.ui.View,
         file: discord.File,
     ) -> RecordedPayload:
-        """Record the daily challenge post (the only ``channel``-kind payload)."""
-        return self.record_message(kind="channel", embed=embed, view=view, file=file)
+        """Record the daily challenge post (the only ``channel``-kind payload).
+
+        ``content`` carries the /songbot-pingrole mention when the guild
+        configured one (the live send's message content).
+        """
+        return self.record_message(
+            kind="channel", content=content, embed=embed, view=view, file=file
+        )
 
     def to_list(self) -> list[dict[str, Any]]:
         """The JSON-serializable transcript of everything recorded so far."""

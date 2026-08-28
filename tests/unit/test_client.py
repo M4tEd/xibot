@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -179,10 +180,12 @@ def _make_client(
 class TestConstruction:
     """The client object builds without any network, gateway, or side effects."""
 
-    def test_minimal_guilds_only_intents(self, stack: _Stack) -> None:
+    def test_minimal_unprivileged_intents(self, stack: _Stack) -> None:
         client = _make_client(stack)
 
         assert client.intents.guilds is True
+        # reactions: the raw reaction events behind the /songbot-pingrole opt-in.
+        assert client.intents.reactions is True
         assert client.intents.message_content is False
         assert client.intents.members is False
         assert client.intents.presences is False
@@ -235,6 +238,7 @@ class TestSetupHook:
                 "songbot-skip",
                 "songbot-reload",
                 "songbot-fixsong",
+                "songbot-pingrole",
             }
             # Guild-scoped only: nothing lands on the global tree.
             assert client.tree.get_commands() == []
@@ -346,7 +350,7 @@ class TestSetupHook:
             await client.on_guild_join(new_guild)  # type: ignore[arg-type]  # idempotent
 
             assert syncer.syncs == [(client.tree, 424242)]
-            assert len(client.tree.get_commands(guild=new_guild)) == 5
+            assert len(client.tree.get_commands(guild=new_guild)) == 6
         finally:
             await client.close()
 
@@ -685,6 +689,252 @@ class TestMultiGuildScheduler:
         assert reveal.channel_id == CHANNEL_ID  # the OLD channel
         new_post = sender.events[2][1]
         assert new_post.channel_id == "333444555"
+
+
+class _FakeMember:
+    """Guild member double: records role grants/revocations."""
+
+    def __init__(self, *, bot: bool = False) -> None:
+        self.bot = bot
+        self.added: list[tuple[Any, str | None]] = []
+        self.removed: list[tuple[Any, str | None]] = []
+
+    async def add_roles(self, role: Any, *, reason: str | None = None) -> None:
+        self.added.append((role, reason))
+
+    async def remove_roles(self, role: Any, *, reason: str | None = None) -> None:
+        self.removed.append((role, reason))
+
+
+class _FakeGuild:
+    """Guild double: role lookup + member fetch (REST-shaped)."""
+
+    def __init__(
+        self,
+        *,
+        role: Any = None,
+        member: _FakeMember | None = None,
+        member_gone: bool = False,
+    ) -> None:
+        self._role = role
+        self._member = member
+        self._member_gone = member_gone
+        self.fetched: list[int] = []
+
+    def get_role(self, role_id: int) -> Any:
+        return self._role
+
+    async def fetch_member(self, user_id: int) -> _FakeMember:
+        self.fetched.append(user_id)
+        if self._member_gone or self._member is None:
+            raise discord.NotFound(mock.MagicMock(), "unknown member")
+        return self._member
+
+
+class _FakeSendChannel:
+    """Channel double for the live transports: records send() calls."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, content: str | None = None, **kwargs: Any) -> object:
+        file = kwargs.pop("file", None)
+        if file is not None:
+            file.close()  # discord.File opens eagerly; avoid fd leaks
+        self.sent.append({"content": content, **kwargs})
+        return object()
+
+
+def _reaction_payload(
+    *,
+    message_id: int = 42424242,
+    emoji: str = "🎵",
+    user_id: int = 777,
+    member: _FakeMember | None = None,
+) -> Any:
+    """A RawReactionActionEvent-shaped stand-in (the handler reads attributes)."""
+    return SimpleNamespace(
+        message_id=message_id,
+        emoji=emoji,
+        user_id=user_id,
+        guild_id=int(GUILD_ID),
+        member=member,
+    )
+
+
+def _seed_ping_role(stack: _Stack, *, emoji: str = "🎵") -> None:
+    """Configure the guild's opt-in announcement (what /songbot-pingrole stores)."""
+    stack.engine.set_ping_role(
+        GUILD_ID,
+        CHANNEL_ID,
+        "42424242",
+        "31337",  # role ids are numeric snowflakes live
+        emoji,
+        set_by="test",
+        now=DAY1_PM,
+    )
+
+
+class TestPingRoleReactions:
+    """on_raw_reaction_add/remove: grant/revoke the configured role."""
+
+    async def test_matching_reaction_grants_the_role(self, stack: _Stack) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        role = object()
+        member = _FakeMember()
+        guild = _FakeGuild(role=role, member=member)
+
+        with mock.patch.object(client, "get_guild", return_value=guild):
+            await client.on_raw_reaction_add(_reaction_payload())
+
+        assert guild.fetched == [777]  # member not cached -> REST fetch
+        assert member.added == [(role, "SongBot daily-song ping opt-in")]
+        assert member.removed == []
+
+    async def test_removing_the_reaction_revokes_the_role(self, stack: _Stack) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        role = object()
+        member = _FakeMember()
+        guild = _FakeGuild(role=role, member=member)
+
+        with mock.patch.object(client, "get_guild", return_value=guild):
+            await client.on_raw_reaction_remove(_reaction_payload())
+
+        assert member.removed == [(role, "SongBot daily-song ping opt-out")]
+        assert member.added == []
+
+    async def test_cached_member_skips_the_rest_fetch(self, stack: _Stack) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        role = object()
+        member = _FakeMember()
+        guild = _FakeGuild(role=role, member=None)
+
+        with mock.patch.object(client, "get_guild", return_value=guild):
+            await client.on_raw_reaction_add(_reaction_payload(member=member))
+
+        assert guild.fetched == []
+        assert len(member.added) == 1
+
+    async def test_other_messages_and_emojis_are_ignored(self, stack: _Stack) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        member = _FakeMember()
+        guild = _FakeGuild(role=object(), member=member)
+
+        with mock.patch.object(client, "get_guild", return_value=guild):
+            await client.on_raw_reaction_add(_reaction_payload(message_id=99999999))
+            await client.on_raw_reaction_add(_reaction_payload(emoji="🔔"))
+            await client.on_raw_reaction_remove(_reaction_payload(emoji="🔔"))
+
+        assert guild.fetched == []
+        assert member.added == []
+        assert member.removed == []
+
+    async def test_bot_reactors_are_ignored(self, stack: _Stack) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        member = _FakeMember(bot=True)
+        guild = _FakeGuild(role=object(), member=member)
+
+        with mock.patch.object(client, "get_guild", return_value=guild):
+            await client.on_raw_reaction_add(_reaction_payload(member=member))
+
+        assert member.added == []
+
+    async def test_a_deleted_role_is_a_logged_noop(
+        self, stack: _Stack, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        guild = _FakeGuild(role=None, member=_FakeMember())
+
+        with (
+            mock.patch.object(client, "get_guild", return_value=guild),
+            caplog.at_level(logging.WARNING, logger="songbot.bot.client"),
+        ):
+            await client.on_raw_reaction_add(_reaction_payload())
+
+        assert guild.fetched == []  # never reached the member lookup
+        assert any("role" in record.message.lower() for record in caplog.records)
+
+    async def test_a_departed_member_is_a_noop(self, stack: _Stack) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        guild = _FakeGuild(role=object(), member_gone=True)
+
+        with mock.patch.object(client, "get_guild", return_value=guild):
+            await client.on_raw_reaction_remove(_reaction_payload())
+
+        assert guild.fetched == [777]
+
+    async def test_forbidden_is_logged_not_raised(
+        self, stack: _Stack, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+
+        class _ForbiddenMember(_FakeMember):
+            async def add_roles(self, role: Any, *, reason: str | None = None) -> None:
+                raise discord.Forbidden(mock.MagicMock(), "missing permissions")
+
+        guild = _FakeGuild(role=object(), member=_ForbiddenMember())
+
+        with (
+            mock.patch.object(client, "get_guild", return_value=guild),
+            caplog.at_level(logging.WARNING, logger="songbot.bot.client"),
+        ):
+            await client.on_raw_reaction_add(_reaction_payload())
+
+        assert any("Manage Roles" in record.message for record in caplog.records)
+
+
+class TestDailyPostPingMention:
+    """_send_daily_post mentions the opt-in role when /songbot-pingrole ran."""
+
+    def _patch_channel(self, client: SongBotClient, channel: _FakeSendChannel) -> None:
+        async def _fake_channel(channel_id: str) -> _FakeSendChannel:
+            return channel
+
+        client._challenge_channel = _fake_channel  # type: ignore[method-assign]
+
+    async def test_post_mentions_the_configured_role(self, stack: _Stack) -> None:
+        _add_song(stack.db, "song-1")
+        _seed_ping_role(stack)
+        client = _make_client(stack)
+        channel = _FakeSendChannel()
+        self._patch_channel(client, channel)
+        challenge = stack.engine.ensure_today_challenge(GUILD_ID, CHANNEL_ID, DAY1_PM)
+
+        await client._send_daily_post(challenge)
+
+        assert len(channel.sent) == 1
+        sent = channel.sent[0]
+        assert sent["content"] == "<@&31337>"
+        # Role mentions are explicitly allowed so the ping always lands.
+        allowed = sent["allowed_mentions"]
+        assert isinstance(allowed, discord.AllowedMentions)
+        assert allowed.roles is True
+        assert sent["embed"] is not None
+        assert sent["view"] is not None
+
+    async def test_post_without_a_configured_role_has_no_content(
+        self, stack: _Stack
+    ) -> None:
+        _add_song(stack.db, "song-1")
+        client = _make_client(stack)
+        channel = _FakeSendChannel()
+        self._patch_channel(client, channel)
+        challenge = stack.engine.ensure_today_challenge(GUILD_ID, CHANNEL_ID, DAY1_PM)
+
+        await client._send_daily_post(challenge)
+
+        assert len(channel.sent) == 1
+        sent = channel.sent[0]
+        assert sent["content"] is None
+        assert sent["allowed_mentions"] is None
 
 
 class TestEntrypoint:

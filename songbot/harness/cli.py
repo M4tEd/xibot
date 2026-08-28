@@ -41,10 +41,10 @@ posts the local date of ``--now`` (or the real clock) with no reveal
 (VAL-CROSS-018).
 
 Admin scenarios — ``admin-setup`` / ``admin-post`` / ``admin-skip`` /
-``admin-reload`` / ``admin-fixsong`` — drive the REAL ``AdminCommands``
-bodies (songbot/bot/admin.py) with the invoking user's Manage-Guild
-permission simulated by ``--as-admin``/``--as-non-admin`` (exactly one
-required). A denied invocation records exactly one ephemeral
+``admin-reload`` / ``admin-fixsong`` / ``admin-pingrole`` — drive the REAL
+``AdminCommands`` bodies (songbot/bot/admin.py) with the invoking user's
+Manage-Guild permission simulated by ``--as-admin``/``--as-non-admin``
+(exactly one required). A denied invocation records exactly one ephemeral
 permission-denied payload and mutates nothing (VAL-ADMIN-009). A same-day
 repeat ``admin-post`` prints the pinned-#4 compact form
 ``{"already_posted": true, "messages": []}`` just like ``post``
@@ -55,6 +55,11 @@ channel). ``admin-fixsong`` corrects a challenge song's title/artist
 (``--title`` required, ``--artist``/``--date`` optional); its ephemeral ack
 and ``state.fix`` show the old -> new metadata (admin-only secrecy
 exception — the harness's ``status`` surface exposes song identity too).
+``admin-pingrole`` posts the reaction-role opt-in announcement (recorded as
+an ``announcement`` payload) and upserts ``ping_role_settings``
+(``--role``/``--emoji`` override the defaults); later ``post``/
+``advance-day`` runs then carry the role mention in the daily post's
+``content``.
 
 Multi-guild: the harness drives ONE guild per run — the
 DISCORD_GUILD_ID/DISCORD_CHANNEL_ID bootstrap pair when set, else the
@@ -86,6 +91,7 @@ from songbot.bot.admin import AdminCommands
 from songbot.bot.embeds import (
     NO_ACTIVE_CHALLENGE_MESSAGE,
     daily_challenge_embed,
+    ping_mention_content,
     reveal_embed,
     snippet_attachment,
 )
@@ -122,6 +128,7 @@ __all__ = [
     "parse_now",
     "parse_user",
     "scenario_admin_fixsong",
+    "scenario_admin_pingrole",
     "scenario_admin_post",
     "scenario_admin_reload",
     "scenario_admin_setup",
@@ -347,6 +354,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="The channel id to configure (default: the harness channel).",
     )
 
+    admin_pingrole = sub.add_parser(
+        "admin-pingrole",
+        help="Run /songbot-pingrole (post the reaction-role opt-in announcement).",
+    )
+    add_admin_flags(admin_pingrole)
+    admin_pingrole.add_argument(
+        "--role",
+        default="ping-role",
+        help="The role id to grant on reaction (default: 'ping-role').",
+    )
+    admin_pingrole.add_argument(
+        "--emoji",
+        default="🎵",
+        help="The opt-in reaction emoji (default: 🎵).",
+    )
+
     reset = sub.add_parser("reset", help="Wipe all DB tables and the snippet cache.")
     add_now(reset)
 
@@ -474,8 +497,12 @@ def _record_daily_post(
 
     Built with the REAL embed builder, the REAL persistent view, and the REAL
     attachment helper (pinned #9 filename); only the transport is recorded.
+    When the guild configured /songbot-pingrole, the payload's ``content``
+    carries the role mention exactly like the live send.
     """
+    config = ctx.engine.ping_role_settings(challenge.guild_id)
     recorder.record_channel_post(
+        content=ping_mention_content(config.role_id) if config is not None else None,
         embed=daily_challenge_embed(challenge, ctx.settings),
         view=_view_for(ctx, challenge.id, now),
         file=snippet_attachment(challenge.snippet_paths[0]),
@@ -491,6 +518,10 @@ def _record_reveal(recorder: Recorder, ctx: HarnessContext, reveal: Reveal) -> N
     symmetry with `RecordPost`.
     """
     recorder.record_message(kind="announcement", embed=reveal_embed(reveal))
+
+
+HARNESS_PING_MESSAGE_ID = "harness-ping-announcement"
+"""The deterministic announcement message id the harness's poster returns."""
 
 
 # -- scenarios ---------------------------------------------------------------------
@@ -706,10 +737,16 @@ def _admin_commands(
     async def send_daily_post(challenge: Challenge) -> None:
         record(recorder, ctx, challenge, now)
 
+    async def post_announcement(channel_id: str, content: str, emoji: str) -> str:
+        """The harness's /songbot-pingrole transport: record, return a stable id."""
+        recorder.record_message(kind="announcement", content=content)
+        return HARNESS_PING_MESSAGE_ID
+
     return AdminCommands(
         ctx.engine,
         ctx.settings,
         post_sender=send_daily_post,
+        announcement_poster=post_announcement,
         clock=lambda: now,
     )
 
@@ -925,6 +962,56 @@ async def scenario_admin_fixsong(
     )
 
 
+async def scenario_admin_pingrole(
+    ctx: HarnessContext,
+    user: FakeUser,
+    role_id: str,
+    emoji: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Drive the REAL /songbot-pingrole body (reaction-role opt-in).
+
+    Success: one ``announcement`` payload (the opt-in message the live client
+    posts to the configured channel) plus one ephemeral ack, and the guild's
+    ``ping_role_settings`` row is upserted (``state.ping_role`` carries the
+    stored row; the harness poster returns the deterministic
+    ``harness-ping-announcement`` message id). A non-admin invocation records
+    exactly one ephemeral denial and mutates nothing (VAL-ADMIN-009).
+    """
+    recorder = Recorder()
+    commands = _admin_commands(ctx, recorder, now)
+    interaction = cast(
+        "discord.Interaction[Any]",
+        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    )
+    result = await commands.setup_ping_role(
+        interaction,
+        role_id=role_id,
+        role_mention=f"<@&{role_id}>",
+        emoji=emoji,
+    )
+    row = ctx.engine.ping_role_settings(ctx.guild_id)
+    return _transcript(
+        "admin-pingrole",
+        recorder,
+        {
+            "outcome": result.outcome,
+            "error": result.error,
+            "ping_role": (
+                {
+                    "guild_id": row.guild_id,
+                    "channel_id": row.channel_id,
+                    "message_id": row.message_id,
+                    "role_id": row.role_id,
+                    "emoji": row.emoji,
+                }
+                if row is not None
+                else None
+            ),
+        },
+    )
+
+
 def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
     """Wipe every data table and the snippet cache (schema/migrations survive).
 
@@ -939,6 +1026,7 @@ def scenario_reset(ctx: HarnessContext) -> dict[str, Any]:
             "user_stats",
             "songs",
             "song_overrides",
+            "ping_role_settings",
             "guild_settings",
         ):
             ctx.db.execute(f"DELETE FROM {table}")
@@ -1057,6 +1145,14 @@ async def _dispatch(
             ctx,
             _admin_user(args.user, as_admin=args.as_admin),
             args.channel if args.channel is not None else ctx.channel_id,
+            now,
+        )
+    if args.scenario == "admin-pingrole":
+        return await scenario_admin_pingrole(
+            ctx,
+            _admin_user(args.user, as_admin=args.as_admin),
+            args.role,
+            args.emoji,
             now,
         )
     if args.scenario == "reset":

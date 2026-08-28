@@ -55,6 +55,22 @@ class _RecordingPoster:
         self.posted.append(challenge)
 
 
+class _RecordingAnnouncer:
+    """AnnouncementPoster test double: records posts, returns a stable message id."""
+
+    MESSAGE_ID = "announcement-message-1"
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.posts: list[tuple[str, str, str]] = []  # (channel_id, content, emoji)
+
+    async def __call__(self, channel_id: str, content: str, emoji: str) -> str:
+        self.posts.append((channel_id, content, emoji))
+        if self.fail:
+            raise RuntimeError("fake announcement send failure")
+        return self.MESSAGE_ID
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Iterator[Database]:
     database = Database.open(tmp_path / "songbot.db")
@@ -74,8 +90,16 @@ def poster() -> _RecordingPoster:
 
 
 @pytest.fixture
+def announcer() -> _RecordingAnnouncer:
+    return _RecordingAnnouncer()
+
+
+@pytest.fixture
 def commands(
-    engine: GameEngine, tmp_path: Path, poster: _RecordingPoster
+    engine: GameEngine,
+    tmp_path: Path,
+    poster: _RecordingPoster,
+    announcer: _RecordingAnnouncer,
 ) -> AdminCommands:
     # The fake interactions act on "guild-1"; configure its post channel so
     # the guild-scoped bodies find it (the live client seeds this from the
@@ -86,6 +110,7 @@ def commands(
         _settings(tmp_path),
         clock=lambda: DAY1,
         post_sender=poster,
+        announcement_poster=announcer,
     )
 
 
@@ -137,7 +162,11 @@ class TestPermissionGate:
 
         engine, _ = _make_engine(tmp_path, db, catalog_refresher=_spy_refresher)
         spied = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_RecordingAnnouncer(),
         )
 
         async def setup_via(interaction: FakeInteraction) -> Any:
@@ -146,12 +175,18 @@ class TestPermissionGate:
         async def fixsong_via(interaction: FakeInteraction) -> Any:
             return await spied.fix_song(interaction, title="Whatever")
 
+        async def pingrole_via(interaction: FakeInteraction) -> Any:
+            return await spied.setup_ping_role(
+                interaction, role_id="role-1", role_mention="<@&role-1>", emoji="🎵"
+            )
+
         for method in (
             spied.post_now,
             spied.skip_song,
             spied.reload_catalog,
             setup_via,
             fixsong_via,
+            pingrole_via,
         ):
             interaction = _interaction(manage_guild=False)
             result = await method(interaction)
@@ -175,6 +210,7 @@ class TestPermissionGate:
             "user_stats",
             "guild_settings",
             "song_overrides",
+            "ping_role_settings",
         ):
             assert _row_count(db, table) == 0
 
@@ -292,7 +328,11 @@ class TestSkipSong:
         _add_two_songs(db)
         engine, fake_snippets = _make_engine(tmp_path, db)
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_RecordingAnnouncer(),
         )
         challenge = engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
 
@@ -396,7 +436,11 @@ class TestReloadCatalog:
         )
         engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda: refresh)
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_RecordingAnnouncer(),
         )
 
         interaction = _interaction()
@@ -427,7 +471,11 @@ class TestReloadCatalog:
         )
         engine, _ = _make_engine(tmp_path, db, catalog_refresher=lambda: refresh)
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_RecordingAnnouncer(),
         )
 
         result = await commands.reload_catalog(_interaction())
@@ -450,7 +498,7 @@ class TestReloadCatalog:
 
 
 class TestRegistration:
-    def test_registers_five_guild_commands_with_manage_guild_default(
+    def test_registers_six_guild_commands_with_manage_guild_default(
         self, commands: AdminCommands
     ) -> None:
         client = discord.Client(intents=discord.Intents.default())
@@ -467,6 +515,7 @@ class TestRegistration:
             "songbot-skip",
             "songbot-reload",
             "songbot-fixsong",
+            "songbot-pingrole",
         }
         for command in registered:
             assert isinstance(command, app_commands.Command)
@@ -501,8 +550,8 @@ class TestRegistration:
         register_admin_commands(tree, commands, guild=guild_a)
         register_admin_commands(tree, commands, guild=guild_b)
 
-        assert len(tree.get_commands(guild=guild_a)) == 5
-        assert len(tree.get_commands(guild=guild_b)) == 5
+        assert len(tree.get_commands(guild=guild_a)) == 6
+        assert len(tree.get_commands(guild=guild_b)) == 6
         assert tree.get_commands() == []  # nothing global
 
 
@@ -546,7 +595,11 @@ class TestSetupChannel:
 
         later = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
         later_commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: later, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: later,
+            post_sender=poster,
+            announcement_poster=_RecordingAnnouncer(),
         )
         result = await later_commands.setup_channel(_interaction(), "777", "#new-home")
 
@@ -565,7 +618,11 @@ class TestSetupChannel:
     ) -> None:
         engine, _ = _make_engine(tmp_path, db)
         commands = AdminCommands(
-            engine, _settings(tmp_path), clock=lambda: DAY1, post_sender=poster
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_RecordingAnnouncer(),
         )
         interaction = _interaction(manage_guild=False)
 
@@ -587,6 +644,132 @@ class TestSetupChannel:
         row = db.query_one("SELECT channel_id FROM challenges")
         assert row is not None
         assert row["channel_id"] == "999888"
+
+
+class TestSetupPingRole:
+    """/songbot-pingrole: post the opt-in announcement, record the config."""
+
+    async def test_posts_announcement_persists_config_and_acks(
+        self,
+        commands: AdminCommands,
+        db: Database,
+        announcer: _RecordingAnnouncer,
+    ) -> None:
+        interaction = _interaction()
+
+        result = await commands.setup_ping_role(
+            interaction, role_id="role-1", role_mention="<@&role-1>", emoji="🎵"
+        )
+
+        assert result.outcome == "ping_configured"
+        # The announcement went to the guild's CONFIGURED channel, built by
+        # the real content builder (emoji + role mention included).
+        assert len(announcer.posts) == 1
+        channel_id, content, emoji = announcer.posts[0]
+        assert channel_id == "channel-1"
+        assert emoji == "🎵"
+        assert "🎵" in content
+        assert "<@&role-1>" in content
+        # The message/emoji/role triple is stored for the reaction listeners.
+        row = db.query_one(
+            "SELECT * FROM ping_role_settings WHERE guild_id = 'guild-1'"
+        )
+        assert row is not None
+        assert row["channel_id"] == "channel-1"
+        assert row["message_id"] == _RecordingAnnouncer.MESSAGE_ID
+        assert row["role_id"] == "role-1"
+        assert row["emoji"] == "🎵"
+        assert row["set_by"] == str(ADMIN_ID)
+        # Exactly one ephemeral ack to the invoking admin.
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        ack = interaction.payloads[0]
+        assert ack.recipient == str(ADMIN_ID)
+        assert ack.content is not None
+        assert "<@&role-1>" in ack.content
+
+    async def test_re_run_supersedes_the_previous_announcement(
+        self,
+        commands: AdminCommands,
+        db: Database,
+        engine: GameEngine,
+        tmp_path: Path,
+        announcer: _RecordingAnnouncer,
+    ) -> None:
+        await commands.setup_ping_role(
+            _interaction(), role_id="role-1", role_mention="<@&role-1>", emoji="🎵"
+        )
+        before = db.query_one(
+            "SELECT created_at FROM ping_role_settings WHERE guild_id = 'guild-1'"
+        )
+        assert before is not None
+
+        later = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)
+        later_commands = AdminCommands(
+            engine,
+            _settings(tmp_path),
+            clock=lambda: later,
+            post_sender=_RecordingPoster(),
+            announcement_poster=announcer,
+        )
+        result = await later_commands.setup_ping_role(
+            _interaction(), role_id="role-2", role_mention="<@&role-2>", emoji="🔔"
+        )
+
+        assert result.outcome == "ping_configured"
+        row = db.query_one(
+            "SELECT * FROM ping_role_settings WHERE guild_id = 'guild-1'"
+        )
+        assert row is not None
+        assert row["role_id"] == "role-2"
+        assert row["emoji"] == "🔔"
+        assert row["created_at"] == before["created_at"]
+        assert row["updated_at"] != before["created_at"]
+
+    async def test_not_configured_guild_posts_nothing(
+        self, commands: AdminCommands, db: Database, announcer: _RecordingAnnouncer
+    ) -> None:
+        interaction = _interaction(guild_id="guild-never-set-up")
+
+        result = await commands.setup_ping_role(
+            interaction, role_id="role-1", role_mention="<@&role-1>", emoji="🎵"
+        )
+
+        assert result.outcome == "not_configured"
+        assert announcer.posts == []
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        content = interaction.payloads[0].content or ""
+        assert "/songbot-setup" in content
+        assert _row_count(db, "ping_role_settings") == 0
+
+    async def test_announcement_failure_persists_nothing(
+        self,
+        db: Database,
+        engine: GameEngine,
+        tmp_path: Path,
+        poster: _RecordingPoster,
+    ) -> None:
+        # The bare engine fixture is unconfigured; seed guild-1 like the
+        # commands fixture does so the body gets past the not-configured check.
+        engine.set_guild_channel("guild-1", "channel-1", set_by="test", now=DAY1)
+        failing_commands = AdminCommands(
+            engine,
+            _settings(tmp_path),
+            clock=lambda: DAY1,
+            post_sender=poster,
+            announcement_poster=_RecordingAnnouncer(fail=True),
+        )
+        interaction = _interaction()
+
+        result = await failing_commands.setup_ping_role(
+            interaction, role_id="role-1", role_mention="<@&role-1>", emoji="🎵"
+        )
+
+        assert result.outcome == "error"
+        assert result.error is not None
+        assert _row_count(db, "ping_role_settings") == 0
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        content = interaction.payloads[0].content or ""
+        assert "announcement" in content.lower()
 
 
 class TestNotConfigured:

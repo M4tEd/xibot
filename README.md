@@ -57,6 +57,19 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
     after every catalog reload (the `song_overrides` table); already-recorded
     guesses keep their original results. The ephemeral ack shows the old →
     new metadata (admin-only, ephemeral — public posts never name songs)
+  - `/songbot-pingrole` — opt-in pings for the daily song: posts an
+    announcement in the configured channel ("React with 🎵 to get the role").
+    Reacting with the emoji grants the chosen `role:` (removing the reaction
+    revokes it), and every daily challenge post mentions the role so opted-in
+    players are pinged. `emoji:` defaults to 🎵. Re-running posts a fresh
+    announcement and supersedes the old one. Needs the bot to have
+    **Manage Roles** (and the role must sit below the bot's highest role).
+- **Reaction-role opt-in** — users opt into daily-song pings by reacting to
+  the `/songbot-pingrole` announcement; reactions are tracked with raw
+  reaction events, so they keep working across restarts, and removing the
+  reaction opts back out. Per guild (each server picks its own role/emoji);
+  the config lives in the `ping_role_settings` table and is dropped with the
+  rest of the guild's configuration when the bot is removed.
 - **Next-day reveal** — each new daily post first reveals the previous
   challenge: the song title/artist and a winners summary (or "nobody got it").
 
@@ -171,13 +184,15 @@ At least one catalog provider must be enabled or posting fails with a
    → **New Application**.
 2. **Bot** tab → **Reset Token** → copy the token into `DISCORD_BOT_TOKEN`.
    No privileged gateway intents are needed (the bot only uses the `guilds`
-   intent).
+   and `reactions` intents — `reactions` powers the /songbot-pingrole opt-in).
 3. Invite the bot with the `bot` and `applications.commands` scopes and
-   permissions integer **116736** (Send Messages + Embed Links + Attach Files +
-   Read Message History):
+   permissions integer **268552256** (Send Messages + Embed Links + Attach
+   Files + Read Message History + Add Reactions + Manage Roles — the last two
+   are only needed for the /songbot-pingrole opt-in feature; use **116736**
+   instead if you'll never enable it):
 
    ```
-   https://discord.com/oauth2/authorize?client_id=<YOUR_APPLICATION_ID>&scope=bot+applications.commands&permissions=116736
+   https://discord.com/oauth2/authorize?client_id=<YOUR_APPLICATION_ID>&scope=bot+applications.commands&permissions=268552256
    ```
 
 4. Either copy your server and channel IDs (enable *User Settings → Advanced →
@@ -254,6 +269,7 @@ Scenarios: `post` · `hear-more --user U [--times N]` · `guess --user U --text 
 `leaderboard --user U` · `advance-day` · `admin-setup [--channel C] |
 admin-post|admin-skip|admin-reload --as-admin|--as-non-admin` ·
 `admin-fixsong --title T [--artist A] [--date YYYY-MM-DD]
+--as-admin|--as-non-admin` · `admin-pingrole [--role R] [--emoji E]
 --as-admin|--as-non-admin` · `status` · `reset` · `serve` (health endpoint
 only).
 
@@ -302,6 +318,8 @@ export LOCAL_MUSIC_DIR=./data/fixture-music    # 8-song synthetic demo library
 .venv/bin/python -m songbot.harness admin-reload --as-non-admin
 # Correct a badly parsed song's metadata (targets the latest challenge's song)
 .venv/bin/python -m songbot.harness admin-fixsong --as-admin --title "Corrected Title" --artist "Corrected Artist"
+# Post the reaction-role opt-in announcement; later posts mention the role
+.venv/bin/python -m songbot.harness admin-pingrole --as-admin --role ping-role --emoji "🎵"
 
 # Start over
 .venv/bin/python -m songbot.harness reset
@@ -364,5 +382,11 @@ maps 1:1 to the core game loop.
    Manage-Server admin: `/songbot-post` is idempotent on an already-posted
    day, `/songbot-skip` replaces today's song with a fresh snippet,
    `/songbot-reload` refreshes the catalog and reports per-source counts.
-9. **Restart safety** — restart the bot process: no duplicate post appears and
-   the existing buttons keep working.
+9. **Ping-role opt-in** — as an admin, `/songbot-pingrole role:@SongBot Pings`
+   posts the announcement with the bot's 🎵 reaction seeded. Reacting with 🎵
+   grants the role, removing it revokes the role, and the next daily post
+   mentions (pings) the role. (Requires the bot to have Manage Roles and the
+   role to sit below the bot's highest role.)
+10. **Restart safety** — restart the bot process: no duplicate post appears and
+    the existing buttons keep working; reactions on the opt-in announcement
+    keep granting/revoking the role.

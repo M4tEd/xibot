@@ -54,6 +54,7 @@ from songbot.db import (
     ChallengeUserRow,
     Database,
     GuildSettingsRow,
+    PingRoleRow,
     SongRow,
     UserStatsRow,
 )
@@ -484,9 +485,69 @@ class GameEngine:
         """Drop a guild's configuration (the bot left the guild).
 
         Challenge/score history is KEPT — re-adding the bot and re-running
-        /songbot-setup resumes the guild's game where it left off.
+        /songbot-setup resumes the guild's game where it left off. The
+        guild's `ping_role_settings` row (if any) cascades away with the
+        `guild_settings` row.
         """
         self._db.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,))
+
+    # -- ping-role configuration (reaction-role opt-in) -----------------------
+
+    def set_ping_role(
+        self,
+        guild_id: str,
+        channel_id: str,
+        message_id: str,
+        role_id: str,
+        emoji: str,
+        *,
+        set_by: str,
+        now: datetime,
+    ) -> PingRoleRow:
+        """Upsert a guild's reaction-role opt-in config; return the stored row.
+
+        Used by /songbot-pingrole after the announcement message is posted
+        (``message_id`` is the announcement the reaction listeners watch). A
+        re-configuration keeps the original ``created_at``, refreshes
+        ``updated_at``, and supersedes the previous announcement (reactions
+        on the old message no longer match any watched message id).
+        """
+        iso_now = self._utc_iso(now)
+        with self._db.transaction():
+            self._db.execute(
+                "INSERT INTO ping_role_settings"
+                " (guild_id, channel_id, message_id, role_id, emoji, set_by,"
+                " created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(guild_id) DO UPDATE SET"
+                " channel_id = excluded.channel_id, message_id = excluded.message_id,"
+                " role_id = excluded.role_id, emoji = excluded.emoji,"
+                " set_by = excluded.set_by, updated_at = excluded.updated_at",
+                (guild_id, channel_id, message_id, role_id, emoji, set_by, iso_now, iso_now),
+            )
+        row = self.ping_role_settings(guild_id)
+        if row is None:  # pragma: no cover - the upsert just wrote it
+            raise EngineError(f"ping_role_settings upsert lost guild {guild_id}")
+        return row
+
+    def ping_role_settings(self, guild_id: str) -> PingRoleRow | None:
+        """A guild's reaction-role opt-in config, or None when not set up."""
+        row = self._db.query_one(
+            "SELECT * FROM ping_role_settings WHERE guild_id = ?", (guild_id,)
+        )
+        return PingRoleRow.from_row(row) if row is not None else None
+
+    def ping_role_for_message(self, message_id: str) -> PingRoleRow | None:
+        """The opt-in config watching ``message_id``, or None.
+
+        The reaction listeners dispatch on the reacted message's id: only
+        reactions on a configured announcement (and only with the configured
+        emoji) grant or revoke the role.
+        """
+        row = self._db.query_one(
+            "SELECT * FROM ping_role_settings WHERE message_id = ?", (message_id,)
+        )
+        return PingRoleRow.from_row(row) if row is not None else None
 
     def latest_challenge_id(self, guild_id: str) -> int | None:
         """The id of the guild's most recent challenge (persistent-view binding)."""

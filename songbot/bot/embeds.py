@@ -46,6 +46,7 @@ __all__ = [
     "HEAR_MORE_SOLVED_MESSAGE",
     "NO_ACTIVE_CHALLENGE_MESSAGE",
     "PERMISSION_DENIED_MESSAGE",
+    "PING_ROLE_FAILED_MESSAGE",
     "announcement_content",
     "daily_challenge_embed",
     "fixsong_ack_content",
@@ -55,6 +56,9 @@ __all__ = [
     "hear_more_content",
     "hear_more_refusal_content",
     "leaderboard_embed",
+    "ping_announcement_content",
+    "ping_mention_content",
+    "pingrole_ack_content",
     "reload_ack_content",
     "reveal_embed",
     "setup_ack_content",
@@ -121,6 +125,17 @@ ADMIN_NOT_CONFIGURED_MESSAGE = (
     "the daily-challenge channel."
 )
 """Ephemeral ack when an admin command needs a channel the guild never configured."""
+
+PING_ROLE_FAILED_MESSAGE = (
+    "⚠️ Couldn't post the opt-in announcement — the channel send or the emoji "
+    "reaction failed (check the bot's permissions and that the emoji is valid). "
+    "Nothing was saved; please try again."
+)
+"""Ephemeral ack when /songbot-pingrole's announcement post fails.
+
+Generic on purpose: no transport internals. Nothing is persisted on failure,
+so a retry posts a fresh announcement from scratch.
+"""
 
 
 def format_seconds(seconds: float) -> str:
@@ -302,6 +317,41 @@ def setup_ack_content(channel_mention: str, settings: Settings) -> str:
         f"(**{settings.daily_post_time} {settings.timezone}**) — or post one "
         "right now with /songbot-post."
     )
+
+
+def ping_announcement_content(emoji: str, role_mention: str) -> str:
+    """The public opt-in announcement posted by /songbot-pingrole.
+
+    Names the role and the emoji but NEVER any song (pinned #9 is trivially
+    preserved — no song identity crosses this builder). Users react with the
+    emoji to receive the role; removing the reaction removes the role.
+    """
+    return (
+        "🎵 **Want a ping when the daily song drops?**\n"
+        f"React with {emoji} to get the {role_mention} role — you'll be "
+        "mentioned in every daily challenge post. Remove your reaction "
+        "anytime to opt out."
+    )
+
+
+def pingrole_ack_content(role_mention: str, emoji: str) -> str:
+    """The ephemeral ack for /songbot-pingrole: what was set up."""
+    return (
+        f"✅ Opt-in announcement posted. Reacting with {emoji} now grants the "
+        f"{role_mention} role (removing the reaction revokes it), and daily "
+        "challenge posts will mention it.\n"
+        "Re-running /songbot-pingrole posts a fresh announcement and "
+        "supersedes the old one."
+    )
+
+
+def ping_mention_content(role_id: str) -> str:
+    """The daily post's message content when a ping role is configured.
+
+    The ``<@&role_id>`` mention pings the role's members (role mentions are
+    explicitly allowed on that send); the embed carries all the copy.
+    """
+    return f"<@&{role_id}>"
 
 
 def skip_refusal_content(reason: SkipRefusedReason) -> str:

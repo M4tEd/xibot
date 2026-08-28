@@ -1,5 +1,5 @@
 """Admin slash commands: /songbot-setup, /songbot-post, /songbot-skip,
-/songbot-reload, /songbot-fixsong.
+/songbot-reload, /songbot-fixsong, /songbot-pingrole.
 
 All three are gated on the Manage-Guild permission and ack EPHEMERALLY. The
 command bodies (`AdminCommands` methods) are plain coroutines that delegate
@@ -45,8 +45,11 @@ from songbot.bot.embeds import (
     ADMIN_POST_SUCCESS_MESSAGE,
     ADMIN_SKIP_SUCCESS_MESSAGE,
     PERMISSION_DENIED_MESSAGE,
+    PING_ROLE_FAILED_MESSAGE,
     fixsong_ack_content,
     fixsong_refusal_content,
+    ping_announcement_content,
+    pingrole_ack_content,
     reload_ack_content,
     setup_ack_content,
     skip_refusal_content,
@@ -68,6 +71,7 @@ from songbot.engine import (
 __all__ = [
     "AdminCommands",
     "AdminResult",
+    "AnnouncementPoster",
     "DailyPostSender",
     "has_manage_guild",
     "register_admin_commands",
@@ -84,16 +88,18 @@ AdminOutcome = Literal[
     "configured",
     "not_configured",
     "fixed",
+    "ping_configured",
     "error",
 ]
 """The machine-readable outcome of an admin command body.
 
-``error`` is the pinned-#16 delivery failure: the daily-post send raised for
-a challenge the call just created, which was rolled back (row deleted,
-snippet cache purged) so a retry reposts the identical challenge.
-``configured``/``not_configured`` are the /songbot-setup outcomes (and the
-``not_configured`` refusal of the other commands in a guild that never ran
-setup).
+``error`` is a delivery failure: for /songbot-post, the pinned-#16 rollback
+of the just-created challenge (row deleted, snippet cache purged) so a retry
+reposts the identical challenge; for /songbot-pingrole, nothing was
+persisted so a retry posts a fresh announcement.
+``configured``/``ping_configured`` are the /songbot-setup and
+/songbot-pingrole outcomes; ``not_configured`` is the refusal of the other
+commands in a guild that never ran setup.
 """
 
 DailyPostSender = Callable[[Challenge], Awaitable[None]]
@@ -102,6 +108,16 @@ DailyPostSender = Callable[[Challenge], Awaitable[None]]
 The message itself is always built from the shared real builders; only the
 transport differs between the live client (channel send) and the harness
 (recorded ``channel``-kind payload).
+"""
+
+AnnouncementPoster = Callable[[str, str, str], Awaitable[str]]
+"""Posts the ping opt-in announcement; returns the new message's id.
+
+Args: ``channel_id``, ``content`` (built by `ping_announcement_content`),
+``emoji``. The live client sends the message to the channel AND seeds it
+with the bot's own ``emoji`` reaction (so users can one-tap); the harness
+records an ``announcement``-kind payload. Raises on delivery failure — the
+caller persists nothing in that case.
 """
 
 
@@ -146,6 +162,9 @@ class AdminCommands:
             harness passes the ``--now`` clock for determinism).
         post_sender: transport for the daily challenge post (see
             `DailyPostSender`); only invoked when a challenge is newly created.
+        announcement_poster: transport for the /songbot-pingrole opt-in
+            announcement (see `AnnouncementPoster`); invoked before the
+            reaction-role config is persisted.
     """
 
     def __init__(
@@ -154,11 +173,13 @@ class AdminCommands:
         settings: Settings,
         *,
         post_sender: DailyPostSender,
+        announcement_poster: AnnouncementPoster,
         clock: Clock | None = None,
     ) -> None:
         self._engine = engine
         self._settings = settings
         self._post_sender = post_sender
+        self._announcement_poster = announcement_poster
         self._clock: Clock = clock if clock is not None else utc_now
 
     async def _deny(self, interaction: discord.Interaction[Any]) -> AdminResult:
@@ -200,6 +221,60 @@ class AdminCommands:
             setup_ack_content(channel_mention, self._settings), ephemeral=True
         )
         return AdminResult("configured")
+
+    async def setup_ping_role(
+        self,
+        interaction: discord.Interaction[Any],
+        *,
+        role_id: str,
+        role_mention: str,
+        emoji: str,
+    ) -> AdminResult:
+        """/songbot-pingrole: post the opt-in announcement and watch its reactions.
+
+        Posts the announcement to the guild's configured channel (via the
+        injected `AnnouncementPoster`, which also seeds the bot's own emoji
+        reaction), then records the message/emoji/role triple in
+        ``ping_role_settings``. Reacting with the emoji grants the role;
+        removing the reaction revokes it; daily posts mention the role. A
+        guild that never ran /songbot-setup gets the not-configured ack and
+        nothing is posted. If the announcement send fails, NOTHING is
+        persisted (a retry posts a fresh announcement) and the admin gets an
+        ephemeral error ack. Re-running supersedes the previous announcement.
+        """
+        if not has_manage_guild(interaction):
+            return await self._deny(interaction)
+        guild_id = self._guild_id_of(interaction)
+        guild = self._engine.guild_settings(guild_id) if guild_id is not None else None
+        if guild is None:
+            await interaction.response.send_message(
+                ADMIN_NOT_CONFIGURED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("not_configured")
+        try:
+            message_id = await self._announcement_poster(
+                guild.channel_id,
+                ping_announcement_content(emoji, role_mention),
+                emoji,
+            )
+        except Exception as exc:
+            await interaction.response.send_message(
+                PING_ROLE_FAILED_MESSAGE, ephemeral=True
+            )
+            return AdminResult("error", error=str(exc))
+        self._engine.set_ping_role(
+            guild.guild_id,
+            guild.channel_id,
+            message_id,
+            role_id,
+            emoji,
+            set_by=str(interaction.user.id),
+            now=self._clock(),
+        )
+        await interaction.response.send_message(
+            pingrole_ack_content(role_mention, emoji), ephemeral=True
+        )
+        return AdminResult("ping_configured")
 
     async def post_now(self, interaction: discord.Interaction[Any]) -> AdminResult:
         """/songbot-post: ensure today's challenge exists and post it.
@@ -400,12 +475,31 @@ def register_admin_commands(
     ) -> None:
         await commands.fix_song(interaction, title=title, artist=artist, date=date)
 
+    @app_commands.command(
+        name="songbot-pingrole",
+        description="Post an announcement users react to for daily-song pings.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        role="The role granted on reaction and mentioned in daily posts.",
+        emoji="The opt-in reaction emoji (default: 🎵).",
+    )
+    async def pingrole_command(
+        interaction: discord.Interaction[Any],
+        role: discord.Role,
+        emoji: str = "🎵",
+    ) -> None:
+        await commands.setup_ping_role(
+            interaction, role_id=str(role.id), role_mention=role.mention, emoji=emoji
+        )
+
     registered: tuple[app_commands.Command[Any, Any, Any], ...] = (
         setup_command,
         post_command,
         skip_command,
         reload_command,
         fixsong_command,
+        pingrole_command,
     )
     for command in registered:
         tree.add_command(command, guild=guild)
