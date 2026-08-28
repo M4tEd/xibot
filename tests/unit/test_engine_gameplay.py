@@ -198,6 +198,7 @@ class TestSubmitGuessOutcomes:
         assert result.points_awarded == 100
         assert result.guesses_used == 1
         assert result.guesses_left == 5
+        assert result.snippet_level == 0
         assert result.announce is True
 
         row = _challenge_user(db, challenge_id, "alice")
@@ -248,6 +249,7 @@ class TestSubmitGuessOutcomes:
         engine.unlock_snippet(challenge_id, "dave")
         result = engine.submit_guess(challenge_id, "dave", BOTH_GUESS, NOW)
         assert result.points_awarded == 75
+        assert result.snippet_level == 2  # the level actually heard at solve time
         row = _challenge_user(db, challenge_id, "dave")
         assert (row["snippet_level"], row["points_awarded"]) == (2, 75)
 

@@ -205,15 +205,19 @@ def leaderboard_embed(entries: Sequence[LeaderboardEntry]) -> discord.Embed:
     )
 
 
-def announcement_content(user_id: str, guesses_used: int, points_awarded: int) -> str:
+def announcement_content(user_id: str, result: GuessResult, settings: Settings) -> str:
     """The public first-solve announcement (VAL-GUESS-012).
 
     Uses the ``<@user_id>`` mention format and NEVER names the song (pinned #9).
+    Reports the snippet length the solver was hearing at solve time
+    (``result.snippet_level`` mapped through the configured ladder), formatted
+    with `format_seconds`.
     """
-    guess_word = "guess" if guesses_used == 1 else "guesses"
+    guess_word = "guess" if result.guesses_used == 1 else "guesses"
+    seconds = format_seconds(settings.snippet_lengths[result.snippet_level])
     return (
-        f"🎉 <@{user_id}> guessed today's song in {guesses_used} {guess_word} "
-        f"for **{points_awarded} points**!"
+        f"🎉 <@{user_id}> guessed today's song in {result.guesses_used} {guess_word} "
+        f"for **{result.points_awarded} points** while hearing **{seconds}** of audio!"
     )
 
 

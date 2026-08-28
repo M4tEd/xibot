@@ -168,7 +168,7 @@ class DailyChallengeView(discord.ui.View):
             return
         challenge_id, _ = target
         await interaction.response.send_modal(
-            GuessModal(self._engine, challenge_id, clock=self._clock)
+            GuessModal(self._engine, challenge_id, settings=self._settings, clock=self._clock)
         )
 
     @discord.ui.button(
