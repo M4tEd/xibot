@@ -12,7 +12,11 @@ the section starts at the nearest container cluster boundary BEFORE the
 requested start (measured ~8s early on a real video), which would silently
 shift every snippet; the re-encode makes the section start sample-accurate
 (verified against the full audio). Transient googlevideo 403s observed during
-ffmpeg-based section fetches are absorbed by retrying with fresh URLs.
+ffmpeg-based section fetches are absorbed by retrying with fresh URLs, each
+re-extracted with a DIFFERENT YouTube player client per attempt: a 403 is
+tied to the extracting client's URL flavor (observed 2026-08-27: every
+ANDROID_VR URL 403ed for hours — issue #11), so client rotation gives each
+attempt an independent chance to clear a client-specific block.
 
 Cache layout (rooted at ``Settings.snippet_cache_dir``)::
 
@@ -76,8 +80,20 @@ DEFAULT_FFMPEG_TIMEOUT_SEC = 60.0
 DEFAULT_DOWNLOAD_TIMEOUT_SEC = 120.0
 """Wall-clock bound for the yt-dlp section download (all attempts combined)."""
 
-_DOWNLOAD_ATTEMPTS = 3
-"""Section-download attempts before giving up (fresh URL per attempt)."""
+_PLAYER_CLIENT_SETS: tuple[tuple[str, ...] | None, ...] = (
+    None,  # attempt 1: yt-dlp's default clients
+    ("web",),
+    ("android",),
+    ("ios",),
+)
+"""YouTube player clients cycled across section-download attempts.
+
+One attempt per entry; ``None`` means yt-dlp's own default client selection.
+googlevideo 403s a URL flavor tied to the extracting client (observed
+2026-08-27: every ANDROID_VR URL 403ed for hours — issue #11), so each
+attempt re-extracts with a DIFFERENT client: the differently-signed URLs
+give every attempt an independent chance to clear a client-specific block.
+"""
 
 SectionDownloader = Callable[[str, float, float, Path, float], Path]
 """Fetches ``url``'s audio from ``start`` to ``end`` seconds into a file.
@@ -518,38 +534,54 @@ def _download_section(
 ) -> Path:
     """Fetch one audio section with the yt-dlp Python API (network: YouTube).
 
-    Retried a few times with a fresh extraction (hence a fresh googlevideo
-    URL) per attempt: ffmpeg-based section fetches intermittently get a
-    transient 403 from googlevideo that a retry clears. Partial output of
-    failed attempts is removed so no stray artifacts survive.
+    One attempt per `_PLAYER_CLIENT_SETS` entry, each a fresh extraction —
+    hence a fresh googlevideo URL — with a DIFFERENT YouTube player client
+    per attempt: ffmpeg-based section fetches intermittently get a
+    client-specific 403 from googlevideo (issue #11), which rotating the
+    extracting client (not just the URL) can clear. Partial output of failed
+    attempts is removed so no stray artifacts survive.
     """
     last_error: SnippetGenerationError | None = None
-    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+    attempts = len(_PLAYER_CLIENT_SETS)
+    for attempt, player_clients in enumerate(_PLAYER_CLIENT_SETS, start=1):
         try:
-            return _download_section_once(url, start_sec, end_sec, dest_base, timeout_sec)
+            return _download_section_once(
+                url, start_sec, end_sec, dest_base, timeout_sec, player_clients
+            )
         except SnippetGenerationError as exc:
             last_error = exc
             logger.warning(
-                "section download attempt %d/%d for %r failed: %s",
+                "section download attempt %d/%d for %r (player_client=%s) failed: %s",
                 attempt,
-                _DOWNLOAD_ATTEMPTS,
+                attempts,
                 url,
+                "default" if player_clients is None else "+".join(player_clients),
                 exc,
             )
             for leftover in dest_base.parent.glob(f"{dest_base.name}.*"):
                 leftover.unlink(missing_ok=True)
-            if attempt < _DOWNLOAD_ATTEMPTS:
+            if attempt < attempts:
                 time.sleep(min(2.0 ** (attempt - 1), 4.0))
     raise SnippetGenerationError(
         f"Failed to download audio section from {url!r} after "
-        f"{_DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+        f"{attempts} attempts: {last_error}"
     ) from last_error
 
 
 def _download_section_once(
-    url: str, start_sec: float, end_sec: float, dest_base: Path, timeout_sec: float
+    url: str,
+    start_sec: float,
+    end_sec: float,
+    dest_base: Path,
+    timeout_sec: float,
+    player_clients: Sequence[str] | None,
 ) -> Path:
-    """Single yt-dlp section-download attempt (network: YouTube)."""
+    """Single yt-dlp section-download attempt (network: YouTube).
+
+    ``player_clients`` pins the YouTube extractor's player clients for this
+    attempt (``None`` = yt-dlp defaults); the extracting client determines
+    the googlevideo URL flavor a client-specific 403 blocks.
+    """
     options: dict[str, Any] = {
         "format": "bestaudio/best",
         "outtmpl": f"{dest_base}.%(ext)s",
@@ -566,6 +598,8 @@ def _download_section_once(
         "noprogress": True,
         "socket_timeout": min(timeout_sec, 30.0),
     }
+    if player_clients is not None:
+        options["extractor_args"] = {"youtube": {"player_client": list(player_clients)}}
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])

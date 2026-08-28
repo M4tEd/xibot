@@ -16,7 +16,7 @@ engine-gameplay-matching feature).
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,11 +27,13 @@ from songbot.catalog.refresh import RefreshResult
 from songbot.config import Settings
 from songbot.db import Database
 from songbot.engine import (
+    MAX_AUTO_SKIPS,
     CatalogEmptyError,
     GameEngine,
     Reveal,
     SkipRefusedError,
 )
+from songbot.snippets import SnippetGenerationError
 
 NOW = datetime(2026, 8, 13, 16, 0, 0, tzinfo=UTC)  # 2026-08-13 13:00 ADT
 TODAY = "2026-08-13"
@@ -59,11 +61,24 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 class FakeSnippets:
-    """SnippetService test double: creates empty level files, records calls."""
+    """SnippetService test double: creates empty level files, records calls.
 
-    def __init__(self, cache_dir: Path, *, fail: bool = False) -> None:
+    ``fail`` raises a plain RuntimeError for every call (a non-SnippetError:
+    no auto-skip). ``fail_ids`` raises a `SnippetGenerationError` — the
+    production failure contract — only for songs whose source_id is in the
+    set, so tests can fail specific picks and exercise auto-skip.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        *,
+        fail: bool = False,
+        fail_ids: Collection[str] = (),
+    ) -> None:
         self.cache_dir = cache_dir
         self.fail = fail
+        self.fail_ids = set(fail_ids)
         self.ensure_calls: list[tuple[str, int | str, float, tuple[float, ...]]] = []
         self.purged: list[int | str] = []
 
@@ -77,6 +92,8 @@ class FakeSnippets:
         self.ensure_calls.append((song.source_id, challenge_id, offset, tuple(lengths)))
         if self.fail:
             raise RuntimeError("fake snippet failure")
+        if song.source_id in self.fail_ids:
+            raise SnippetGenerationError(f"fake snippet failure for {song.source_id}")
         base = self.cache_dir / str(challenge_id)
         base.mkdir(parents=True, exist_ok=True)
         paths: dict[int, Path] = {}
@@ -384,6 +401,105 @@ def _source_id_index(db: Database, song_id: int) -> int:
     row = db.query_one("SELECT source_id FROM songs WHERE id = ?", (song_id,))
     assert row is not None
     return int(str(row["source_id"]).split("-")[1])
+
+
+class TestAutoSkip:
+    """Issue #11: an unsnippable FRESH pick is auto-replaced (bounded).
+
+    Without it, the scheduler retries the identical song+offset (seed
+    hash(date|guild|skip=0)) every 60s until a manual /songbot-skip.
+    """
+
+    @staticmethod
+    def _fail_seed0_pick(
+        engine: GameEngine, db: Database, fake: FakeSnippets
+    ) -> tuple[int, str]:
+        """Learn today's seed-0 pick via a probe post, reset, then fail it."""
+        probe = engine.ensure_today_challenge("g1", "c1", NOW)
+        db.execute("DELETE FROM challenges WHERE id = ?", (probe.id,))
+        fake.fail_ids = {probe.song.source_id}
+        return probe.song.id, probe.song.source_id
+
+    def test_failed_pick_is_auto_skipped_to_the_next_seed(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        _add_songs(db, 4)
+        engine, fake = _make_engine(tmp_path, db)
+        failed_id, failed_source = self._fail_seed0_pick(engine, db, fake)
+        calls_before = len(fake.ensure_calls)
+
+        challenge = engine.ensure_today_challenge("g1", "c1", NOW)
+
+        assert challenge.created is True
+        assert challenge.skip_count == 1
+        assert challenge.song.id != failed_id
+        assert _challenge_count(db) == 1  # only the replacement row survives
+        row = db.query_one("SELECT song_id, skip_count FROM challenges")
+        assert row is not None
+        assert (row["song_id"], row["skip_count"]) == (challenge.song.id, 1)
+        # One failed attempt (the seed-0 song) + one success, in that order.
+        new_calls = fake.ensure_calls[calls_before:]
+        assert [call[0] for call in new_calls] == [failed_source, challenge.song.source_id]
+
+    def test_auto_skip_pick_matches_the_manual_skip_chain(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """Auto-skip k lands on the same song+offset as k manual skips (one chain)."""
+        _add_songs(db, 8)
+        engine, fake = _make_engine(tmp_path, db)
+        first = engine.ensure_today_challenge("g1", "c1", NOW)  # seed-0 pick
+        manual = engine.skip_today_song("g1", NOW)  # seed-1 pick (manual chain)
+
+        # Replay the day with the seed-0 pick unsnippable: the auto-skip must
+        # land on the manual chain's seed-1 pick (same seed, same exclusion).
+        db.execute("DELETE FROM challenges WHERE id = ?", (manual.id,))
+        fake.fail_ids = {first.song.source_id}
+        auto = engine.ensure_today_challenge("g1", "c1", NOW)
+
+        assert auto.skip_count == 1
+        assert auto.song.id == manual.song.id
+        assert auto.snippet_offset_sec == manual.snippet_offset_sec
+
+    def test_all_picks_failing_raises_and_leaves_no_row(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """Every song failing -> the last SnippetError propagates, no row."""
+        _add_songs(db, 2)
+        engine, fake = _make_engine(tmp_path, db)
+        fake.fail_ids = {"song-0", "song-1"}
+
+        with pytest.raises(SnippetGenerationError, match="fake snippet failure"):
+            engine.ensure_today_challenge("g1", "c1", NOW)
+
+        assert _challenge_count(db) == 0
+
+    def test_auto_skip_is_bounded(self, db: Database, tmp_path: Path) -> None:
+        """One call tries at most MAX_AUTO_SKIPS + 1 songs before giving up."""
+        _add_songs(db, 10)
+        engine, fake = _make_engine(tmp_path, db)
+        fake.fail_ids = {f"song-{i}" for i in range(10)}
+
+        with pytest.raises(SnippetGenerationError):
+            engine.ensure_today_challenge("g1", "c1", NOW)
+
+        assert len(fake.ensure_calls) == MAX_AUTO_SKIPS + 1
+        assert _challenge_count(db) == 0
+
+    def test_existing_row_reheal_failure_does_not_auto_skip(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """A pre-existing row may already be posted: never auto-replace it."""
+        _add_songs(db, 4)
+        engine, fake = _make_engine(tmp_path, db)
+        challenge = engine.ensure_today_challenge("g1", "c1", NOW)
+        fake.fail_ids = {challenge.song.source_id}
+
+        with pytest.raises(SnippetGenerationError, match="fake snippet failure"):
+            engine.ensure_today_challenge("g1", "c1", NOW)
+
+        row = db.query_one("SELECT song_id, skip_count FROM challenges")
+        assert row is not None
+        assert (row["song_id"], row["skip_count"]) == (challenge.song.id, 0)
 
 
 class TestPerGuildIsolation:

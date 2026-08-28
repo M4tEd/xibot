@@ -15,7 +15,11 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
 - **Daily post** — a new challenge every day at `DAILY_POST_TIME` in the
   configured `TIMEZONE`: an embed, a 1-second snippet attachment, and three
   buttons. Posting is idempotent (a restart never double-posts), and songs are
-  never repeated until the whole catalog has been used.
+  never repeated until the whole catalog has been used. If the day's pick
+  cannot be snippeted (e.g. YouTube refuses the download), the bot
+  automatically replaces it with the next deterministic pick (bounded) before
+  falling back to its 60s retry cadence; YouTube section downloads also
+  rotate player clients across attempts to clear client-specific 403s.
 - **Hear-more ladder** — each player starts at the 1s snippet (worth 100
   points) and can press **Hear more** up to 4 times to unlock 2s / 4s / 8s /
   16s snippets, worth 75 / 50 / 30 / 15 points. Unlocks are per-user and
