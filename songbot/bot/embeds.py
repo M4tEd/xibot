@@ -31,6 +31,7 @@ from songbot.engine import (
     UnlockRefusedReason,
     UnlockResult,
 )
+from songbot.matching import GuessMatchMode
 
 __all__ = [
     "ADMIN_CATALOG_EMPTY_MESSAGE",
@@ -150,13 +151,18 @@ def daily_challenge_embed(challenge: Challenge, settings: Settings) -> discord.E
     """
     level0_seconds = format_seconds(settings.snippet_lengths[0])
     level0_points = settings.snippet_points[0]
+    guess_targets = {
+        "either": "the artist or the title",
+        "title": "the title",
+        "artist": "the artist",
+    }
     embed = discord.Embed(
         title=f"🎵 Daily Song — {challenge.date}",
         description=(
             "A new song just dropped — can you name it from a tiny snippet?\n\n"
             "**How to play**\n"
             "🎧 **Hear more** — unlock a longer snippet (worth fewer points)\n"
-            "💡 **Guess** — name the artist or the title\n"
+            f"💡 **Guess** — name {guess_targets[settings.guess_match_mode]}\n"
             "🏆 **Leaderboard** — see today's rankings\n\n"
             f"Right now you hear **{level0_seconds}** — a correct guess is worth "
             f"**{level0_points} points**. You have **{settings.max_guesses_per_day}** "
@@ -239,16 +245,24 @@ def announcement_content(user_id: str, result: GuessResult, settings: Settings) 
     )
 
 
-def guess_feedback_content(result: GuessResult) -> str:
+def guess_feedback_content(result: GuessResult, mode: GuessMatchMode = "either") -> str:
     """The ephemeral reply to a guess submission (never names the song).
 
     Maps every `GuessOutcome` to user-facing copy; ``challenge_closed`` maps
-    to the single closed-challenge notice (VAL-GUESS-019).
+    to the single closed-challenge notice (VAL-GUESS-019). ``mode`` (the
+    configured ``GUESS_MATCH_MODE``) keeps the correct-guess copy honest in
+    restricted modes: only the counted field is named, and the 1.5x
+    both-fields bonus is mentioned only in ``either`` mode.
     """
     if result.outcome == "correct":
+        # Branch order matters: in "artist" mode a guess that also matched the
+        # title still reads as "the artist"; the matched_title fallback below
+        # is only reached in "either" mode.
         if result.is_both:
             matched = "**both the title and the artist** — 1.5x bonus!"
-        elif result.matched_title:
+        elif mode == "artist":
+            matched = "the **artist**"
+        elif mode == "title" or result.matched_title:
             matched = "the **title**"
         else:
             matched = "the **artist**"

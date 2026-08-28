@@ -31,6 +31,7 @@ VALID_ENV = {
     "SNIPPET_LENGTHS": "1,2,4,8,16",
     "SNIPPET_POINTS": "100,75,50,30,15",
     "BOTH_CORRECT_MULTIPLIER": "1.5",
+    "GUESS_MATCH_MODE": "either",
     "DATABASE_PATH": "./data/songbot.db",
     "SNIPPET_CACHE_DIR": "./data/snippets",
     "HEALTH_PORT": "3108",
@@ -65,6 +66,7 @@ class TestHappyPath:
         assert settings.snippet_lengths == (1.0, 2.0, 4.0, 8.0, 16.0)
         assert settings.snippet_points == (100, 75, 50, 30, 15)
         assert settings.both_correct_multiplier == 1.5
+        assert settings.guess_match_mode == "either"
         assert settings.database_path == Path("./data/songbot.db")
         assert settings.snippet_cache_dir == Path("./data/snippets")
         assert settings.health_port == 3108
@@ -80,6 +82,7 @@ class TestHappyPath:
         assert settings.snippet_lengths == (1.0, 2.0, 4.0, 8.0, 16.0)
         assert settings.snippet_points == (100, 75, 50, 30, 15)
         assert settings.both_correct_multiplier == 1.5
+        assert settings.guess_match_mode == "either"
         assert settings.database_path == Path("./data/songbot.db")
         assert settings.snippet_cache_dir == Path("./data/snippets")
         assert settings.health_port == 3108
@@ -256,6 +259,32 @@ class TestMultiplier:
         env_file = write_env(tmp_path, {**VALID_ENV, "BOTH_CORRECT_MULTIPLIER": bad})
         with pytest.raises(ConfigError, match="BOTH_CORRECT_MULTIPLIER"):
             load(env_file)
+
+
+class TestGuessMatchMode:
+    def test_defaults_to_either_when_absent(self, tmp_path: Path) -> None:
+        without_mode = {k: v for k, v in VALID_ENV.items() if k != "GUESS_MATCH_MODE"}
+        env_file = write_env(tmp_path, without_mode)
+        assert load(env_file).guess_match_mode == "either"
+
+    @pytest.mark.parametrize("mode", ["title", "artist", "either"])
+    def test_valid_modes_accepted(self, tmp_path: Path, mode: str) -> None:
+        env_file = write_env(tmp_path, {**VALID_ENV, "GUESS_MATCH_MODE": mode})
+        assert load(env_file).guess_match_mode == mode
+
+    def test_value_is_case_insensitive(self, tmp_path: Path) -> None:
+        env_file = write_env(tmp_path, {**VALID_ENV, "GUESS_MATCH_MODE": "ARTIST"})
+        assert load(env_file).guess_match_mode == "artist"
+
+    @pytest.mark.parametrize("bad", ["", "both", "song", "TITLE ARTIST"])
+    def test_invalid_mode_rejected(self, tmp_path: Path, bad: str) -> None:
+        """Invalid values are rejected at load, naming the field and valid values."""
+        env_file = write_env(tmp_path, {**VALID_ENV, "GUESS_MATCH_MODE": bad})
+        with pytest.raises(ConfigError) as exc_info:
+            load(env_file)
+        message = str(exc_info.value)
+        assert "GUESS_MATCH_MODE" in message
+        assert "title, artist, either" in message
 
 
 class TestNumericFields:

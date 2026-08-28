@@ -91,7 +91,7 @@ class GuessModal(discord.ui.Modal):
             self._challenge_id, user_id, self.guess.value, self._clock()
         )
         await interaction.response.send_message(
-            guess_feedback_content(result), ephemeral=True
+            guess_feedback_content(result, self._settings.guess_match_mode), ephemeral=True
         )
         if result.announce:
             await self._announce(

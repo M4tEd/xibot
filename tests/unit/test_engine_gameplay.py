@@ -13,6 +13,7 @@ validation).
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,12 +25,15 @@ from songbot.engine import (
     GameEngine,
     UnlockRefusedError,
 )
+from songbot.matching import GuessMatchMode
 from tests.unit.test_engine_daily import (
     NOW,
     TODAY,
+    FakeSnippets,
     _db_snapshot,
     _make_engine,
     _reveal_previous,
+    _settings,
 )
 
 TITLE = "Neon Skyline"
@@ -929,3 +933,74 @@ class TestRevealedChallengeLockout:
         assert result.outcome == "challenge_closed"
         assert db.query("SELECT * FROM guesses") == []
         assert db.query("SELECT * FROM challenge_users") == []
+
+
+def _engine_in_mode(tmp_path: Path, db: Database, mode: GuessMatchMode) -> GameEngine:
+    """An engine whose settings carry the given GUESS_MATCH_MODE."""
+    settings = replace(_settings(tmp_path), guess_match_mode=mode)
+    return GameEngine(db, settings, FakeSnippets(tmp_path / "snippets"))
+
+
+class TestGuessMatchMode:
+    """GUESS_MATCH_MODE at engine level (issue #4): the configured mode
+    decides what submit_guess counts as correct; the 1.5x both-fields bonus
+    exists only in `either` mode."""
+
+    def test_artist_mode_artist_only_guess_solves(self, db: Database, tmp_path: Path) -> None:
+        engine = _engine_in_mode(tmp_path, db, "artist")
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        result = engine.submit_guess(challenge_id, "alice", ARTIST, NOW)
+        assert result.outcome == "correct"
+        assert result.matched_artist is True
+        assert result.matched_title is False
+        assert result.is_both is False
+        assert result.points_awarded == 100
+
+    def test_artist_mode_title_only_guess_is_wrong(self, db: Database, tmp_path: Path) -> None:
+        engine = _engine_in_mode(tmp_path, db, "artist")
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        result = engine.submit_guess(challenge_id, "alice", TITLE, NOW)
+        assert result.outcome == "wrong"
+        assert result.matched_title is True
+        assert result.points_awarded == 0
+
+    def test_artist_mode_combined_guess_pays_ladder_without_bonus(
+        self, db: Database, tmp_path: Path
+    ) -> None:
+        """Both fields in one guess: correct, but never the 1.5x bonus."""
+        engine = _engine_in_mode(tmp_path, db, "artist")
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        result = engine.submit_guess(challenge_id, "alice", BOTH_GUESS, NOW)
+        assert result.outcome == "correct"
+        assert result.is_both is False
+        assert result.points_awarded == 100
+
+    def test_title_mode_title_only_guess_solves(self, db: Database, tmp_path: Path) -> None:
+        engine = _engine_in_mode(tmp_path, db, "title")
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        result = engine.submit_guess(challenge_id, "alice", TITLE, NOW)
+        assert result.outcome == "correct"
+        assert result.points_awarded == 100
+
+    def test_title_mode_artist_only_guess_is_wrong(self, db: Database, tmp_path: Path) -> None:
+        engine = _engine_in_mode(tmp_path, db, "title")
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        result = engine.submit_guess(challenge_id, "alice", ARTIST, NOW)
+        assert result.outcome == "wrong"
+        assert result.matched_artist is True
+        assert result.points_awarded == 0
+
+    def test_either_mode_keeps_both_bonus(self, db: Database, tmp_path: Path) -> None:
+        """The default mode is unchanged: a combined guess pays 1.5x."""
+        engine = _engine_in_mode(tmp_path, db, "either")
+        _add_song(db)
+        challenge_id = engine.ensure_today_challenge("g1", "c1", NOW).id
+        result = engine.submit_guess(challenge_id, "alice", BOTH_GUESS, NOW)
+        assert result.outcome == "correct"
+        assert result.is_both is True
+        assert result.points_awarded == 150

@@ -343,3 +343,71 @@ class TestRawTitleFallback:
         result = match_guess("Official Video", self.POORLY_PARSED)
         assert result.matched_title is True
         assert result.is_correct is True
+
+
+class TestMatchMode:
+    """GUESS_MATCH_MODE: the mode narrows is_correct; the field flags stay raw."""
+
+    def test_title_mode_accepts_title_only_guess(self) -> None:
+        result = match_guess("Bohemian Rhapsody", QUEEN, mode="title")
+        assert result.matched_title is True
+        assert result.is_correct is True
+        assert result.is_both is False
+
+    def test_title_mode_rejects_artist_only_guess(self) -> None:
+        result = match_guess("Queen", QUEEN, mode="title")
+        assert result.matched_artist is True  # field flags report the raw outcome
+        assert result.is_correct is False
+        assert result.is_both is False
+
+    def test_title_mode_combined_guess_is_correct_without_bonus(self) -> None:
+        result = match_guess("Queen - Bohemian Rhapsody", QUEEN, mode="title")
+        assert result.matched_title is True
+        assert result.matched_artist is True
+        assert result.is_correct is True
+        assert result.is_both is False
+
+    def test_artist_mode_accepts_artist_only_guess(self) -> None:
+        result = match_guess("Queen", QUEEN, mode="artist")
+        assert result.matched_title is False
+        assert result.matched_artist is True
+        assert result.is_correct is True
+        assert result.is_both is False
+
+    def test_artist_mode_rejects_title_only_guess(self) -> None:
+        result = match_guess("Bohemian Rhapsody", QUEEN, mode="artist")
+        assert result.matched_title is True
+        assert result.is_correct is False
+        assert result.is_both is False
+
+    def test_artist_mode_combined_guess_is_correct_without_bonus(self) -> None:
+        result = match_guess("Queen - Bohemian Rhapsody", QUEEN, mode="artist")
+        assert result.matched_title is True
+        assert result.matched_artist is True
+        assert result.is_correct is True
+        assert result.is_both is False
+
+    def test_either_mode_matches_default_behavior(self) -> None:
+        """Explicit mode='either' is byte-for-byte the default."""
+        for guess in ("Queen", "Bohemian Rhapsody", "Queen - Bohemian Rhapsody", "nope"):
+            assert match_guess(guess, QUEEN, mode="either") == match_guess(guess, QUEEN)
+        assert match_guess("Queen - Bohemian Rhapsody", QUEEN, mode="either").is_both is True
+
+    def test_empty_guess_never_matches_in_any_mode(self) -> None:
+        assert match_guess("  ", QUEEN, mode="title").is_correct is False
+        assert match_guess("  ", QUEEN, mode="artist").is_correct is False
+
+    def test_raw_title_rescue_counts_as_title_in_title_mode(self) -> None:
+        poorly_parsed = TestRawTitleFallback.POORLY_PARSED
+        result = match_guess("Real Title", poorly_parsed, mode="title")
+        assert result.matched_title is True
+        assert result.is_correct is True
+
+    def test_raw_title_rescue_does_not_help_in_artist_mode(self) -> None:
+        """The raw_title rescue is credited as a TITLE match (unchanged), so a
+        poorly-parsed entry whose real artist lives only in raw_title stays
+        unsolved in artist mode."""
+        poorly_parsed = TestRawTitleFallback.POORLY_PARSED
+        result = match_guess("Real Artist", poorly_parsed, mode="artist")
+        assert result.matched_artist is False
+        assert result.is_correct is False

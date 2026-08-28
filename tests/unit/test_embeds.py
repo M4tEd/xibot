@@ -10,6 +10,7 @@ pinned-#9 secrecy invariant for all pre-reveal copy.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import discord
@@ -37,6 +38,7 @@ from songbot.engine import (
     UnlockResult,
     Winner,
 )
+from songbot.matching import GuessMatchMode
 from tests.unit.test_engine_daily import _settings
 
 SONG = SongRow(
@@ -103,6 +105,22 @@ class TestDailyChallengeEmbed:
         for secret in (SONG.title, SONG.artist or "", SONG.raw_title):
             assert secret
             assert secret.lower() not in text
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [
+            ("either", "name the artist or the title"),
+            ("title", "name the title\n"),
+            ("artist", "name the artist\n"),
+        ],
+    )
+    def test_how_to_play_names_the_configured_guess_target(
+        self, tmp_path: Path, mode: GuessMatchMode, expected: str
+    ) -> None:
+        """GUESS_MATCH_MODE: the how-to-play line says what counts as correct."""
+        settings = replace(_settings(tmp_path), guess_match_mode=mode)
+        text = _embed_text(daily_challenge_embed(CHALLENGE, settings))
+        assert f"💡 **Guess** — {expected}" in text
 
 
 class TestRevealEmbed:
@@ -343,6 +361,39 @@ class TestGuessFeedbackContent:
             == CHALLENGE_CLOSED_MESSAGE
         )
         assert CHALLENGE_CLOSED_MESSAGE == "This challenge has closed."
+
+    def test_artist_mode_names_only_the_artist(self) -> None:
+        """GUESS_MATCH_MODE=artist: correct copy names the artist, never a bonus."""
+        content = guess_feedback_content(
+            self._result(outcome="correct", matched_artist=True, points_awarded=100),
+            mode="artist",
+        )
+        assert "artist" in content.lower()
+        assert "bonus" not in content.lower()
+
+    def test_title_mode_names_only_the_title(self) -> None:
+        content = guess_feedback_content(
+            self._result(outcome="correct", matched_title=True, points_awarded=100),
+            mode="title",
+        )
+        assert "title" in content.lower()
+        assert "bonus" not in content.lower()
+
+    def test_restricted_mode_combined_guess_shows_no_bonus_copy(self) -> None:
+        """A guess matching both fields in artist mode still reads as 'the artist'."""
+        content = guess_feedback_content(
+            self._result(
+                outcome="correct",
+                matched_title=True,
+                matched_artist=True,
+                is_both=False,
+                points_awarded=100,
+            ),
+            mode="artist",
+        )
+        assert "artist" in content.lower()
+        assert "both" not in content.lower()
+        assert "bonus" not in content.lower()
 
 
 class TestHearMoreContent:

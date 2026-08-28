@@ -29,14 +29,16 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   typing). Guesses are fuzzy-matched (rapidfuzz, threshold 85 after
   normalization, plus a per-token fallback that forgives a typo in one token —
   including inside a combined title+artist guess and on short names like
-  "Halo"); matching the title **or** the artist is correct. Feedback is
+  "Halo"); matching the title **or** the artist is correct (`GUESS_MATCH_MODE`
+  can restrict correctness to just the title or just the artist). Feedback is
   ephemeral; wrong guesses cost nothing. Each player has 6 full-value
   guesses per day — after that, guesses are still accepted and a correct
   one still solves (reveal winner + announcement) but banks a flat 10
   points with no win/streak.
 - **Scoring & bonus** — a correct guess awards the points of the player's
   current snippet level. Naming **both** artist and title in a single guess
-  earns a 1.5× bonus (rounded half-up: 75 → 113, 15 → 23). The first correct
+  earns a 1.5× bonus (rounded half-up: 75 → 113, 15 → 23; only in the default
+  `either` match mode). The first correct
   guess triggers a public "🎉 @user guessed today's song…" announcement that
   reports the snippet length they were hearing and never reveals the song.
 - **Streaks** — consecutive calendar days (configured timezone) with at least
@@ -168,7 +170,8 @@ error listing every problem.
 | `MAX_GUESSES_PER_DAY` | `6` | Full-value guesses per player per challenge (≥ 1). Wrong guesses are free but count toward the limit; the winning guess counts too. Guesses past the limit are still accepted — a correct one banks a flat 10 points with no win/streak. |
 | `SNIPPET_LENGTHS` | `1,2,4,8,16` | Comma-separated snippet durations in seconds (the hear-more ladder). First entry ships with the daily post. |
 | `SNIPPET_POINTS` | `100,75,50,30,15` | Comma-separated points per ladder level; must have the same number of entries as `SNIPPET_LENGTHS`. |
-| `BOTH_CORRECT_MULTIPLIER` | `1.5` | Score multiplier when one guess matches both artist and title (> 0; rounded half-up). |
+| `BOTH_CORRECT_MULTIPLIER` | `1.5` | Score multiplier when one guess matches both artist and title (> 0; rounded half-up). Only applies when `GUESS_MATCH_MODE=either`. |
+| `GUESS_MATCH_MODE` | `either` | What counts as a correct guess: `either` (title OR artist), `title` (title only), or `artist` (artist only — handy for a single-artist catalog). The both-fields bonus only exists in `either` mode. |
 | `DATABASE_PATH` | `./data/songbot.db` | SQLite database file (created and migrated automatically). |
 | `SNIPPET_CACHE_DIR` | `./data/snippets` | On-disk cache for generated snippets (keyed by challenge). |
 | `HEALTH_PORT` | `3108` | Port for the `GET /health` liveness endpoint. |
@@ -370,7 +373,8 @@ maps 1:1 to the core game loop.
    ephemeral ✅ with your points, plus a public "🎉 @you guessed today's song
    in N guesses for P points while hearing Xs of audio!" message that does
    **not** name the song (X is the snippet length you had unlocked when you
-   solved). A guess naming both artist and title shows the 1.5× bonus.
+   solved). A guess naming both artist and title shows the 1.5× bonus
+   (default `either` match mode only).
    Further guesses and Hear-more presses from you are refused afterwards.
 6. **Leaderboard** — press **Leaderboard**: an ephemeral top-10 embed shows
    points, wins, and 🔥 streaks, and includes your new score.

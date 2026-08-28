@@ -52,6 +52,7 @@ def _settings(tmp_path: Path) -> Settings:
         snippet_lengths=(1.0, 2.0, 4.0, 8.0, 16.0),
         snippet_points=(100, 75, 50, 30, 15),
         both_correct_multiplier=1.5,
+        guess_match_mode="either",
         database_path=tmp_path / "songbot.db",
         snippet_cache_dir=tmp_path / "snippets",
         health_port=3108,
