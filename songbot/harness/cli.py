@@ -51,9 +51,11 @@ repeat ``admin-post`` prints the pinned-#4 compact form
 (VAL-CROSS-015); an empty catalog prints ``{"error": "catalog_empty"}``
 (pinned #11). ``admin-setup`` upserts the guild's post channel
 (multi-guild configuration, ``--channel`` overrides the default harness
-channel). ``admin-fixsong`` corrects a challenge song's title/artist
-(``--title`` required, ``--artist``/``--date`` optional); its ephemeral ack
-and ``state.fix`` show the old -> new metadata (admin-only secrecy
+channel). ``admin-fixsong`` shows a challenge song's current metadata, then presses
+the REAL Edit button and submits the REAL modal (``--title``/``--artist``
+are the texts typed into the pre-filled fields — omit either to keep the
+current value; ``--date`` selects the challenge); its ephemeral ack and
+``state.fix`` show the old -> new metadata (admin-only secrecy
 exception — the harness's ``status`` surface exposes song identity too).
 ``admin-pingrole`` posts the reaction-role opt-in announcement (recorded as
 an ``announcement`` payload) and upserts ``ping_role_settings``
@@ -95,6 +97,7 @@ from songbot.bot.embeds import (
     reveal_embed,
     snippet_attachment,
 )
+from songbot.bot.fixsong import FixSongModal, FixSongView
 from songbot.bot.health import serve_health
 from songbot.bot.modals import GuessModal
 from songbot.bot.views import DailyChallengeView
@@ -331,12 +334,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     admin_fixsong = sub.add_parser(
         "admin-fixsong",
-        help="Run /songbot-fixsong (correct a challenge song's title/artist).",
+        help="Run /songbot-fixsong (show a challenge song's metadata, then edit it).",
     )
     add_admin_flags(admin_fixsong)
-    admin_fixsong.add_argument("--title", required=True, help="The correct song title.")
     admin_fixsong.add_argument(
-        "--artist", default=None, help="The correct artist (omit to keep the current one)."
+        "--title",
+        default=None,
+        help="Text to type into the modal's Title field (omit to keep the current one).",
+    )
+    admin_fixsong.add_argument(
+        "--artist",
+        default=None,
+        help="Text to type into the modal's Artist field (omit to keep the current "
+        "one; an empty string clears it).",
     )
     admin_fixsong.add_argument(
         "--date",
@@ -917,49 +927,84 @@ async def scenario_admin_reload(
 async def scenario_admin_fixsong(
     ctx: HarnessContext,
     user: FakeUser,
-    title: str,
+    title: str | None,
     artist: str | None,
     date: str | None,
     now: datetime,
 ) -> dict[str, Any]:
-    """Drive the REAL /songbot-fixsong body.
+    """Drive the REAL /songbot-fixsong flow: show, press Edit, submit the modal.
 
-    Success: exactly one ephemeral ack showing the old -> new metadata (the
-    admin-only, ephemeral exception to the pinned-#9 secrecy rule), and
-    ``state.fix`` carries the same record. Refusals
-    (``no_challenge``/``invalid_date``/``blank_title``) record one ephemeral
-    refusal with zero mutation; ``state.reason`` carries the machine-readable
-    cause.
+    The command body answers with exactly one ephemeral payload carrying the
+    current metadata and the REAL FixSongView — zero mutation, reported as
+    ``state.target`` — then the scenario presses ``songbot:fixsong_edit``
+    and submits the REAL FixSongModal, injecting ``title``/``artist`` where
+    given and mirroring Discord's submit payload (the pre-filled default)
+    where a flag is omitted. Success: a second ephemeral payload with the
+    old -> new ack (the admin-only, ephemeral exception to the pinned-#9
+    secrecy rule) and ``state.fix`` carries the same record. Refusals record
+    exactly one ephemeral refusal with zero mutation —
+    ``no_challenge``/``invalid_date`` at the command step, ``blank_title``
+    at the modal submit; ``state.reason`` carries the machine-readable cause.
     """
     recorder = Recorder()
     commands = _admin_commands(ctx, recorder, now)
-    interaction = cast(
-        "discord.Interaction[Any]",
-        FakeInteraction(recorder, user, guild_id=ctx.guild_id),
+    fake = FakeInteraction(recorder, user, guild_id=ctx.guild_id)
+    # The fake is duck-typed, not an Interaction subclass — same cast the
+    # button/modal drivers use (see fakes.press_button).
+    interaction = cast("discord.Interaction[Any]", fake)
+    result = await commands.fix_song(interaction, date=date)
+    target = result.target
+    state: dict[str, Any] = {
+        "outcome": result.outcome,
+        "reason": result.reason,
+        "target": (
+            {
+                "song_id": target.song_id,
+                "challenge_id": target.challenge_id,
+                "challenge_date": target.challenge_date,
+                "title": target.title,
+                "artist": target.artist,
+            }
+            if target is not None
+            else None
+        ),
+        "fix": None,
+    }
+    if result.outcome != "shown":
+        return _transcript("admin-fixsong", recorder, state)
+    view = recorder.payloads[-1].view
+    if not isinstance(view, FixSongView):  # defensive: the body always sends one
+        raise RuntimeError("fix_song did not answer with a FixSongView")
+    await press_button(view, "songbot:fixsong_edit", fake)
+    modal = recorder.payloads[-1].modal
+    if not isinstance(modal, FixSongModal):  # defensive: the button always opens one
+        raise RuntimeError("fixsong edit button did not open a FixSongModal")
+    # Discord's submit payload carries every field: the edited text where the
+    # admin typed, the pre-filled default where the field was left untouched.
+    modal.title_input._value = (
+        title if title is not None else (modal.title_input.default or "")
     )
-    result = await commands.fix_song(interaction, title=title, artist=artist, date=date)
-    fix = result.fix
-    return _transcript(
-        "admin-fixsong",
-        recorder,
+    modal.artist_input._value = (
+        artist if artist is not None else (modal.artist_input.default or "")
+    )
+    await modal.on_submit(interaction)
+    fix = modal.result
+    state["outcome"] = "fixed" if fix is not None else "refused"
+    state["reason"] = modal.refused_reason
+    state["fix"] = (
         {
-            "outcome": result.outcome,
-            "reason": result.reason,
-            "fix": (
-                {
-                    "song_id": fix.song_id,
-                    "challenge_id": fix.challenge_id,
-                    "challenge_date": fix.challenge_date,
-                    "old_title": fix.old_title,
-                    "old_artist": fix.old_artist,
-                    "new_title": fix.new_title,
-                    "new_artist": fix.new_artist,
-                }
-                if fix is not None
-                else None
-            ),
-        },
+            "song_id": fix.song_id,
+            "challenge_id": fix.challenge_id,
+            "challenge_date": fix.challenge_date,
+            "old_title": fix.old_title,
+            "old_artist": fix.old_artist,
+            "new_title": fix.new_title,
+            "new_artist": fix.new_artist,
+        }
+        if fix is not None
+        else None
     )
+    return _transcript("admin-fixsong", recorder, state)
 
 
 async def scenario_admin_pingrole(

@@ -29,10 +29,11 @@ from songbot.bot.admin import (
     register_admin_commands,
 )
 from songbot.bot.embeds import PERMISSION_DENIED_MESSAGE
+from songbot.bot.fixsong import FixSongModal
 from songbot.catalog.refresh import RefreshResult, SourceRefresh
 from songbot.db import Database
 from songbot.engine import Challenge, GameEngine
-from tests.unit.interaction_fakes import FakeInteraction
+from tests.unit.interaction_fakes import FakeInteraction, press
 from tests.unit.test_engine_daily import _make_engine, _settings
 from tests.unit.test_engine_gameplay import _add_song
 
@@ -173,7 +174,7 @@ class TestPermissionGate:
             return await spied.setup_channel(interaction, "channel-1", "#channel-1")
 
         async def fixsong_via(interaction: FakeInteraction) -> Any:
-            return await spied.fix_song(interaction, title="Whatever")
+            return await spied.fix_song(interaction)
 
         async def pingrole_via(interaction: FakeInteraction) -> Any:
             return await spied.setup_ping_role(
@@ -804,29 +805,108 @@ class TestNotConfigured:
 DAY2 = datetime(2026, 8, 14, 16, 0, 0, tzinfo=UTC)  # 2026-08-14 13:00 ADT
 
 
-class TestFixSong:
-    """/songbot-fixsong: admin metadata correction for bad catalog parses.
+async def _open_edit_modal(interaction: FakeInteraction) -> FixSongModal:
+    """Press the show-first ephemeral's Edit button; return the opened modal."""
+    assert interaction.payloads[-1].view is not None
+    await press(interaction.payloads[-1].view, "songbot:fixsong_edit", interaction)
+    payload = interaction.payloads[-1]
+    assert payload.kind == "modal"
+    modal = payload.modal
+    assert isinstance(modal, FixSongModal)
+    return modal
 
-    The ephemeral ack names the song (old -> new) — the deliberate, scoped
-    exception to the pinned-#9 secrecy rule: ephemeral, admin-gated, and the
-    command is unusable blind.
+
+async def _submit_edit(
+    modal: FixSongModal,
+    interaction: FakeInteraction,
+    *,
+    title: str | None = None,
+    artist: str | None = None,
+) -> None:
+    """Submit the REAL modal, mirroring Discord's payload: an omitted field
+    arrives with its pre-filled default, exactly as an untouched input does.
+    """
+    modal.title_input._value = (
+        title if title is not None else (modal.title_input.default or "")
+    )
+    modal.artist_input._value = (
+        artist if artist is not None else (modal.artist_input.default or "")
+    )
+    await modal.on_submit(interaction)
+
+
+class TestFixSong:
+    """/songbot-fixsong: show the current song metadata, then edit it.
+
+    The command body is the zero-mutation show-first step; the correction
+    lands on the modal submit. The show payload and the submit ack name the
+    song — the deliberate, scoped exception to the pinned-#9 secrecy rule:
+    ephemeral, admin-gated, and the edit form is unusable blind.
     """
 
-    async def test_fixes_latest_challenge_song_and_records_override(
+    async def test_shows_current_metadata_with_edit_button_zero_mutation(
         self, commands: AdminCommands, db: Database, engine: GameEngine
     ) -> None:
         _add_song(db)  # song-1: Neon Skyline / Midnight Circuit
         challenge = engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
 
         interaction = _interaction()
-        result = await commands.fix_song(
-            interaction, title="Fixed Title", artist="Fixed Artist"
-        )
+        result = await commands.fix_song(interaction)
 
-        assert result.outcome == "fixed"
+        assert result.outcome == "shown"
         assert result.reason is None
-        fix = result.fix
+        target = result.target
+        assert target is not None
+        assert target.song_id == challenge.song.id
+        assert target.challenge_id == challenge.id
+        assert target.challenge_date == "2026-08-13"
+        assert (target.title, target.artist) == (TITLE, ARTIST)
+        # Exactly one ephemeral payload showing the current parameters...
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        shown = interaction.payloads[0]
+        assert shown.recipient == str(ADMIN_ID)
+        content = shown.content or ""
+        for text in (TITLE, ARTIST, "song-1", "2026-08-13"):
+            assert text in content
+        # ...carrying the view whose button opens the edit modal.
+        assert shown.view is not None
+        # Zero mutation: the correction only lands on the modal submit.
+        row = db.query_one("SELECT title, artist FROM songs")
+        assert row is not None
+        assert (row["title"], row["artist"]) == (TITLE, ARTIST)
+        assert _row_count(db, "song_overrides") == 0
+
+    async def test_edit_button_opens_modal_prefilled_with_current_values(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)
+        engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+        interaction = _interaction()
+        await commands.fix_song(interaction)
+
+        modal = await _open_edit_modal(interaction)
+
+        assert modal.title_input.default == TITLE
+        assert modal.title_input.required is True
+        assert modal.artist_input.default == ARTIST
+        assert modal.artist_input.required is False
+        # Opening the form mutates nothing.
+        assert _row_count(db, "song_overrides") == 0
+
+    async def test_submit_applies_fix_and_records_override(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        _add_song(db)
+        challenge = engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+        interaction = _interaction()
+        await commands.fix_song(interaction)
+        modal = await _open_edit_modal(interaction)
+
+        await _submit_edit(modal, interaction, title="Fixed Title", artist="Fixed Artist")
+
+        fix = modal.result
         assert fix is not None
+        assert modal.refused_reason is None
         assert fix.song_id == challenge.song.id
         assert fix.challenge_id == challenge.id
         assert fix.challenge_date == "2026-08-13"
@@ -844,40 +924,46 @@ class TestFixSong:
         assert override is not None
         assert (override["title"], override["artist"]) == ("Fixed Title", "Fixed Artist")
         assert override["set_by"] == str(ADMIN_ID)
-        # Exactly one ephemeral ack showing old -> new (the secrecy exception).
-        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
-        ack = interaction.payloads[0]
+        # Show ephemeral, modal, then the ephemeral old -> new ack.
+        assert [p.kind for p in interaction.payloads] == ["ephemeral", "modal", "ephemeral"]
+        ack = interaction.payloads[-1]
         assert ack.recipient == str(ADMIN_ID)
         content = ack.content or ""
         for text in (TITLE, ARTIST, "Fixed Title", "Fixed Artist"):
             assert text in content
 
-    async def test_artist_omitted_keeps_the_current_artist(
+    async def test_submit_with_untouched_fields_keeps_current_values(
         self, commands: AdminCommands, db: Database, engine: GameEngine
     ) -> None:
         _add_song(db)
         engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+        interaction = _interaction()
+        await commands.fix_song(interaction)
+        modal = await _open_edit_modal(interaction)
 
-        result = await commands.fix_song(_interaction(), title="Fixed Title")
+        await _submit_edit(modal, interaction)  # both fields left pre-filled
 
-        assert result.outcome == "fixed"
-        assert result.fix is not None
-        assert result.fix.new_artist == ARTIST
-        row = db.query_one("SELECT artist FROM songs")
+        fix = modal.result
+        assert fix is not None
+        assert (fix.new_title, fix.new_artist) == (TITLE, ARTIST)
+        row = db.query_one("SELECT title, artist FROM songs")
         assert row is not None
-        assert row["artist"] == ARTIST
+        assert (row["title"], row["artist"]) == (TITLE, ARTIST)
 
     async def test_blank_artist_clears_the_artist(
         self, commands: AdminCommands, db: Database, engine: GameEngine
     ) -> None:
         _add_song(db)
         engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+        interaction = _interaction()
+        await commands.fix_song(interaction)
+        modal = await _open_edit_modal(interaction)
 
-        result = await commands.fix_song(_interaction(), title="Fixed Title", artist="   ")
+        await _submit_edit(modal, interaction, title="Fixed Title", artist="   ")
 
-        assert result.outcome == "fixed"
-        assert result.fix is not None
-        assert result.fix.new_artist is None
+        fix = modal.result
+        assert fix is not None
+        assert fix.new_artist is None
         row = db.query_one("SELECT artist FROM songs")
         assert row is not None
         assert row["artist"] is None
@@ -890,13 +976,17 @@ class TestFixSong:
         day2 = engine.ensure_today_challenge("guild-1", "channel-1", DAY2)
         assert day2.song.id != day1.song.id  # no repeats until exhausted
 
-        dated = await commands.fix_song(
-            _interaction(), title="Day One Fix", date="2026-08-13"
-        )
+        dated_interaction = _interaction()
+        dated = await commands.fix_song(dated_interaction, date="2026-08-13")
 
-        assert dated.outcome == "fixed"
-        assert dated.fix is not None
-        assert dated.fix.challenge_id == day1.id
+        assert dated.outcome == "shown"
+        assert dated.target is not None
+        assert dated.target.challenge_id == day1.id
+        # The modal submit fixes exactly the challenge that was displayed.
+        modal = await _open_edit_modal(dated_interaction)
+        await _submit_edit(modal, dated_interaction, title="Day One Fix")
+        assert modal.result is not None
+        assert modal.result.challenge_id == day1.id
         row = db.query_one("SELECT title FROM songs WHERE id = ?", (day1.song.id,))
         assert row is not None
         assert row["title"] == "Day One Fix"
@@ -904,11 +994,11 @@ class TestFixSong:
         assert untouched is not None
         assert untouched["title"] != "Day One Fix"
 
-        latest = await commands.fix_song(_interaction(), title="Day Two Fix")
+        latest = await commands.fix_song(_interaction())
 
-        assert latest.outcome == "fixed"
-        assert latest.fix is not None
-        assert latest.fix.challenge_id == day2.id
+        assert latest.outcome == "shown"
+        assert latest.target is not None
+        assert latest.target.challenge_id == day2.id
 
     async def test_refused_on_invalid_date_zero_mutation(
         self, commands: AdminCommands, db: Database, engine: GameEngine
@@ -917,11 +1007,12 @@ class TestFixSong:
         engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
 
         interaction = _interaction()
-        result = await commands.fix_song(interaction, title="X", date="13-08-2026")
+        result = await commands.fix_song(interaction, date="13-08-2026")
 
         assert result.outcome == "refused"
         assert result.reason == "invalid_date"
         assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        assert interaction.payloads[0].view is None
         row = db.query_one("SELECT title, artist FROM songs")
         assert row is not None
         assert (row["title"], row["artist"]) == (TITLE, ARTIST)
@@ -933,28 +1024,59 @@ class TestFixSong:
         _add_song(db)
 
         interaction = _interaction()
-        result = await commands.fix_song(interaction, title="X")
+        result = await commands.fix_song(interaction)
 
         assert result.outcome == "refused"
         assert result.reason == "no_challenge"
         assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        assert interaction.payloads[0].view is None
         row = db.query_one("SELECT title, artist FROM songs")
         assert row is not None
         assert (row["title"], row["artist"]) == (TITLE, ARTIST)
         assert _row_count(db, "song_overrides") == 0
 
-    async def test_refused_on_blank_title_zero_mutation(
+    async def test_blank_title_refused_at_submit_zero_mutation(
         self, commands: AdminCommands, db: Database, engine: GameEngine
     ) -> None:
         _add_song(db)
         engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
-
         interaction = _interaction()
-        result = await commands.fix_song(interaction, title="   ")
+        await commands.fix_song(interaction)
+        modal = await _open_edit_modal(interaction)
 
-        assert result.outcome == "refused"
-        assert result.reason == "blank_title"
-        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        await _submit_edit(modal, interaction, title="   ")
+
+        assert modal.result is None
+        assert modal.refused_reason == "blank_title"
+        # Show ephemeral, modal, then the ephemeral refusal.
+        assert [p.kind for p in interaction.payloads] == ["ephemeral", "modal", "ephemeral"]
+        row = db.query_one("SELECT title FROM songs")
+        assert row is not None
+        assert row["title"] == TITLE
+        assert _row_count(db, "song_overrides") == 0
+
+    async def test_non_admin_cannot_open_or_submit_the_modal(
+        self, commands: AdminCommands, db: Database, engine: GameEngine
+    ) -> None:
+        """The view/modal re-check Manage-Guild (it could be revoked mid-flow)."""
+        _add_song(db)
+        engine.ensure_today_challenge("guild-1", "channel-1", DAY1)
+        admin = _interaction()
+        await commands.fix_song(admin)
+        view = admin.payloads[0].view
+        assert view is not None
+        non_admin = _interaction(manage_guild=False)
+
+        await press(view, "songbot:fixsong_edit", non_admin)
+
+        assert [p.kind for p in non_admin.payloads] == ["ephemeral"]
+        assert non_admin.payloads[0].content == PERMISSION_DENIED_MESSAGE
+
+        modal = await _open_edit_modal(admin)
+        await _submit_edit(modal, non_admin, title="Fixed Title")
+
+        assert modal.result is None
+        assert non_admin.payloads[-1].content == PERMISSION_DENIED_MESSAGE
         row = db.query_one("SELECT title FROM songs")
         assert row is not None
         assert row["title"] == TITLE
@@ -969,10 +1091,11 @@ class TestFixSong:
         before = engine.submit_guess(challenge.id, "uma", "Fixed Title Fixed Artist", DAY1)
         assert before.outcome == "wrong"
 
-        result = await commands.fix_song(
-            _interaction(), title="Fixed Title", artist="Fixed Artist"
-        )
-        assert result.outcome == "fixed"
+        interaction = _interaction()
+        await commands.fix_song(interaction)
+        modal = await _open_edit_modal(interaction)
+        await _submit_edit(modal, interaction, title="Fixed Title", artist="Fixed Artist")
+        assert modal.result is not None
 
         # New guesses match the corrected metadata immediately (both -> bonus).
         after = engine.submit_guess(challenge.id, "uma", "Fixed Title Fixed Artist", DAY1)

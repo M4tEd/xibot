@@ -45,6 +45,7 @@ class RecordedPayload:
     embed: discord.Embed | None = None
     attachment: RecordedAttachment | None = None
     modal: discord.ui.Modal[Any] | None = None
+    view: discord.ui.View[Any] | None = None
     recipient: str | None = None
 
 
@@ -81,6 +82,7 @@ class FakeResponse:
         *,
         embed: discord.Embed | None = None,
         file: discord.File | None = None,
+        view: discord.ui.View[Any] | None = None,
         ephemeral: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -91,6 +93,7 @@ class FakeResponse:
                 content=content,
                 embed=embed,
                 attachment=attachment,
+                view=view,
                 recipient=str(self.interaction.user.id) if ephemeral else None,
             )
         )
