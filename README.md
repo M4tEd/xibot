@@ -51,19 +51,14 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   - `/songbot-skip` — replace today's song with a different one (refused once
     the challenge is revealed or anyone has solved it)
   - `/songbot-reload` — refresh the song catalog from its sources
-  - `/songbot-fixsong` — fix the title/artist of a challenge's song when the
-    catalog parsed it badly (user-uploaded video titles are messy). The
-    command first answers ephemerally with the song's **current** parameters
-    (title, artist, source, original title, duration) plus an **Edit
-    metadata** button; the button opens a form pre-filled with the current
-    values, and the correction applies only when the form is submitted
-    (clearing the artist field clears the artist). Targets the latest
-    challenge's song by default, or a specific challenge with `date:`
-    (YYYY-MM-DD). The correction applies to new guesses immediately and is
-    re-applied after every catalog reload (the `song_overrides` table);
-    already-recorded guesses keep their original results. The ephemeral show
-    payload and the post-submit ack name the song (admin-only, ephemeral —
-    public posts never name songs)
+  - `/songbot-fixsong` — correct the title/artist of a challenge's song when
+    the catalog parsed it badly (user-uploaded video titles are messy).
+    Targets the latest challenge's song by default, or a specific challenge
+    with `date:` (YYYY-MM-DD); `artist:` may be omitted to keep the current
+    one. The correction applies to new guesses immediately and is re-applied
+    after every catalog reload (the `song_overrides` table); already-recorded
+    guesses keep their original results. The ephemeral ack shows the old →
+    new metadata (admin-only, ephemeral — public posts never name songs)
   - `/songbot-pingrole` — opt-in pings for the daily song: posts an
     announcement in the configured channel ("React with 🎵 to get the role").
     Reacting with the emoji grants the chosen `role:` (removing the reaction
@@ -276,15 +271,10 @@ loop end to end.
 Scenarios: `post` · `hear-more --user U [--times N]` · `guess --user U --text T` ·
 `leaderboard --user U` · `advance-day` · `admin-setup [--channel C] |
 admin-post|admin-skip|admin-reload --as-admin|--as-non-admin` ·
-`admin-fixsong [--title T] [--artist A] [--date YYYY-MM-DD]
+`admin-fixsong --title T [--artist A] [--date YYYY-MM-DD]
 --as-admin|--as-non-admin` · `admin-pingrole [--role R] [--emoji E]
 --as-admin|--as-non-admin` · `status` · `reset` · `serve` (health endpoint
 only).
-
-`admin-fixsong` mirrors the interactive command: it shows the current
-metadata, presses the Edit button, and submits the pre-filled form —
-`--title`/`--artist` are the texts typed into the two fields (omit either to
-submit the field unchanged; `--artist ""` clears the artist).
 
 The harness drives one guild per run: the `DISCORD_GUILD_ID`/
 `DISCORD_CHANNEL_ID` pair when set, else the deterministic `harness-guild`/
@@ -329,8 +319,7 @@ export LOCAL_MUSIC_DIR=./data/fixture-music    # 8-song synthetic demo library
 # Admin flows (permission simulation)
 .venv/bin/python -m songbot.harness admin-skip --as-admin --now "2026-08-14T16:00:00Z"
 .venv/bin/python -m songbot.harness admin-reload --as-non-admin
-# Fix a badly parsed song's metadata: shows the current values, then submits
-# the edit form with these corrections (targets the latest challenge's song)
+# Correct a badly parsed song's metadata (targets the latest challenge's song)
 .venv/bin/python -m songbot.harness admin-fixsong --as-admin --title "Corrected Title" --artist "Corrected Artist"
 # Post the reaction-role opt-in announcement; later posts mention the role
 .venv/bin/python -m songbot.harness admin-pingrole --as-admin --role ping-role --emoji "🎵"
@@ -341,9 +330,8 @@ export LOCAL_MUSIC_DIR=./data/fixture-music    # 8-song synthetic demo library
 
 Each command prints the recorded Discord payloads (`channel` = daily post,
 `announcement` = solve announcements and reveals, `ephemeral` = per-user
-replies, `modal` = a modal handover: the guess modal, or the fixsong edit
-form) plus resulting state. A same-day repeat `post` prints
-`{"already_posted": true, "messages": []}`.
+replies, `modal` = the guess modal) plus resulting state. A same-day repeat
+`post` prints `{"already_posted": true, "messages": []}`.
 
 ## Development
 
