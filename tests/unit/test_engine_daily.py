@@ -68,6 +68,7 @@ class FakeSnippets:
     no auto-skip). ``fail_ids`` raises a `SnippetGenerationError` — the
     production failure contract — only for songs whose source_id is in the
     set, so tests can fail specific picks and exercise auto-skip.
+    ``fail_full`` raises for full-audio generation (issue #7).
     """
 
     def __init__(
@@ -76,11 +77,14 @@ class FakeSnippets:
         *,
         fail: bool = False,
         fail_ids: Collection[str] = (),
+        fail_full: bool = False,
     ) -> None:
         self.cache_dir = cache_dir
         self.fail = fail
         self.fail_ids = set(fail_ids)
+        self.fail_full = fail_full
         self.ensure_calls: list[tuple[str, int | str, float, tuple[float, ...]]] = []
+        self.full_calls: list[tuple[str, int | str]] = []
         self.purged: list[int | str] = []
 
     def ensure_snippets(
@@ -103,6 +107,17 @@ class FakeSnippets:
             path.touch(exist_ok=True)
             paths[level] = path
         return paths
+
+    def ensure_full_audio(self, song: Song, challenge_id: int | str) -> Path:
+        """Stage an empty ``full.mp3`` beside the fake levels (real file to attach)."""
+        self.full_calls.append((song.source_id, challenge_id))
+        if self.fail_full:
+            raise RuntimeError("fake full-audio failure")
+        base = self.cache_dir / str(challenge_id)
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "full.mp3"
+        path.touch(exist_ok=True)
+        return path
 
     def purge_challenge(self, challenge_id: int | str) -> None:
         self.purged.append(challenge_id)

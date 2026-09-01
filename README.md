@@ -34,7 +34,10 @@ playlist (via yt-dlp) and/or a local audio directory (via mutagen tags).
   ephemeral; wrong guesses cost nothing. Each player has 6 full-value
   guesses per day — after that, guesses are still accepted and a correct
   one still solves (reveal winner + announcement) but banks a flat 10
-  points with no win/streak.
+  points with no win/streak. A correct guess's ephemeral reply also attaches the **full song** as
+  `songbot-full.mp3` (same no-leak filename discipline as the snippets;
+  YouTube tracks are downloaded once per challenge and cached) — the solver
+  proved they know it, so they get to hear the whole thing.
 - **Scoring & bonus** — a correct guess awards the points of the player's
   current snippet level. Naming **both** artist and title in a single guess
   earns a 1.5× bonus (rounded half-up: 75 → 113, 15 → 23; only in the default
@@ -382,7 +385,8 @@ maps 1:1 to the core game loop.
    public message. Submit empty/whitespace → ephemeral "please enter a guess"
    notice that doesn't consume a guess.
 5. **Correct guess + announcement** — submit the right title or artist →
-   ephemeral ✅ with your points, plus a public "🎉 @you guessed today's song
+   ephemeral ✅ with your points and the full song attached as
+   `songbot-full.mp3` (only you can see it), plus a public "🎉 @you guessed today's song
    in N guesses for P points while hearing Xs of audio!" message that does
    **not** name the song (X is the snippet length you had unlocked when you
    solved). A guess naming both artist and title shows the 1.5× bonus

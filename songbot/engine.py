@@ -197,6 +197,14 @@ class SnippetService(Protocol):
         """Idempotently ensure all snippet levels exist; return their paths."""
         ...
 
+    def ensure_full_audio(self, song: Song, challenge_id: int | str) -> Path:
+        """Idempotently ensure the challenge's full-length audio exists.
+
+        Returns the path of the neutral ``full.mp3`` cache file (the song's
+        own file name never appears on a served path — pinned #9).
+        """
+        ...
+
     def purge_challenge(self, challenge_id: int | str) -> None:
         """Delete a challenge's snippet cache dir and section intermediates."""
         ...
@@ -1238,6 +1246,26 @@ class GameEngine:
                 snippet_level=level,
                 announce=solved,
             )
+
+    def full_audio_path(self, challenge_id: int) -> Path:
+        """The full-length audio for a challenge's song: the solver's reward.
+
+        A correct guess earns the WHOLE track (issue #7), attached to the
+        solver's ephemeral feedback. Local songs are staged from the catalog
+        file, YouTube songs downloaded once per challenge; either way the
+        snippet service caches it under the neutral ``full.mp3`` name, so
+        nothing served to a player carries the song's file name (pinned #9).
+        Reads only — no game state changes.
+
+        Raises `EngineError` for an unknown challenge id and the snippet
+        errors (`SnippetSourceError`/`SnippetGenerationError`) when the audio
+        is missing, unreadable, or the download fails — callers attach
+        best-effort: a storage failure must not sink the solve feedback.
+        """
+        challenge = self._challenge_row_by_id(challenge_id)
+        return self._snippets.ensure_full_audio(
+            _song_for_generator(self._song_row(challenge.song_id)), challenge.id
+        )
 
     def leaderboard(
         self, guild_id: str, now: datetime, limit: int = 10

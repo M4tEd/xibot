@@ -3,8 +3,10 @@
 Every builder in this module is a PURE function: engine result in, Discord
 payload out. No game rules, no I/O. Two pinned invariants live here:
 
-- Pinned #9 (attachments): snippet files are ALWAYS attached under the
-  filename ``songbot-snippet.mp3`` so the file name never leaks the song.
+- Pinned #9 (attachments): audio files are ALWAYS attached under neutral
+  filenames — ``songbot-snippet.mp3`` for snippets, ``songbot-full.mp3`` for
+  the solver's full-song reward (issue #7) — so the file name never leaks
+  the song.
 - Pinned #9 (secrecy): no pre-reveal copy (daily embed, guess/hear-more
   feedback, solve announcement) ever contains the song title or artist.
   Only `reveal_embed` names the song — it runs after the reveal.
@@ -45,6 +47,7 @@ __all__ = [
     "CHALLENGE_CLOSED_MESSAGE",
     "EMPTY_GUESS_MESSAGE",
     "EMPTY_LEADERBOARD_MESSAGE",
+    "FULL_ATTACHMENT_FILENAME",
     "HEAR_MORE_SOLVED_MESSAGE",
     "NO_ACTIVE_CHALLENGE_MESSAGE",
     "PERMISSION_DENIED_MESSAGE",
@@ -55,6 +58,7 @@ __all__ = [
     "fixsong_refusal_content",
     "fixsong_show_content",
     "format_seconds",
+    "full_song_attachment",
     "guess_feedback_content",
     "hear_more_content",
     "hear_more_refusal_content",
@@ -71,6 +75,9 @@ __all__ = [
 
 ATTACHMENT_FILENAME = "songbot-snippet.mp3"
 """Pinned #9: snippet attachments always use this filename (never the song)."""
+
+FULL_ATTACHMENT_FILENAME = "songbot-full.mp3"
+"""Pinned #9: the solver's full-song attachment filename (issue #7; never the song)."""
 
 CHALLENGE_CLOSED_MESSAGE = "This challenge has closed."
 """The single ephemeral notice for gameplay on a revealed challenge (VAL-GUESS-019)."""
@@ -323,6 +330,16 @@ def hear_more_refusal_content(reason: UnlockRefusedReason, settings: Settings) -
 def snippet_attachment(path: Path) -> discord.File:
     """Attach a snippet file under the pinned-#9 filename (never the song's)."""
     return discord.File(path, filename=ATTACHMENT_FILENAME)
+
+
+def full_song_attachment(path: Path) -> discord.File:
+    """Attach the solver's full-song audio under the pinned-#9 filename.
+
+    The correct-guess reward (issue #7): the WHOLE track, attached to the
+    solver's ephemeral feedback. The pinned filename keeps the attachment
+    from leaking the song identity exactly like the snippet filename does.
+    """
+    return discord.File(path, filename=FULL_ATTACHMENT_FILENAME)
 
 
 def setup_ack_content(channel_mention: str, settings: Settings) -> str:

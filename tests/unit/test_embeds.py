@@ -19,9 +19,11 @@ import pytest
 from songbot.bot.embeds import (
     ATTACHMENT_FILENAME,
     CHALLENGE_CLOSED_MESSAGE,
+    FULL_ATTACHMENT_FILENAME,
     announcement_content,
     daily_challenge_embed,
     format_seconds,
+    full_song_attachment,
     guess_feedback_content,
     hear_more_content,
     hear_more_refusal_content,
@@ -441,6 +443,22 @@ class TestSnippetAttachment:
         try:
             assert attachment.filename == "songbot-snippet.mp3"
             assert "Neon" not in attachment.filename
+        finally:
+            attachment.close()
+
+
+class TestFullSongAttachment:
+    """Issue #7: the solver's full-song attachment follows pinned #9."""
+
+    def test_filename_is_always_songbot_full(self, tmp_path: Path) -> None:
+        assert FULL_ATTACHMENT_FILENAME == "songbot-full.mp3"
+        source = tmp_path / "Midnight Circuit - Neon Skyline.mp3"
+        source.write_bytes(b"fake-mp3")
+        attachment = full_song_attachment(source)
+        try:
+            assert attachment.filename == "songbot-full.mp3"
+            assert "Neon" not in attachment.filename
+            assert "Midnight" not in attachment.filename
         finally:
             attachment.close()
 
