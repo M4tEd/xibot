@@ -1441,6 +1441,22 @@ class GameEngine:
             row.snippet_offset_sec,
             self._settings.snippet_lengths,
         )
+        # Pre-cache the full-length audio for the solver reward (issue #7):
+        # done at post time so a correct guess can attach it without a slow
+        # YouTube download blocking the congratulations reply. Best-effort:
+        # a download failure must not sink the daily post (the guess-time
+        # fallback still logs and sends the feedback without the file).
+        try:
+            self._snippets.ensure_full_audio(
+                _song_for_generator(song),
+                row.id,
+            )
+        except Exception:
+            logger.exception(
+                "full-audio pre-cache failed for challenge %s; "
+                "solver feedback will be sent without it",
+                row.id,
+            )
         return Challenge(
             id=row.id,
             guild_id=row.guild_id,

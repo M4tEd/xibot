@@ -205,6 +205,9 @@ class FakeResponse:
             recipient=str(self._user.id) if ephemeral else None,
         )
 
+    async def defer(self, *args: object, **kwargs: object) -> None:
+        return None
+
     async def send_modal(self, modal: discord.ui.Modal) -> None:
         self._recorder.record_modal(modal, recipient=str(self._user.id))
 
@@ -233,18 +236,28 @@ class FakeChannel:
 
 
 class FakeFollowup:
-    """Stand-in for ``interaction.followup`` (parity with the reference fakes).
-
-    The adapter never uses followups; if that changes, a follow-up message is
-    a public channel message.
-    """
+    """Stand-in for ``interaction.followup`` (parity with the reference fakes)."""
 
     def __init__(self, recorder: Recorder, user: FakeUser) -> None:
         self._recorder = recorder
         self._user = user
 
-    async def send(self, content: str | None = None, **kwargs: object) -> None:
-        self._recorder.record_message(kind="channel", content=content)
+    async def send(
+        self,
+        content: str | None = None,
+        *,
+        embed: discord.Embed | None = None,
+        file: discord.File | None = None,
+        ephemeral: bool = False,
+        **kwargs: object,
+    ) -> None:
+        self._recorder.record_message(
+            kind="ephemeral" if ephemeral else "channel",
+            content=content,
+            embed=embed,
+            file=file,
+            recipient=str(self._user.id) if ephemeral else None,
+        )
 
 
 class FakeInteraction:

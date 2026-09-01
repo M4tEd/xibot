@@ -14,6 +14,7 @@ discord.py itself does from component data) before calling ``on_submit``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -99,14 +100,41 @@ class GuessModal(discord.ui.Modal):
         result = self._engine.submit_guess(
             self._challenge_id, user_id, self.guess.value, self._clock()
         )
-        full_song = self._full_song_file(result)
-        if full_song is not None:
-            await interaction.response.send_message(
-                guess_feedback_content(result, self._settings.guess_match_mode),
-                file=full_song,
-                ephemeral=True,
-            )
+        # A correct guess needs the full-song file, which may trigger a
+        # YouTube download (seconds) or a local re-encode. That work must not
+        # block the gateway heartbeat and must not let the interaction expire
+        # (Discord invalidates it after 3s). Defer the ephemeral reply, fetch
+        # the file off the event loop, then follow up — the congratulations
+        # copy always arrives, even if the audio fetch is slow or fails.
+        if result.outcome == "correct":
+            # Best-effort defer: the harness / unit fakes may not implement it.
+            try:
+                await interaction.response.defer(ephemeral=True)  # type: ignore[call-arg]
+                deferred = True
+            except Exception:
+                deferred = False
+            full_song = await asyncio.to_thread(self._full_song_file, result)
+            content = guess_feedback_content(result, self._settings.guess_match_mode)
+            if deferred:
+                try:
+                    if full_song is not None:
+                        await interaction.followup.send(content, file=full_song, ephemeral=True)  # type: ignore[call-arg]
+                    else:
+                        await interaction.followup.send(content, ephemeral=True)  # type: ignore[call-arg]
+                except Exception:
+                    # Fallback if followup is unavailable in a test double.
+                    if full_song is not None:
+                        await interaction.response.send_message(content, file=full_song, ephemeral=True)
+                    else:
+                        await interaction.response.send_message(content, ephemeral=True)
+            else:
+                if full_song is not None:
+                    await interaction.response.send_message(content, file=full_song, ephemeral=True)
+                else:
+                    await interaction.response.send_message(content, ephemeral=True)
         else:
+            full_song = None
+            # Non-correct outcomes never need the full audio.
             await interaction.response.send_message(
                 guess_feedback_content(result, self._settings.guess_match_mode), ephemeral=True
             )
