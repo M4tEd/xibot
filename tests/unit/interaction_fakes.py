@@ -98,6 +98,10 @@ class FakeResponse:
             )
         )
 
+    async def defer(self, *args: Any, **kwargs: Any) -> None:
+        """No-op defer: records nothing, just keeps the interaction alive."""
+        return None
+
     async def send_modal(self, modal: discord.ui.Modal[Any]) -> None:
         self.interaction.payloads.append(
             RecordedPayload(kind="modal", modal=modal, recipient=str(self.interaction.user.id))
@@ -120,8 +124,25 @@ class FakeFollowup:
 
     interaction: FakeInteraction
 
-    async def send(self, content: str | None = None, **kwargs: Any) -> None:
-        self.interaction.payloads.append(RecordedPayload(kind="channel", content=content))
+    async def send(
+        self,
+        content: str | None = None,
+        *,
+        embed: discord.Embed | None = None,
+        file: discord.File | None = None,
+        ephemeral: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        attachment = _capture_attachment(file)
+        self.interaction.payloads.append(
+            RecordedPayload(
+                kind="ephemeral" if ephemeral else "channel",
+                content=content,
+                embed=embed,
+                attachment=attachment,
+                recipient=str(self.interaction.user.id) if ephemeral else None,
+            )
+        )
 
 
 @dataclass

@@ -341,7 +341,8 @@ class TestSkipSong:
 
         assert result.outcome == "skipped"
         assert challenge.id in fake_snippets.purged
-        # The replacement challenge's snippet set was regenerated (5 levels).
+        # The replacement challenge's snippet set was regenerated (5 levels)
+        # plus the pre-cached full audio (issue #7).
         row = db.query_one("SELECT id FROM challenges WHERE date = '2026-08-13'")
         assert row is not None
         cache_dir = tmp_path / "snippets" / str(row["id"])
@@ -351,6 +352,7 @@ class TestSkipSong:
             "2.mp3",
             "3.mp3",
             "4.mp3",
+            "full.mp3",
         ]
 
     async def test_refused_when_no_challenge_today(

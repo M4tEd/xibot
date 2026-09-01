@@ -770,9 +770,10 @@ class TestAdminSkip:
             assert row is not None
             assert row["c"] == 0
         # The snippet cache was purged and regenerated for the replacement.
+        # Full audio (issue #7) is pre-cached at post time alongside snippets.
         cache_dir = tmp_path / "snippets" / str(after["id"])
         assert sorted(p.name for p in cache_dir.glob("*.mp3")) == [
-            "0.mp3", "1.mp3", "2.mp3", "3.mp3", "4.mp3",
+            "0.mp3", "1.mp3", "2.mp3", "3.mp3", "4.mp3", "full.mp3",
         ]
         # Secrecy: the ack names neither song.
         ack = out["payloads"][0]["content"].lower()
