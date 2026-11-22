@@ -7,7 +7,8 @@ feedback message, plus the public first-solve announcement via
 
 Drivability contract (the headless harness and the unit-test fakes drive the
 REAL modal): ``on_submit`` only touches ``interaction.user``,
-``interaction.channel``, and ``interaction.response.send_message``. The
+``interaction.channel``, ``interaction.response.defer`` and
+``interaction.followup.send``. The
 harness injects the submitted text by setting the text input's value (as
 discord.py itself does from component data) before calling ``on_submit``.
 """
@@ -97,46 +98,33 @@ class GuessModal(discord.ui.Modal):
         announcement, no error leak (VAL-GUESS-019 adapter half).
         """
         user_id = str(interaction.user.id)
-        result = self._engine.submit_guess(
-            self._challenge_id, user_id, self.guess.value, self._clock()
+        # Ack first (issue #22). Discord kills the interaction if it is not
+        # acknowledged within 3s, and the guess is committed before any reply
+        # goes out — so a late ack meant a solve the player never heard about
+        # (the modal said "Something went wrong", the retry "already solved").
+        # The full-song fetch can be a multi-second yt-dlp download; it and
+        # the DB work run off the event loop, then the reply is a followup
+        # (valid for 15 minutes).
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await asyncio.to_thread(
+            self._engine.submit_guess,
+            self._challenge_id,
+            user_id,
+            self.guess.value,
+            self._clock(),
         )
-        # A correct guess needs the full-song file, which may trigger a
-        # YouTube download (seconds) or a local re-encode. That work must not
-        # block the gateway heartbeat and must not let the interaction expire
-        # (Discord invalidates it after 3s). Defer the ephemeral reply, fetch
-        # the file off the event loop, then follow up — the congratulations
-        # copy always arrives, even if the audio fetch is slow or fails.
-        if result.outcome == "correct":
-            # Best-effort defer: the harness / unit fakes may not implement it.
-            try:
-                await interaction.response.defer(ephemeral=True)  # type: ignore[call-arg]
-                deferred = True
-            except Exception:
-                deferred = False
-            full_song = await asyncio.to_thread(self._full_song_file, result)
-            content = guess_feedback_content(result, self._settings.guess_match_mode)
-            if deferred:
-                try:
-                    if full_song is not None:
-                        await interaction.followup.send(content, file=full_song, ephemeral=True)  # type: ignore[call-arg]
-                    else:
-                        await interaction.followup.send(content, ephemeral=True)  # type: ignore[call-arg]
-                except Exception:
-                    # Fallback if followup is unavailable in a test double.
-                    if full_song is not None:
-                        await interaction.response.send_message(content, file=full_song, ephemeral=True)
-                    else:
-                        await interaction.response.send_message(content, ephemeral=True)
+        full_song = await asyncio.to_thread(self._full_song_file, result)
+        content = guess_feedback_content(result, self._settings.guess_match_mode)
+        try:
+            if full_song is not None:
+                await interaction.followup.send(content, file=full_song, ephemeral=True)
             else:
-                if full_song is not None:
-                    await interaction.response.send_message(content, file=full_song, ephemeral=True)
-                else:
-                    await interaction.response.send_message(content, ephemeral=True)
-        else:
-            full_song = None
-            # Non-correct outcomes never need the full audio.
-            await interaction.response.send_message(
-                guess_feedback_content(result, self._settings.guess_match_mode), ephemeral=True
+                await interaction.followup.send(content, ephemeral=True)
+        except Exception:
+            # The solve is already committed: a failed feedback reply must
+            # not also swallow the public announcement.
+            logger.exception(
+                "guess feedback reply failed for challenge %s", self._challenge_id
             )
         if result.announce:
             await self._announce(
