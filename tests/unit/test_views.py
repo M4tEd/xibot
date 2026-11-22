@@ -24,7 +24,7 @@ from songbot.bot.modals import GuessModal
 from songbot.bot.views import DailyChallengeView
 from songbot.db import Database
 from songbot.engine import Challenge, GameEngine
-from tests.unit.interaction_fakes import FakeInteraction, press
+from tests.unit.interaction_fakes import FakeInteraction, press, submit_modal
 from tests.unit.test_engine_daily import NOW, _make_engine, _reveal_previous, _settings
 from tests.unit.test_engine_gameplay import _add_song
 
@@ -206,7 +206,7 @@ class TestGuessButton:
         assert isinstance(modal, GuessModal)
 
         modal.guess._value = TITLE  # harness drives the real modal like discord would
-        await modal.on_submit(interaction)
+        await submit_modal(modal, interaction)
 
         row = db.query_one(
             "SELECT solved FROM challenge_users WHERE challenge_id = ? AND user_id = '1001'",
@@ -214,6 +214,107 @@ class TestGuessButton:
         )
         assert row is not None
         assert row["solved"] == 1
+
+
+class TestAckFirst:
+    """Issue #22: ack within Discord's 3s window BEFORE any slow work.
+
+    The guess is committed before the reply, so a late ack left a recorded
+    solve the player never heard about ("Something went wrong" on the modal,
+    then "already solved" on the retry). Every slow path now defers first and
+    replies through the followup webhook.
+    """
+
+    def _modal(self, engine: GameEngine, challenge: Challenge, tmp_path: Path) -> GuessModal:
+        modal = GuessModal(engine, challenge.id, settings=_settings(tmp_path), clock=lambda: NOW)
+        modal.guess._value = TITLE
+        return modal
+
+    async def test_hear_more_defers_before_snippet_work(
+        self,
+        view: DailyChallengeView,
+        challenge: Challenge,
+        engine: GameEngine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        interaction = _interaction()
+        unlock = engine.unlock_snippet
+        acked_before_unlock: list[bool] = []
+
+        def spy(challenge_id: int, user_id: str):  # type: ignore[no-untyped-def]
+            acked_before_unlock.append(interaction.response.is_done())
+            return unlock(challenge_id, user_id)
+
+        monkeypatch.setattr(engine, "unlock_snippet", spy)
+        await press(view, "songbot:hear_more", interaction)
+
+        assert acked_before_unlock == [True]
+        assert interaction.response.deferred == {"ephemeral": True, "thinking": True}
+        assert [p.kind for p in interaction.payloads] == ["ephemeral"]
+        assert interaction.payloads[0].attachment is not None
+
+    async def test_guess_defers_before_committing_and_fetching_audio(
+        self,
+        challenge: Challenge,
+        engine: GameEngine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        interaction = _interaction()
+        calls: list[tuple[str, bool]] = []
+        submit, full_audio = engine.submit_guess, engine.full_audio_path
+
+        def submit_spy(*args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(("submit_guess", interaction.response.is_done()))
+            return submit(*args, **kwargs)
+
+        def audio_spy(*args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(("full_audio_path", interaction.response.is_done()))
+            return full_audio(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "submit_guess", submit_spy)
+        monkeypatch.setattr(engine, "full_audio_path", audio_spy)
+        await self._modal(engine, challenge, tmp_path).on_submit(interaction)  # type: ignore[arg-type]
+
+        assert calls == [("submit_guess", True), ("full_audio_path", True)]
+        assert interaction.response.deferred == {"ephemeral": True, "thinking": True}
+        assert [p.kind for p in interaction.payloads] == ["ephemeral", "announcement"]
+        assert interaction.payloads[0].attachment is not None
+
+    async def test_audio_failure_still_sends_feedback_and_announcement(
+        self,
+        challenge: Challenge,
+        engine: GameEngine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def boom(challenge_id: int) -> Path:
+            raise RuntimeError("yt-dlp failed")
+
+        monkeypatch.setattr(engine, "full_audio_path", boom)
+        interaction = _interaction()
+        await self._modal(engine, challenge, tmp_path).on_submit(interaction)  # type: ignore[arg-type]
+
+        assert [p.kind for p in interaction.payloads] == ["ephemeral", "announcement"]
+        assert interaction.payloads[0].attachment is None
+        assert interaction.payloads[0].content
+
+    async def test_failed_feedback_reply_still_announces(
+        self,
+        challenge: Challenge,
+        engine: GameEngine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        interaction = _interaction()
+
+        async def dead_webhook(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("404 Unknown Webhook")
+
+        monkeypatch.setattr(interaction.followup, "send", dead_webhook)
+        await self._modal(engine, challenge, tmp_path).on_submit(interaction)  # type: ignore[arg-type]
+
+        assert [p.kind for p in interaction.payloads] == ["announcement"]
 
 
 class TestPersistentFallback:
@@ -305,7 +406,7 @@ class TestPersistentFallback:
         modal = interaction.payloads[0].modal
         assert isinstance(modal, GuessModal)
         modal.guess._value = TITLE
-        await modal.on_submit(interaction)
+        await submit_modal(modal, interaction)
 
         row = db.query_one(
             "SELECT solved FROM challenge_users WHERE challenge_id = ? AND user_id = '1001'",

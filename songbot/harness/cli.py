@@ -987,6 +987,7 @@ async def scenario_admin_fixsong(
     modal.artist_input._value = (
         artist if artist is not None else (modal.artist_input.default or "")
     )
+    fake.response.reset()  # the submit is its own Discord interaction
     await modal.on_submit(interaction)
     fix = modal.result
     state["outcome"] = "fixed" if fix is not None else "refused"

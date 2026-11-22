@@ -6,8 +6,9 @@ engine results are formatted by the pure builders in `embeds.py`.
 
 Drivability contract (the headless harness and the unit-test fakes drive the
 REAL callbacks): callbacks only touch ``interaction.user``,
-``interaction.response.send_message``/``send_modal``, and (indirectly, via
-the modal) ``interaction.channel``. Buttons are pressed by custom_id:
+``interaction.response.send_message``/``send_modal``/``defer``,
+``interaction.followup.send``, and (indirectly, via the modal)
+``interaction.channel``. Buttons are pressed by custom_id:
 ``await button.callback(interaction)``.
 """
 
@@ -136,19 +137,20 @@ class DailyChallengeView(discord.ui.View):
             return
         challenge_id, _ = target
         user_id = str(interaction.user.id)
+        # Ack first (issue #22): snippet generation can run ffmpeg/yt-dlp for
+        # seconds (pinned #14 re-heal on every unlock), past Discord's 3s
+        # window. Defer, do the work off the event loop, reply as a followup.
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            # Snippet generation can run ffmpeg/yt-dlp for seconds or minutes
-            # (pinned #14 re-heal on every unlock); keep it off the event loop
-            # so the bot can still ack interactions within Discord's 3s window.
             result = await asyncio.to_thread(
                 self._engine.unlock_snippet, challenge_id, user_id
             )
         except UnlockRefusedError as exc:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 hear_more_refusal_content(exc.reason, self._settings), ephemeral=True
             )
             return
-        await interaction.response.send_message(
+        await interaction.followup.send(
             hear_more_content(result, self._settings),
             file=snippet_attachment(result.path),
             ephemeral=True,

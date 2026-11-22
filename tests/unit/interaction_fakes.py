@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import discord
 
@@ -72,9 +72,28 @@ class FakeUser:
 
 @dataclass
 class FakeResponse:
-    """Stand-in for ``discord.InteractionResponse``."""
+    """Stand-in for ``discord.InteractionResponse``.
+
+    Like Discord, an interaction is acknowledged exactly once: a second
+    ``send_message``/``defer``/``send_modal`` raises ``InteractionResponded``.
+    """
 
     interaction: FakeInteraction
+    done: bool = False
+    deferred: dict[str, bool] | None = None
+
+    def is_done(self) -> bool:
+        return self.done
+
+    def reset(self) -> None:
+        """Start a new interaction: Discord sends a fresh token per callback."""
+        self.done = False
+        self.deferred = None
+
+    def _respond(self) -> None:
+        if self.done:
+            raise discord.InteractionResponded(cast("discord.Interaction[Any]", self.interaction))
+        self.done = True
 
     async def send_message(
         self,
@@ -86,6 +105,7 @@ class FakeResponse:
         ephemeral: bool = False,
         **kwargs: Any,
     ) -> None:
+        self._respond()
         attachment = _capture_attachment(file)
         self.interaction.payloads.append(
             RecordedPayload(
@@ -98,11 +118,13 @@ class FakeResponse:
             )
         )
 
-    async def defer(self, *args: Any, **kwargs: Any) -> None:
-        """No-op defer: records nothing, just keeps the interaction alive."""
-        return None
+    async def defer(self, *, ephemeral: bool = False, thinking: bool = False) -> None:
+        """Acknowledge without a message; records how it was deferred."""
+        self._respond()
+        self.deferred = {"ephemeral": ephemeral, "thinking": thinking}
 
     async def send_modal(self, modal: discord.ui.Modal[Any]) -> None:
+        self._respond()
         self.interaction.payloads.append(
             RecordedPayload(kind="modal", modal=modal, recipient=str(self.interaction.user.id))
         )
@@ -120,7 +142,11 @@ class FakeChannel:
 
 @dataclass
 class FakeFollowup:
-    """Stand-in for ``interaction.followup`` (public follow-up messages)."""
+    """Stand-in for ``interaction.followup``.
+
+    Like Discord's webhook, a followup is only valid once the interaction
+    has been acknowledged (``response.defer`` or ``send_message``).
+    """
 
     interaction: FakeInteraction
 
@@ -133,6 +159,8 @@ class FakeFollowup:
         ephemeral: bool = False,
         **kwargs: Any,
     ) -> None:
+        if not self.interaction.response.is_done():
+            raise RuntimeError("followup sent before the interaction was acknowledged")
         attachment = _capture_attachment(file)
         self.interaction.payloads.append(
             RecordedPayload(
@@ -205,5 +233,15 @@ def button_by_custom_id(view: discord.ui.View, custom_id: str) -> discord.ui.But
 
 
 async def press(view: discord.ui.View, custom_id: str, interaction: FakeInteraction) -> None:
-    """Drive a real button callback with a fake interaction."""
+    """Drive a real button callback with a fake interaction.
+
+    Every press is its own Discord interaction, so the response resets.
+    """
+    interaction.response.reset()
     await button_by_custom_id(view, custom_id).callback(interaction)
+
+
+async def submit_modal(modal: discord.ui.Modal[Any], interaction: FakeInteraction) -> None:
+    """Drive a real modal's ``on_submit``: the submit is its own interaction."""
+    interaction.response.reset()
+    await modal.on_submit(interaction)  # type: ignore[arg-type]

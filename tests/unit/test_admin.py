@@ -33,7 +33,7 @@ from songbot.bot.fixsong import FixSongModal
 from songbot.catalog.refresh import RefreshResult, SourceRefresh
 from songbot.db import Database
 from songbot.engine import Challenge, GameEngine
-from tests.unit.interaction_fakes import FakeInteraction, press
+from tests.unit.interaction_fakes import FakeInteraction, press, submit_modal
 from tests.unit.test_engine_daily import _make_engine, _settings
 from tests.unit.test_engine_gameplay import _add_song
 
@@ -834,7 +834,7 @@ async def _submit_edit(
     modal.artist_input._value = (
         artist if artist is not None else (modal.artist_input.default or "")
     )
-    await modal.on_submit(interaction)
+    await submit_modal(modal, interaction)
 
 
 class TestFixSong:

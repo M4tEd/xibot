@@ -180,11 +180,30 @@ class FakeUser:
 
 
 class FakeResponse:
-    """Stand-in for ``discord.InteractionResponse``."""
+    """Stand-in for ``discord.InteractionResponse``.
+
+    Like Discord, an interaction is acknowledged exactly once: a second
+    ``send_message``/``defer``/``send_modal`` raises ``InteractionResponded``.
+    """
 
     def __init__(self, recorder: Recorder, user: FakeUser) -> None:
         self._recorder = recorder
         self._user = user
+        self._done = False
+        self.deferred_ephemeral: bool | None = None
+
+    def is_done(self) -> bool:
+        return self._done
+
+    def reset(self) -> None:
+        """Start a new interaction: Discord sends a fresh token per callback."""
+        self._done = False
+        self.deferred_ephemeral = None
+
+    def _respond(self) -> None:
+        if self._done:
+            raise discord.InteractionResponded(cast("discord.Interaction[Any]", self))
+        self._done = True
 
     async def send_message(
         self,
@@ -196,6 +215,7 @@ class FakeResponse:
         ephemeral: bool = False,
         **kwargs: object,
     ) -> None:
+        self._respond()
         self._recorder.record_message(
             kind="ephemeral" if ephemeral else "channel",
             content=content,
@@ -205,10 +225,12 @@ class FakeResponse:
             recipient=str(self._user.id) if ephemeral else None,
         )
 
-    async def defer(self, *args: object, **kwargs: object) -> None:
-        return None
+    async def defer(self, *, ephemeral: bool = False, thinking: bool = False) -> None:
+        self._respond()
+        self.deferred_ephemeral = ephemeral
 
     async def send_modal(self, modal: discord.ui.Modal) -> None:
+        self._respond()
         self._recorder.record_modal(modal, recipient=str(self._user.id))
 
 
@@ -236,11 +258,16 @@ class FakeChannel:
 
 
 class FakeFollowup:
-    """Stand-in for ``interaction.followup`` (parity with the reference fakes)."""
+    """Stand-in for ``interaction.followup``.
 
-    def __init__(self, recorder: Recorder, user: FakeUser) -> None:
+    Like Discord's webhook, a followup is only valid once the interaction
+    has been acknowledged (``response.defer`` or ``send_message``).
+    """
+
+    def __init__(self, recorder: Recorder, user: FakeUser, response: FakeResponse) -> None:
         self._recorder = recorder
         self._user = user
+        self._response = response
 
     async def send(
         self,
@@ -251,6 +278,8 @@ class FakeFollowup:
         ephemeral: bool = False,
         **kwargs: object,
     ) -> None:
+        if not self._response.is_done():
+            raise RuntimeError("followup sent before the interaction was acknowledged")
         self._recorder.record_message(
             kind="ephemeral" if ephemeral else "channel",
             content=content,
@@ -275,7 +304,7 @@ class FakeInteraction:
         self.user = user
         self.channel = FakeChannel(recorder)
         self.response = FakeResponse(recorder, user)
-        self.followup = FakeFollowup(recorder, user)
+        self.followup = FakeFollowup(recorder, user, self.response)
         self.message: None = None
         self.guild_id = guild_id
 
@@ -298,6 +327,7 @@ async def press_button(
     satisfies mypy (the fake is duck-typed, not an Interaction subclass).
     """
     button = find_button(view, custom_id)
+    interaction.response.reset()  # every press is its own Discord interaction
     await button.callback(cast("discord.Interaction[Any]", interaction))
 
 
@@ -314,6 +344,7 @@ async def submit_modal_text(
     value is injected via ``_value`` exactly like the reference test fakes do.
     """
     text_input._value = text
+    interaction.response.reset()  # the submit is its own Discord interaction
     await modal.on_submit(cast("discord.Interaction[Any]", interaction))
 
 
